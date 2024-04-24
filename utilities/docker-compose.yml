@@ -1,0 +1,1 @@
+version: "${DOCKER_VERSION}"  # Specifies the Docker Compose file version
