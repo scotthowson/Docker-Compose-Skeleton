@@ -1,0 +1,161 @@
+[SUCCESS] - Logger Initialized.
+[ Docker Compose Updater ] - [ Made by: Scott Howson ]
+[IMPORTANT] - Environment Verification: Ensuring Compatibility...
+[SUCCESS] - Environment Verification: Successful.
+[INFO] - Current installed Docker Compose version: Docker Compose version v2.32.2
+[INFO] - Fetching the latest release of Docker Compose from GitHub...
+[HIGHLIGHT] - Latest Docker Compose version on GitHub: v2.32.2
+[SUCCESS] - Your Docker Compose is up to date.
+[INFO] - Base directory set to: /home/howson/.Docker-Services/App-Data
+[HIGHLIGHT] - Scanning Docker Compose files at: /home/howson/.Docker-Services/Stacks
+[FOCUS] - Reading file: /home/howson/.Docker-Services/Stacks/communication-collaboration/docker-compose.yml
+[FOCUS] - Reading file: /home/howson/.Docker-Services/Stacks/core-infrastructure/docker-compose.yml
+[FOCUS] - Reading file: /home/howson/.Docker-Services/Stacks/development-tools/docker-compose.yml
+[FOCUS] - Reading file: /home/howson/.Docker-Services/Stacks/entertainment-personal/docker-compose.yml
+[FOCUS] - Reading file: /home/howson/.Docker-Services/Stacks/media-services/docker-compose.yml
+[FOCUS] - Reading file: /home/howson/.Docker-Services/Stacks/miscellaneous-services/docker-compose.yml
+[FOCUS] - Reading file: /home/howson/.Docker-Services/Stacks/monitoring-management/docker-compose.yml
+[FOCUS] - Reading file: /home/howson/.Docker-Services/Stacks/networking-security/docker-compose.yml
+[FOCUS] - Reading file: /home/howson/.Docker-Services/Stacks/storage-backup/docker-compose.yml
+[FOCUS] - Reading file: /home/howson/.Docker-Services/Stacks/web-applications/docker-compose.yml
+[INFO] - Checking for unreferenced directories...
+[SUCCESS] - No unused directories found. Nothing to delete.
+[STATUS] - Verification complete.
+[INFO] - Starting Docker Compose service stacks...
+[1m[38;5;119m[INFO] - [38;5;119mStarting Docker Compose service stacks...(B[m
+[NOTE] - Starting services in core-infrastructure stack...
+[1m[38;5;250m[NOTE] - [38;5;250mStarting services in core-infrastructure stack...(B[m
+ Container whoami  Running
+ Container Universal_Database  Running
+ Container Authelia-Tunnel  Running
+ Container Sablier  Running
+ Container Ntfy-Tunnel  Running
+ Container Redis  Running
+ Container Spotify_DB  Running
+ Container Docker-Socket  Running
+ Container Authelia  Running
+ Container Pelican-Panel-Tunnel  Running
+ Container Ntfy  Running
+ Container Tautulli  Running
+ Container Pelican-Wings  Running
+ Container Traefik-v3.0  Running
+[SUCCESS] - core-infrastructure service stack started successfully.
+[1m[38;5;82m[SUCCESS] - [38;5;82mcore-infrastructure service stack started successfully.(B[m
+[ALERT] - Notification sent for core-infrastructure!
+[INFO] - Starting Docker Compose service stacks...
+[1m[38;5;119m[INFO] - [38;5;119mStarting Docker Compose service stacks...(B[m
+[NOTE] - Starting services in networking-security stack...
+[1m[38;5;250m[NOTE] - [38;5;250mStarting services in networking-security stack...(B[m
+ Container FlareSolverr  Running
+[SUCCESS] - networking-security service stack started successfully.
+[1m[38;5;82m[SUCCESS] - [38;5;82mnetworking-security service stack started successfully.(B[m
+[INFO] - Starting Docker Compose service stacks...
+[1m[38;5;119m[INFO] - [38;5;119mStarting Docker Compose service stacks...(B[m
+[NOTE] - Starting services in monitoring-management stack...
+[1m[38;5;250m[NOTE] - [38;5;250mStarting services in monitoring-management stack...(B[m
+ Container Glances  Running
+ Container Dozzle  Running
+ Container Uptime-Kuma  Running
+ Container Yacht  Running
+ Container Redis_Insight  Running
+ Container WatchTower  Running
+ Container MotionEye  Running
+ Container SpeedTest  Running
+ Container DashDot  Running
+ Container Portainer  Running
+[SUCCESS] - monitoring-management service stack started successfully.
+[1m[38;5;82m[SUCCESS] - [38;5;82mmonitoring-management service stack started successfully.(B[m
+[INFO] - Starting Docker Compose service stacks...
+[1m[38;5;119m[INFO] - [38;5;119mStarting Docker Compose service stacks...(B[m
+[NOTE] - Starting services in development-tools stack...
+[1m[38;5;250m[NOTE] - [38;5;250mStarting services in development-tools stack...(B[m
+ Container GitHub  Running
+ Container NetBootxyz  Running
+ Container BambuStudio  Running
+ Container VsCode-Server  Running
+[SUCCESS] - development-tools service stack started successfully.
+[1m[38;5;82m[SUCCESS] - [38;5;82mdevelopment-tools service stack started successfully.(B[m
+[INFO] - Starting Docker Compose service stacks...
+[1m[38;5;119m[INFO] - [38;5;119mStarting Docker Compose service stacks...(B[m
+[NOTE] - Starting services in media-services stack...
+[1m[38;5;250m[NOTE] - [38;5;250mStarting services in media-services stack...(B[m
+ Container Readarr  Running
+ Container Plex-Meta-Manager  Running
+ Container Bazarr  Running
+ Container Radarr  Running
+ Container qBittorrent  Running
+ Container MeTube  Running
+ Container Sonarr  Running
+ Container Plex  Running
+[SUCCESS] - media-services service stack started successfully.
+[1m[38;5;82m[SUCCESS] - [38;5;82mmedia-services service stack started successfully.(B[m
+[INFO] - Starting Docker Compose service stacks...
+[1m[38;5;119m[INFO] - [38;5;119mStarting Docker Compose service stacks...(B[m
+[NOTE] - Starting services in web-applications stack...
+[1m[38;5;250m[NOTE] - [38;5;250mStarting services in web-applications stack...(B[m
+ Container vite_docker  Running
+ Container Homarr  Running
+ Container Change-Detection  Running
+ Container yourls  Running
+ Container Calibre-Web  Running
+ Container phpMyAdmin  Running
+ Container MySQL-Workbench  Running
+ Container Pelican-Panel  Running
+ Container austin-react  Running
+ Container HomeAssistant  Running
+ Container Heimdall  Running
+ Container Leantime  Running
+ Container Adminer  Running
+ Container Cloudflare-DDNS  Recreate
+ Container Homepage  Running
+ Container NextCloud  Running
+ Container Cloudflare-DDNS  Recreated
+ Container Cloudflare-DDNS  Starting
+ Container Cloudflare-DDNS  Started
+[SUCCESS] - web-applications service stack started successfully.
+[1m[38;5;82m[SUCCESS] - [38;5;82mweb-applications service stack started successfully.(B[m
+[ALERT] - Notification sent for web-applications!
+[INFO] - Starting Docker Compose service stacks...
+[1m[38;5;119m[INFO] - [38;5;119mStarting Docker Compose service stacks...(B[m
+[NOTE] - Starting services in storage-backup stack...
+[1m[38;5;250m[NOTE] - [38;5;250mStarting services in storage-backup stack...(B[m
+ Container FileZilla  Running
+ Container VaultWarden  Running
+ Container VaultWarden-Backup  Running
+[SUCCESS] - storage-backup service stack started successfully.
+[1m[38;5;82m[SUCCESS] - [38;5;82mstorage-backup service stack started successfully.(B[m
+[INFO] - Starting Docker Compose service stacks...
+[1m[38;5;119m[INFO] - [38;5;119mStarting Docker Compose service stacks...(B[m
+[NOTE] - Starting services in communication-collaboration stack...
+[1m[38;5;250m[NOTE] - [38;5;250mStarting services in communication-collaboration stack...(B[m
+ Container Overseerr  Running
+ Container Doplarr  Running
+ Container Wizarr  Running
+ Container Prowlarr  Running
+[SUCCESS] - communication-collaboration service stack started successfully.
+[1m[38;5;82m[SUCCESS] - [38;5;82mcommunication-collaboration service stack started successfully.(B[m
+[ALERT] - Notification sent for communication-collaboration!
+[INFO] - Starting Docker Compose service stacks...
+[1m[38;5;119m[INFO] - [38;5;119mStarting Docker Compose service stacks...(B[m
+[NOTE] - Starting services in entertainment-personal stack...
+[1m[38;5;250m[NOTE] - [38;5;250mStarting services in entertainment-personal stack...(B[m
+ Container PrivateBin  Running
+ Container Your_Spotify_Client  Running
+ Container MonkeyType  Running
+ Container emulatorjs  Running
+ Container Your_Spotify_Server  Running
+[SUCCESS] - entertainment-personal service stack started successfully.
+[1m[38;5;82m[SUCCESS] - [38;5;82mentertainment-personal service stack started successfully.(B[m
+[INFO] - Starting Docker Compose service stacks...
+[1m[38;5;119m[INFO] - [38;5;119mStarting Docker Compose service stacks...(B[m
+[NOTE] - Starting services in miscellaneous-services stack...
+[1m[38;5;250m[NOTE] - [38;5;250mStarting services in miscellaneous-services stack...(B[m
+ Container AutoHeal  Running
+ Container IT_Tools  Running
+ Container Mealie-API  Running
+ Container Mealie-Frontend  Running
+[SUCCESS] - miscellaneous-services service stack started successfully.
+[1m[38;5;82m[SUCCESS] - [38;5;82mmiscellaneous-services service stack started successfully.(B[m
+[HIGHLIGHT] - All requested services processed.
+[1m[38;5;201m[HIGHLIGHT] - [38;5;201mAll requested services processed.(B[m
+[SUCCESS] - Main script execution complete.
