@@ -1,1 +1,27 @@
-/logs/archive
+# Environment configuration (contains secrets)
+.env
+
+# Keep the example template
+!.env.example
+
+# Keep per-stack .env files (they are templates, not secrets)
+!Stacks/*/.env
+
+# Logs
+logs/
+*.log
+
+# Persistent container data
+App-Data/
+
+# IDE files
+.vs/
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db

@@ -1,32 +1,66 @@
 ===============================================================================
-Logger System v2.0 - Session Started: 2026-02-21 12:00:00
+Logger System v3.0 - Session Started: 2026-02-23 03:47:06
 Application: Docker Compose Updater
 Script Version: 2.0.0
 Log Level: INFO
 Verbose Mode: false
 ===============================================================================
 
-[SUCCESS] - Logger System v2.0 initialized successfully
-[Feb/21/2026 — 12:00 PM] [INFO] - Docker Services Backup Started
-[Feb/21/2026 — 12:00 PM] [INFO] - Timestamp: 2026-02-21 12:00:00
-[Feb/21/2026 — 12:00 PM] [FOCUS] - Starting Docker services backup
-[Feb/21/2026 — 12:00 PM] [INFO] - Backup target: Docker-Compose-Backup-20260221-120000.tar.gz
-[Feb/21/2026 — 12:00 PM] [STATUS] - Creating temporary backup directory
-[Feb/21/2026 — 12:00 PM] [STATUS] - Performing comprehensive rsync backup
-[Feb/21/2026 — 12:02 PM] [WARNING] - Initial rsync failed with exit code: 24
-[Feb/21/2026 — 12:02 PM] [INFO] - Attempting backup with elevated permissions
-[Feb/21/2026 — 12:03 PM] [SUCCESS] - Rsync backup completed successfully with elevated permissions
-[Feb/21/2026 — 12:03 PM] [STATUS] - Creating compressed archive
-[Feb/21/2026 — 12:22 PM] [SUCCESS] - Archive created successfully
-[Feb/21/2026 — 12:24 PM] [SUCCESS] - Archive integrity verified
-[Feb/21/2026 — 12:24 PM] [STATUS] - Cleaning up temporary files
-[Feb/21/2026 — 12:24 PM] [STATUS] - Cleaning up old backups
-[Feb/21/2026 — 12:24 PM] [INFO] - No old backups to remove
-[Feb/21/2026 — 12:24 PM] [SUCCESS] - Docker backup completed successfully
-[Feb/21/2026 — 12:24 PM] [INFO] - Final archive size: 23G
-[Feb/21/2026 — 12:24 PM] [INFO] - Location: /mnt/Storage/Backups/Docker/Backups//Docker-Compose-Backup-20260221-120000.tar.gz
-[Feb/21/2026 — 12:24 PM] [CONFIRMATION] - Backup operation completed in 1489 seconds
-[INFO] - Logger session ended (Duration: 1489s)
-
---- Session Ended: 2026-02-21 12:24:49 (Duration: 1489s) ---
-
+[SUCCESS] - Logger System v3.0 initialized successfully
+------------------------------------------------------------
+[Feb/23/2026 — 3:47 AM] [INFO] - User .......................... howson
+[Feb/23/2026 — 3:47 AM] [INFO] - Hostname ...................... Howson-Ubuntu
+[Feb/23/2026 — 3:47 AM] [INFO] - Base Dir ...................... /home/howson/Documents/GitHub/Docker-Compose-Skeleton
+[Feb/23/2026 — 3:47 AM] [INFO] - Stacks Dir .................... /home/howson/Documents/GitHub/Docker-Compose-Skeleton/Stacks
+[Feb/23/2026 — 3:47 AM] [INFO] - App Data ...................... ./App-Data
+[Feb/23/2026 — 3:47 AM] [INFO] - Environment ................... production
+[Feb/23/2026 — 3:47 AM] [INFO] - Log Level ..................... INFO
+[Feb/23/2026 — 3:47 AM] [INFO] - Compose ....................... docker compose
+[Feb/23/2026 — 3:47 AM] [INFO] - Volumes on Stop ............... Preserve
+[Feb/23/2026 — 3:47 AM] [INFO] - Force Mode .................... Disabled (30s timeout)
+[Feb/23/2026 — 3:47 AM] [INFO] - Notifications ................. Disabled
+[Feb/23/2026 — 3:47 AM] [INFO] - Initiated at .................. 2026-02-23 03:47:06
+------------------------------------------------------------
+[Feb/23/2026 — 3:47 AM] [STEP 1/4] - Verifying Docker environment
+[Feb/23/2026 — 3:47 AM] [INFO] - Docker ........................ v28.2.2
+[Feb/23/2026 — 3:47 AM] [INFO] - Compose ....................... Docker Compose version 2.37.1+ds1-0ubuntu2
+[Feb/23/2026 — 3:47 AM] [SUCCESS] - Docker environment verified
+[Feb/23/2026 — 3:47 AM] [STEP 2/4] - Stopping all Docker service stacks
+[Feb/23/2026 — 3:47 AM] [ Docker Compose Updater ] - Docker Services Shutdown Initiated
+[Feb/23/2026 — 3:47 AM] [INFO] - Shutdown requested at: 2026-02-23 03:47:06
+[Feb/23/2026 — 3:47 AM] [INFO] - Volume removal: DISABLED — named volumes will be preserved
+[Feb/23/2026 — 3:47 AM] [INFO] - Full system shutdown requested for all 10 service stacks
+[Feb/23/2026 — 3:47 AM] [FOCUS] - Beginning controlled Docker services shutdown...
+[Feb/23/2026 — 3:47 AM] [INFO] - Initiating shutdown of 10 Docker service stacks...
+================ SERVICE SHUTDOWN SEQUENCE ================
+[Feb/23/2026 — 3:47 AM] [INFO] - Stopping services in miscellaneous-services stack...
+ Container skeleton-misc  Stopping
+ Container skeleton-misc  Stopped
+ Container skeleton-misc  Removing
+ Container skeleton-misc  Removed
+ Network miscellaneous-services_default  Removing
+ Network miscellaneous-services_default  Removed
+[Feb/23/2026 — 3:47 AM] [TIMING] - stop_miscellaneous-services completed in 31s
+[Feb/23/2026 — 3:47 AM] [SUCCESS] - miscellaneous-services stack stopped successfully
+[Feb/23/2026 — 3:47 AM] [INFO] - Stopping stacks [#####---------------------------------------------] 10%
+[Feb/23/2026 — 3:47 AM] [INFO] - Stopping services in entertainment-personal stack...
+ Container skeleton-entertainment  Stopping
+ Container skeleton-entertainment  Stopped
+ Container skeleton-entertainment  Removing
+ Container skeleton-entertainment  Removed
+ Network entertainment-personal_default  Removing
+ Network entertainment-personal_default  Removed
+[Feb/23/2026 — 3:48 AM] [TIMING] - stop_entertainment-personal completed in 30s
+[Feb/23/2026 — 3:48 AM] [SUCCESS] - entertainment-personal stack stopped successfully
+[Feb/23/2026 — 3:48 AM] [INFO] - Stopping stacks [##########----------------------------------------] 20%
+[Feb/23/2026 — 3:48 AM] [INFO] - Stopping services in communication-collaboration stack...
+ Container skeleton-comms  Stopping
+ Container skeleton-comms  Stopped
+ Container skeleton-comms  Removing
+ Container skeleton-comms  Removed
+ Network communication-collaboration_default  Removing
+ Network communication-collaboration_default  Removed
+[Feb/23/2026 — 3:48 AM] [TIMING] - stop_communication-collaboration completed in 31s
+[Feb/23/2026 — 3:48 AM] [SUCCESS] - communication-collaboration stack stopped successfully
+[Feb/23/2026 — 3:49 AM] [INFO] - Stopping stacks [###############-----------------------------------] 30%
+[Feb/23/2026 — 3:49 AM] [INFO] - Stopping services in storage-backup stack...

@@ -1,3 +1,4 @@
+#!/bin/bash
 # This script contains functions for handling errors in a standardized and graceful manner.
 
 # Exits the script gracefully while logging an error message with the exit code.

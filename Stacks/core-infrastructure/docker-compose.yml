@@ -1,0 +1,15 @@
+services:
+  redis:
+    container_name: skeleton-redis
+    image: redis:alpine
+    restart: unless-stopped
+    environment:
+      - TZ=${TZ:-UTC}
+    volumes:
+      - ${APP_DATA_DIR:-./App-Data}/Redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
