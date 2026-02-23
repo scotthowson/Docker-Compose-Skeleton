@@ -4,21 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Docker Compose Skeleton is a modular Docker service orchestration system for managing multiple compose stacks with dependency-ordered startup/shutdown, enhanced logging, NTFY push notifications, and intelligent image updates. It is a Bash-based framework (no build system, no tests) designed to be cloned and configured for any server.
-
-## Critical Issue: Hardcoded Paths
-
-The #1 problem is hardcoded paths throughout the codebase. These files all contain `/home/howson/.Docker-Services` or similar absolute paths that must be made dynamic for portability:
-
-- `setup.sh` — `COMPOSE_DIR` hardcoded
-- `start.sh` / `stop.sh` — `BASE_DIR` and `COMPOSE_DIR` hardcoded
-- `.scripts/run.sh` — `COMPOSE_DIR`, `BASE_DIR`, `NTFY_URL` hardcoded
-- `.scripts/stop.sh` — `COMPOSE_DIR`, `BASE_DIR`, `NTFY_URL` hardcoded (also uses `declare -r` which conflicts with re-sourcing)
-- `.scripts/clean-up.sh` — `BASE_DIR` hardcoded to App-Data path
-- `.scripts/ntfy-status.sh` — hardcoded container names and NTFY URL
-- `.config/settings.cfg` — paths are dynamic via `BASE_DIR` (good), but `BASE_DIR` itself comes from the caller
-
-The intended fix: `BASE_DIR` should be auto-detected from the repo root (via `BASH_SOURCE` or a `.env` file) and all scripts should derive paths from it.
+Docker Compose Skeleton is a portable, modular Docker service orchestration framework for managing multiple Compose stacks with dependency-ordered startup/shutdown, enhanced logging, NTFY push notifications, intelligent image updates, and a comprehensive suite of management utilities. It is a Bash-based framework (no build system, no tests) designed to be cloned and configured for any server by any user. All paths are auto-detected from the repository root.
 
 ## Architecture
 
@@ -26,26 +12,38 @@ The intended fix: `BASE_DIR` should be auto-detected from the repo root (via `BA
 
 ```
 ./start.sh (entry point)
+  -> auto-detects BASE_DIR from script location (BASH_SOURCE)
+  -> loads root .env (user configuration)
   -> sources .config/settings.cfg (config + color detection + validation)
-  -> sources .lib/logger.sh (initializes logging system)
+  -> sources .lib/docker-utils.sh (detects docker compose v1 vs v2)
+  -> sources .lib/logger.sh (initializes logging system v3.0)
+  -> sources .lib/banner.sh (ASCII art banners)
   -> sources .scripts/run.sh, update.sh, update_all_stacks.sh, clean-up.sh
+  -> sources .scripts/health-check.sh, system-info.sh (optional)
   -> main():
-       1. verify_environment() — checks docker, docker-compose, base dirs
-       2. initiate_docker_update() — auto-updates docker-compose binary
-       3. cleanup_docker_services() — removes unreferenced App-Data volumes
-       4. start_docker_services() — starts all 10 stacks in dependency order
-       5. update_all_stacks() — pulls latest images, detects changes via SHA256, rolling updates
-       6. check_containers_status() — monitors critical containers via NTFY
+       1. verify_environment() — checks docker, compose, base dirs
+       2. initiate_docker_update() — auto-updates docker-compose binary (v1 only)
+       3. cleanup_docker_services() — removes unreferenced resources
+       4. start_docker_services() — starts all 10 stacks with progress bars + timing
+       5. update_all_stacks() — pulls images, detects changes via SHA256, rolling updates
+       6. run_health_check() — comprehensive container health check with formatted table
 ```
 
-`./stop.sh` mirrors this but only runs `stop_docker_services()` (reverse dependency order).
+`./stop.sh` mirrors this with `show_shutdown_banner`, `stop_docker_services()` (reverse order), post-shutdown verification, and `show_completion_banner`.
+
+`./restart.sh` runs stop followed by start.
+
+`./status.sh` displays container status across all stacks (standalone, no logger dependency).
 
 ### Source Dependency Chain
 
 All scripts assume these are sourced first (in order):
-1. `.config/settings.cfg` — exports `LOG_LEVEL`, `ENABLE_COLORS`, `LOG_FILE`, all feature flags
-2. `.config/palette.sh` — sourced internally by `logger.sh`, provides `COLOR_PALETTE` associative array
-3. `.lib/logger.sh` — must call `initiate_logger` after sourcing; provides all `log_*` functions
+1. Root `.env` — user configuration (loaded via `set -a; source .env; set +a`)
+2. `.config/settings.cfg` — exports `LOG_LEVEL`, `ENABLE_COLORS`, `LOG_FILE`, all feature flags
+3. `.config/palette.sh` — sourced internally by `logger.sh`, provides `COLOR_PALETTE` associative array
+4. `.lib/docker-utils.sh` — detects Docker Compose version, sets `DOCKER_COMPOSE_CMD`
+5. `.lib/logger.sh` — must call `initiate_logger` after sourcing; provides all `log_*` functions
+6. `.lib/banner.sh` — ASCII art banners (optional, loaded via `_source_optional`)
 
 Scripts in `.scripts/` and `.lib/` are **libraries** (sourced, not executed directly). They rely on `log_*` functions and `$COMPOSE_DIR`/`$BASE_DIR` being set by the caller.
 
@@ -53,55 +51,102 @@ Scripts in `.scripts/` and `.lib/` are **libraries** (sourced, not executed dire
 
 10 service categories under `Stacks/`, each with `docker-compose.yml` + `.env`:
 
-**Startup order (dependency):** core-infrastructure → networking-security → monitoring-management → development-tools → media-services → web-applications → storage-backup → communication-collaboration → entertainment-personal → miscellaneous-services
+**Startup order:** core-infrastructure -> networking-security -> monitoring-management -> development-tools -> media-services -> web-applications -> storage-backup -> communication-collaboration -> entertainment-personal -> miscellaneous-services
 
 **Shutdown order:** exact reverse of startup.
 
-Each stack's `.env` is loaded with `set -a; source .env; set +a` before `docker-compose up`.
+### Logger System (v3.0)
 
-### Logger System
+`.lib/logger.sh` (1200+ lines) provides 50+ log functions:
 
-The logger (`.lib/logger.sh`, 600+ lines) provides 20+ log functions: `log_info`, `log_success`, `log_warning`, `log_error`, `log_debug`, `log_critical`, plus extended variants (`log_info_header`, `log_focus`, `log_highlight`, etc.) and modifiers (`log_bold_*`, `log_nodate_*`). All output goes to both console (with colors) and `$LOG_FILE` (plain text). The logger must be initialized with `initiate_logger` and cleaned up with `close_logger`.
+**Core:** `log_info`, `log_success`, `log_warning`, `log_error`, `log_debug`, `log_critical`
+**Extended:** `log_info_header`, `log_focus`, `log_highlight`, `log_alert`, etc.
+**Variants:** `log_bold_*`, `log_nodate_*`, `log_bold_nodate_*`
+**Advanced:** `log_progress`, `log_step`, `log_timer_start/stop`, `log_table`, `log_banner`, `log_keyvalue`, `log_separator`
+**Tracking:** `LOG_ERROR_COUNT`, `LOG_WARNING_COUNT`, `LOG_ENTRY_COUNT` (auto-incremented)
 
-### Notification System
+### Management Utilities
 
-Uses [NTFY](https://ntfy.sh) for push notifications. `NTFY_URL` is currently hardcoded in `.scripts/run.sh` and `.scripts/stop.sh`. Notifications fire for: service start/failure (critical stacks only), shutdown completion, and container health issues.
+Standalone scripts in `.scripts/` with their own color setup and `--help`:
+- `stack-manager.sh` — CLI for individual stacks (start/stop/restart/status/logs/pull/list/running)
+- `health-check.sh` — Container health monitoring with formatted tables
+- `config-validator.sh` — Validates config, directories, compose syntax, ports, system requirements
+- `maintenance.sh` — Cleanup, disk analysis, orphan detection, log rotation (report/disk/prune/deep-prune/orphans/log-rotate)
+- `docker-network-info.sh` — Network visualization with tree-style container connections
+- `image-tracker.sh` — Image age tracking and staleness detection
+- `system-info.sh` — Docker and system resource information
+- `logs-viewer.sh` — Interactive log viewer with filtering and search
 
 ## Key Commands
 
 ```bash
-# Run the full startup sequence (update docker-compose, cleanup, start stacks, pull images)
-./start.sh
+./start.sh                          # Full startup sequence
+./stop.sh                           # Graceful shutdown
+./stop.sh --force                   # Force stop (5s timeout)
+./restart.sh                        # Stop + Start
+./status.sh                         # Container status
+./setup.sh                          # First-run setup
+./start.sh --debug                  # Debug mode
+LOG_LEVEL=DEBUG ./start.sh          # Runtime override
 
-# Stop all services in reverse dependency order
-./stop.sh
-
-# Initial setup (sets permissions on all scripts)
-./setup.sh
+# Management utilities
+.scripts/stack-manager.sh list      # List all stacks
+.scripts/maintenance.sh             # System report
+.scripts/config-validator.sh --fix  # Validate & fix config
+.scripts/docker-network-info.sh     # Network map
+.scripts/image-tracker.sh           # Check image freshness
 ```
 
 There are no tests, no linter, and no CI pipeline.
 
 ## Shell Conventions
 
-- Bash 4+ required (uses associative arrays, `declare -ra`, `${var,,}`)
+- Bash 4+ required (associative arrays, `declare -gA`, `${var,,}`)
 - Functions prefixed with `_` are private/internal
 - All scripts use `#!/bin/bash` shebang
-- Config uses `${VAR:-default}` pattern extensively for safe defaults
-- `export -f` is used to share functions across sourced scripts
+- Config uses `${VAR:-default}` pattern extensively
+- `export -f` shares functions across sourced scripts
 - Color output respects `$ENABLE_COLORS` and `$COLOR_MODE` (auto/always/never)
+- `BASE_DIR` is auto-detected via `BASH_SOURCE` — never hardcoded
+- Standalone utilities detect their own `BASE_DIR` relative to script location
+- Each standalone script has its own color palette (prefixed `_XX_*` to avoid conflicts)
 
 ## Configuration Hierarchy
 
 1. **Defaults** in `.config/settings.cfg` (every setting has a `${VAR:-default}`)
-2. **Environment overrides** via `$ENVIRONMENT` variable (development/testing/staging/production) — see the `case` block at the bottom of `settings.cfg`
-3. **Per-stack** `.env` files in each `Stacks/<category>/` directory
-4. **Runtime** environment variables override everything (e.g., `LOG_LEVEL=DEBUG ./start.sh`)
+2. **Root `.env`** — user-facing configuration (created by `setup.sh` from `.env.example`)
+3. **Environment overrides** via `$ENVIRONMENT` variable (development/testing/staging/production)
+4. **Per-stack** `.env` files in each `Stacks/<category>/` directory
+5. **Runtime** environment variables override everything (e.g., `LOG_LEVEL=DEBUG ./start.sh`)
 
-## Known Issues / Design Debt
+## File Reference
 
-- `declare -r` in `.scripts/stop.sh` for `NTFY_URL`/`COMPOSE_DIR`/`BASE_DIR` causes "readonly variable" errors if the script is sourced multiple times
-- `.scripts/stop.sh` uses `--volumes` flag on `docker-compose down`, which destroys named volumes (destructive by default)
-- `setup.sh` hardcodes user `howson` in `chown` commands
-- The wrapper scripts (`start_docker_services.sh`, `stop_docker_services.sh`, `restart_docker_services.sh`) reference the old hardcoded path structure
-- `README.md` is outdated (references `./docker-compose/` and `run.sh` instead of current structure)
+### Entry Points (executable)
+- `start.sh` — Full startup sequence with banners, progress, health check
+- `stop.sh` — Graceful shutdown with progress bars, verification, cleanup report
+- `restart.sh` — Stop then start wrapper
+- `status.sh` — Container status viewer (standalone, no logger)
+- `setup.sh` — First-run setup
+
+### Libraries (`.lib/`, sourced)
+- `logger.sh` — Enhanced logging system v3.0
+- `banner.sh` — ASCII art banners (startup/shutdown/completion/mini)
+- `docker-utils.sh` — Docker Compose version detection
+- `helpers.sh`, `environment.sh`, `error_handling.sh`, `debugger.sh`
+
+### Core Scripts (`.scripts/`, sourced by entry points)
+- `run.sh` — Service startup with progress, timers, summary tables
+- `stop.sh` — Service shutdown with progress, timers, summary tables
+- `update.sh`, `update_all_stacks.sh`, `clean-up.sh`
+- `ntfy-status.sh`, `ntfy-status-stop.sh`, `ntfy-status-restart.sh`
+- `backup-server.sh`, `wait-for-it.sh`
+
+### Standalone Utilities (`.scripts/`, directly executable)
+- `stack-manager.sh` — Individual stack management CLI
+- `health-check.sh` — Container health monitoring
+- `config-validator.sh` — Configuration validation
+- `maintenance.sh` — Docker maintenance & cleanup
+- `docker-network-info.sh` — Network visualization
+- `image-tracker.sh` — Image update tracking
+- `system-info.sh` — System information
+- `logs-viewer.sh` — Log viewer with filtering
