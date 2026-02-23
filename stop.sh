@@ -1,44 +1,38 @@
 #!/bin/bash
-
 # Base Directory of the Script
+BASE_DIR="/home/howson/.Docker-Services"
 COMPOSE_DIR="/home/howson/.Docker-Services"
-export COMPOSE_DIR
+export BASE_DIR COMPOSE_DIR
 
-# Source Configuration files and Libraries
-for lib in "$COMPOSE_DIR/.config"/*.sh "$COMPOSE_DIR/.lib"/*.sh; do
-    source "$lib"
-done
+# Source the enhanced logger system
+source "$BASE_DIR/.config/settings.cfg"
+source "$BASE_DIR/.lib/logger.sh"
+initiate_logger
 
-# Source Scripts
-for script in "$COMPOSE_DIR/.scripts"/*.sh; do
-    source "$script"
-done
+# Source only the specific scripts we need
+source "$BASE_DIR/.scripts/stop.sh"
 
-# Initialize Logger
-if [[ -z $LOGGER_INITIALIZED ]]; then
-    initiate_logger
-    export LOGGER_INITIALIZED=true
+# Check if the ntfy status script exists before sourcing
+if [[ -f "$BASE_DIR/.scripts/ntfy-status-stop.sh" ]]; then
+    source "$BASE_DIR/.scripts/ntfy-status-stop.sh"
+else
+    log_warning "NTFY status script not found, skipping notification status check"
 fi
-
-# Set Terminal Title
-set_terminal_title "$APPLICATION_TITLE"
 
 # Main Function
 main() {
-    # Log Headers and Environment Verification
-    log_bold_nodate_info_header "[ Made by: Scott Howson ]"
-    verify_environment
-    toggle_debug_mode "Debugger Enabled."
-
-    # Update Docker-Compose
+    log_info_header "Docker Services Stop Script Started"
+    
     stop_docker_services
-
-    # Finalize Execution
-    log_nodate_success "Main script execution complete."
+    
+    if command -v check_stop_containers_status >/dev/null 2>&1; then
+        check_stop_containers_status
+    else
+        log_info "Container status check function not available, skipping"
+    fi
+    
+    log_success "Main script execution complete."
 }
-
-# Error Handling
-trap 'graceful_exit' ERR
 
 # Execute Main Function
 main

@@ -4,7 +4,7 @@
 verify_environment() {
     log_nodate_important "Environment Verification: Ensuring Compatibility..."
 
-    local required_tools=("curl" "neofetch" "docker")  # Add more tools as required
+    local required_tools=("curl" "neofetch" "docker" "jq")  # Add more tools as required
     local tool_missing=false
 
     check_installation() {
