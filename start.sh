@@ -125,17 +125,7 @@ unset PALETTE_QUIET
 source "$BASE_DIR/.scripts/run.sh"
 
 # Optional libraries (graceful skip if missing)
-_source_optional() {
-    local path="$1"
-    local label="$2"
-    if [[ -f "$path" ]]; then
-        source "$path"
-        log_debug "Loaded: $label"
-    else
-        log_debug "Not found, skipping: $label"
-    fi
-}
-
+# _source_optional is provided by docker-utils.sh
 _source_optional "$BASE_DIR/.lib/banner.sh"                  "banner.sh"
 _source_optional "$BASE_DIR/.scripts/update.sh"              "update.sh"
 _source_optional "$BASE_DIR/.scripts/update_all_stacks.sh"   "update_all_stacks.sh"

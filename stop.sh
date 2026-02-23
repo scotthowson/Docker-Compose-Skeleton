@@ -128,17 +128,7 @@ unset PALETTE_QUIET
 source "$BASE_DIR/.scripts/stop.sh"
 
 # Optional libraries (graceful skip if missing)
-_source_optional() {
-    local path="$1"
-    local label="$2"
-    if [[ -f "$path" ]]; then
-        source "$path"
-        log_debug "Loaded: $label"
-    else
-        log_debug "Not found, skipping: $label"
-    fi
-}
-
+# _source_optional is provided by docker-utils.sh
 _source_optional "$BASE_DIR/.lib/banner.sh"                  "banner.sh"
 _source_optional "$BASE_DIR/.scripts/ntfy-status-stop.sh"    "ntfy-status-stop.sh"
 
@@ -174,7 +164,7 @@ main() {
     local total_steps=4
 
     # ── Shutdown Banner ──────────────────────────────────────────────
-    if [[ "${SHOW_STARTUP_BANNER:-true}" == "true" ]] && command -v show_shutdown_banner >/dev/null 2>&1; then
+    if [[ "${SHOW_BANNERS:-${SHOW_STARTUP_BANNER:-true}}" == "true" ]] && command -v show_shutdown_banner >/dev/null 2>&1; then
         show_shutdown_banner
     else
         log_banner "DOCKER SERVICES MANAGER" "Shutdown Sequence — v${SCRIPT_VERSION:-2.0.0}"
@@ -273,7 +263,7 @@ main() {
     log_timer_stop "full_shutdown"
 
     # ── Completion ───────────────────────────────────────────────────
-    if [[ "${SHOW_STARTUP_BANNER:-true}" == "true" ]] && command -v show_completion_banner >/dev/null 2>&1; then
+    if [[ "${SHOW_BANNERS:-${SHOW_STARTUP_BANNER:-true}}" == "true" ]] && command -v show_completion_banner >/dev/null 2>&1; then
         if [[ "$remaining_containers" -gt 0 ]]; then
             show_completion_banner "warning" "Shutdown complete — $remaining_containers containers still running"
         else

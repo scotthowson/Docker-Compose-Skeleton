@@ -57,6 +57,23 @@ _is_compose_v2() {
     [[ "$DOCKER_COMPOSE_CMD" == "docker compose" ]]
 }
 
+# Source an optional script with a log message if the logger is available
+# Args: $1 — file path, $2 — human-readable label
+_source_optional() {
+    local path="$1"
+    local label="$2"
+    if [[ -f "$path" ]]; then
+        source "$path"
+        if command -v log_debug >/dev/null 2>&1; then
+            log_debug "Loaded: $label"
+        fi
+    else
+        if command -v log_debug >/dev/null 2>&1; then
+            log_debug "Not found, skipping: $label"
+        fi
+    fi
+}
+
 # Export functions
-export -f _detect_docker_compose _docker_compose_version_string _is_compose_v2
+export -f _detect_docker_compose _docker_compose_version_string _is_compose_v2 _source_optional
 export DOCKER_COMPOSE_CMD

@@ -13,11 +13,13 @@
 #   status <stack>    Show status of a specific stack
 #   logs <stack>      Show logs for a specific stack
 #   pull <stack>      Pull latest images for a stack
+#   update <stack>    Pull, detect changes, recreate if needed
 #   list              List all available stacks
 #   running           List only running stacks
 #
 # Examples:
 #   ./stack-manager.sh start core-infrastructure
+#   ./stack-manager.sh update media-services
 #   ./stack-manager.sh logs media-services --follow
 #   ./stack-manager.sh status web-applications
 #   ./stack-manager.sh list
@@ -99,13 +101,15 @@ _sm_header() {
     local title="$1"
     local width=60
     local border
-    border="$(printf '%*s' "$width" '' | tr ' ' '-')"
+    border="$(printf '%0.s─' $(seq 1 "$width"))"
+    local heavy_border
+    heavy_border="$(printf '%0.s═' $(seq 1 "$width"))"
 
     echo ""
-    _sm_print "$_SM_BLUE" "+${border}+"
+    echo "  ${_SM_BLUE}╔${heavy_border}╗${_SM_RESET}"
     local pad=$(( (width - ${#title}) / 2 ))
-    printf "  %s|%*s%s%s%s%*s|%s\n" "$_SM_BLUE" "$pad" "" "$_SM_BOLD$_SM_CYAN" "$title" "$_SM_RESET$_SM_BLUE" $(( width - pad - ${#title} )) "" "$_SM_RESET"
-    _sm_print "$_SM_BLUE" "+${border}+"
+    printf "  ${_SM_BLUE}║%*s${_SM_BOLD}${_SM_CYAN}%s${_SM_RESET}${_SM_BLUE}%*s║${_SM_RESET}\n" "$pad" "" "$title" $(( width - pad - ${#title} )) ""
+    echo "  ${_SM_BLUE}╚${heavy_border}╝${_SM_RESET}"
     echo ""
 }
 
@@ -242,9 +246,12 @@ cmd_status() {
     local compose_file="$COMPOSE_DIR/$stack/docker-compose.yml"
     local env_file="$COMPOSE_DIR/$stack/.env"
 
+    local -a compose_args=(-f "$compose_file")
+    [[ -f "$env_file" ]] && compose_args+=(--env-file "$env_file")
+
     # Container status
     local containers
-    containers="$($DOCKER_COMPOSE_CMD -f "$compose_file" ps --format '{{.Name}}|{{.Status}}|{{.Ports}}' 2>/dev/null)"
+    containers="$($DOCKER_COMPOSE_CMD "${compose_args[@]}" ps --format '{{.Name}}|{{.Status}}|{{.Ports}}' 2>/dev/null)"
 
     if [[ -z "$containers" ]]; then
         _sm_warning "No containers running for stack ${_SM_BOLD}$stack${_SM_RESET}"
@@ -279,7 +286,7 @@ cmd_status() {
 
     # Resource usage
     local container_names
-    container_names="$($DOCKER_COMPOSE_CMD -f "$compose_file" ps -q 2>/dev/null)"
+    container_names="$($DOCKER_COMPOSE_CMD "${compose_args[@]}" ps -q 2>/dev/null)"
 
     if [[ -n "$container_names" ]]; then
         _sm_info "Resource usage:"
@@ -300,20 +307,22 @@ cmd_logs() {
     _sm_validate_stack "$stack" || return 1
 
     local compose_file="$COMPOSE_DIR/$stack/docker-compose.yml"
+    local env_file="$COMPOSE_DIR/$stack/.env"
 
     _sm_header "Logs: $stack"
 
-    local -a log_args=(-f "$compose_file" logs)
+    local -a log_args=(-f "$compose_file")
+    [[ -f "$env_file" ]] && log_args+=(--env-file "$env_file")
+    log_args+=(logs)
 
     # Parse additional flags
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --follow|-f) log_args+=(--follow) ;;
-            --tail)      log_args+=(--tail "${2:-100}"); shift ;;
-            --since)     log_args+=(--since "$2"); shift ;;
-            *)           log_args+=("$1") ;;
+            --follow|-f) log_args+=(--follow); shift ;;
+            --tail)      log_args+=(--tail "${2:-100}"); shift 2 ;;
+            --since)     log_args+=(--since "$2"); shift 2 ;;
+            *)           log_args+=("$1"); shift ;;
         esac
-        shift
     done
 
     # Default: last 50 lines if no --follow
@@ -333,19 +342,102 @@ cmd_pull() {
     _sm_validate_stack "$stack" || return 1
 
     local compose_file="$COMPOSE_DIR/$stack/docker-compose.yml"
+    local env_file="$COMPOSE_DIR/$stack/.env"
 
     _sm_header "Pulling images: $stack"
 
-    if $DOCKER_COMPOSE_CMD -f "$compose_file" pull; then
+    local -a args=(-f "$compose_file")
+    [[ -f "$env_file" ]] && args+=(--env-file "$env_file")
+    args+=(pull)
+
+    if $DOCKER_COMPOSE_CMD "${args[@]}"; then
         echo ""
         _sm_success "Images updated for ${_SM_BOLD}$stack${_SM_RESET}"
         echo ""
         _sm_info "Run '${_SM_BOLD}$0 restart $stack${_SM_RESET}' to apply the updates"
+        _sm_info "Or run '${_SM_BOLD}$0 update $stack${_SM_RESET}' to detect and apply changes"
     else
         echo ""
         _sm_error "Failed to pull images for ${_SM_BOLD}$stack${_SM_RESET}"
         return 1
     fi
+}
+
+cmd_update() {
+    local stack="$1"
+    _sm_validate_stack "$stack" || return 1
+
+    local compose_file="$COMPOSE_DIR/$stack/docker-compose.yml"
+    local env_file="$COMPOSE_DIR/$stack/.env"
+
+    _sm_header "Updating: $stack"
+
+    local -a compose_args=(-f "$compose_file")
+    [[ -f "$env_file" ]] && compose_args+=(--env-file "$env_file")
+
+    # Phase 1: Record pre-update image IDs (what running containers use)
+    _sm_info "Recording current image IDs..."
+    declare -A pre_ids=()
+
+    while IFS= read -r img_name; do
+        [[ -z "$img_name" ]] && continue
+        local current_id
+        current_id=$(docker image inspect --format='{{.Id}}' "$img_name" 2>/dev/null)
+        [[ -n "$current_id" ]] && pre_ids["$img_name"]="$current_id"
+    done < <($DOCKER_COMPOSE_CMD "${compose_args[@]}" config 2>/dev/null | grep 'image:' | awk '{print $2}' | sort -u)
+
+    # Phase 2: Pull latest images
+    _sm_info "Pulling latest images..."
+    echo ""
+    if ! $DOCKER_COMPOSE_CMD "${compose_args[@]}" pull; then
+        _sm_error "Failed to pull images"
+        return 1
+    fi
+    echo ""
+
+    # Phase 3: Compare image IDs
+    local changes_detected=false
+    local -a changed_images=()
+
+    for img_name in "${!pre_ids[@]}"; do
+        local new_id
+        new_id=$(docker image inspect --format='{{.Id}}' "$img_name" 2>/dev/null)
+        if [[ "${pre_ids[$img_name]}" != "$new_id" ]]; then
+            changes_detected=true
+            local old_short="${pre_ids[$img_name]:7:12}"
+            local new_short="${new_id:7:12}"
+            changed_images+=("$img_name: ${old_short} -> ${new_short}")
+            _sm_success "Changed: ${_SM_BOLD}$img_name${_SM_RESET} (${old_short} -> ${new_short})"
+        fi
+    done
+
+    if [[ "$changes_detected" == "true" ]]; then
+        echo ""
+        _sm_info "Recreating containers with new images..."
+        echo ""
+
+        local -a up_args=("${compose_args[@]}" up -d --remove-orphans)
+        if [[ "${SKIP_HEALTHCHECK_WAIT:-false}" != "true" ]]; then
+            up_args+=(--wait)
+        fi
+
+        if $DOCKER_COMPOSE_CMD "${up_args[@]}"; then
+            echo ""
+            _sm_success "Stack ${_SM_BOLD}$stack${_SM_RESET} updated successfully"
+            echo ""
+            for change in "${changed_images[@]}"; do
+                _sm_info "  $change"
+            done
+        else
+            echo ""
+            _sm_error "Failed to recreate containers for ${_SM_BOLD}$stack${_SM_RESET}"
+            return 1
+        fi
+    else
+        _sm_success "All images are already up-to-date — no changes needed"
+    fi
+
+    echo ""
 }
 
 cmd_list() {
@@ -366,10 +458,14 @@ cmd_list() {
     for stack in "${stacks[@]}"; do
         (( index++ )) || true
         local compose_file="$COMPOSE_DIR/$stack/docker-compose.yml"
+        local env_file="$COMPOSE_DIR/$stack/.env"
+
+        local -a _list_args=(-f "$compose_file")
+        [[ -f "$env_file" ]] && _list_args+=(--env-file "$env_file")
 
         # Check if any containers are running
         local running_count=0
-        running_count="$($DOCKER_COMPOSE_CMD -f "$compose_file" ps -q 2>/dev/null | wc -l)"
+        running_count="$($DOCKER_COMPOSE_CMD "${_list_args[@]}" ps -q 2>/dev/null | wc -l)"
 
         local status_text status_color
         if [[ "$running_count" -gt 0 ]]; then
@@ -400,8 +496,13 @@ cmd_running() {
 
     for stack in "${stacks[@]}"; do
         local compose_file="$COMPOSE_DIR/$stack/docker-compose.yml"
+        local env_file="$COMPOSE_DIR/$stack/.env"
+
+        local -a _run_args=(-f "$compose_file")
+        [[ -f "$env_file" ]] && _run_args+=(--env-file "$env_file")
+
         local running_count=0
-        running_count="$($DOCKER_COMPOSE_CMD -f "$compose_file" ps -q 2>/dev/null | wc -l)"
+        running_count="$($DOCKER_COMPOSE_CMD "${_run_args[@]}" ps -q 2>/dev/null | wc -l)"
 
         if [[ "$running_count" -gt 0 ]]; then
             (( running_stacks++ ))
@@ -423,8 +524,14 @@ cmd_running() {
 # =============================================================================
 
 show_help() {
+    local _border
+    _border="$(printf '%0.s─' $(seq 1 50))"
+
     cat <<EOF
-${_SM_BOLD}${_SM_CYAN}Docker Compose Skeleton — Stack Manager${_SM_RESET}
+
+  ${_SM_BOLD}${_SM_BLUE}╔$(printf '%0.s═' $(seq 1 50))╗${_SM_RESET}
+  ${_SM_BOLD}${_SM_BLUE}║${_SM_RESET}  ${_SM_BOLD}${_SM_CYAN}Docker Compose Skeleton — Stack Manager${_SM_RESET}  ${_SM_BOLD}${_SM_BLUE}  ║${_SM_RESET}
+  ${_SM_BOLD}${_SM_BLUE}╚$(printf '%0.s═' $(seq 1 50))╝${_SM_RESET}
 
 ${_SM_BOLD}Usage:${_SM_RESET}
   $0 <command> [stack-name] [options]
@@ -436,6 +543,7 @@ ${_SM_BOLD}Commands:${_SM_RESET}
   ${_SM_CYAN}status${_SM_RESET}  <stack>     Show detailed status of a stack
   ${_SM_MAGENTA}logs${_SM_RESET}    <stack>     Show logs (--follow, --tail N, --since TIME)
   ${_SM_BLUE}pull${_SM_RESET}    <stack>     Pull latest images
+  ${_SM_MAGENTA}update${_SM_RESET}  <stack>     Pull, detect changes, and recreate if needed
   ${_SM_WHITE}list${_SM_RESET}                List all available stacks
   ${_SM_WHITE}running${_SM_RESET}             List only running stacks
 
@@ -443,6 +551,7 @@ ${_SM_BOLD}Examples:${_SM_RESET}
   $0 start core-infrastructure
   $0 status web-applications
   $0 logs media-services --follow
+  $0 update monitoring-management
   $0 pull monitoring-management
   $0 list
 
@@ -471,6 +580,7 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
         status)   cmd_status "$@" ;;
         logs)     cmd_logs "$@" ;;
         pull)     cmd_pull "$@" ;;
+        update)   cmd_update "$@" ;;
         list)     cmd_list ;;
         running)  cmd_running ;;
         help|--help|-h) show_help ;;

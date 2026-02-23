@@ -30,6 +30,17 @@ fi
 
 COMPOSE_DIR="${COMPOSE_DIR:-$BASE_DIR/Stacks}"
 
+# Detect Docker Compose command if not already set
+if [[ -z "${DOCKER_COMPOSE_CMD:-}" ]]; then
+    if docker compose version >/dev/null 2>&1; then
+        DOCKER_COMPOSE_CMD="docker compose"
+    elif command -v docker-compose >/dev/null 2>&1; then
+        DOCKER_COMPOSE_CMD="docker-compose"
+    else
+        DOCKER_COMPOSE_CMD="docker compose"
+    fi
+fi
+
 # =============================================================================
 # COLOR SETUP (standalone mode)
 # =============================================================================
@@ -124,6 +135,34 @@ _hc_repeat_char() {
 }
 
 # =============================================================================
+# BATCHED STATS COLLECTION
+# =============================================================================
+
+# Pre-fetch memory stats for all containers in a single Docker API call.
+# Populates the _HC_STATS_CACHE associative array: container_name -> mem_usage
+declare -gA _HC_STATS_CACHE=()
+_HC_STATS_LOADED=false
+
+_hc_load_stats_cache() {
+    [[ "$_HC_STATS_LOADED" == "true" ]] && return
+    _HC_STATS_LOADED=true
+
+    if [[ "${_HC_QUIET:-false}" == "true" ]]; then
+        return
+    fi
+
+    local line
+    while IFS='|' read -r name mem; do
+        [[ -z "$name" ]] && continue
+        # Strip leading slash and whitespace
+        name="${name#/}"
+        name="${name## }"
+        name="${name%% }"
+        _HC_STATS_CACHE["$name"]="$(_hc_format_memory "$mem")"
+    done < <(docker stats --no-stream --format '{{.Name}}|{{.MemUsage}}' 2>/dev/null)
+}
+
+# =============================================================================
 # CONTAINER INSPECTION
 # =============================================================================
 
@@ -205,12 +244,11 @@ _hc_inspect_container() {
         fi
     fi
 
-    # Memory usage (skip if --quiet to avoid slow docker stats call)
+    # Memory usage from batched stats cache (avoids per-container docker stats calls)
     if [[ "${_HC_QUIET:-false}" != "true" ]]; then
-        local mem_raw
-        mem_raw="$(docker stats --no-stream --format '{{.MemUsage}}' "$container_name" 2>/dev/null)"
-        if [[ -n "$mem_raw" ]]; then
-            _CONT_MEMORY="$(_hc_format_memory "$mem_raw")"
+        _hc_load_stats_cache
+        if [[ -n "${_HC_STATS_CACHE[$container_name]+_}" ]]; then
+            _CONT_MEMORY="${_HC_STATS_CACHE[$container_name]}"
         fi
     fi
 
@@ -231,24 +269,24 @@ declare -g _HC_COL_MEMORY=14
 _hc_render_table_border() {
     local style="${1:-middle}"  # top, middle, bottom
 
-    local left middle right
+    local left middle right hchar
     case "$style" in
-        top)    left="+" middle="+" right="+" ;;
-        middle) left="+" middle="+" right="+" ;;
-        bottom) left="+" middle="+" right="+" ;;
+        top)    left="╔" middle="╦" right="╗" hchar="═" ;;
+        middle) left="╠" middle="╬" right="╣" hchar="═" ;;
+        bottom) left="╚" middle="╩" right="╝" hchar="═" ;;
     esac
 
-    printf "%s" "$left"
-    _hc_repeat_char "-" $(( _HC_COL_NAME + 2 ))
+    printf "%s" "${_HC_BLUE}${left}"
+    _hc_repeat_char "$hchar" $(( _HC_COL_NAME + 2 ))
     printf "%s" "$middle"
-    _hc_repeat_char "-" $(( _HC_COL_STATUS + 2 ))
+    _hc_repeat_char "$hchar" $(( _HC_COL_STATUS + 2 ))
     printf "%s" "$middle"
-    _hc_repeat_char "-" $(( _HC_COL_HEALTH + 2 ))
+    _hc_repeat_char "$hchar" $(( _HC_COL_HEALTH + 2 ))
     printf "%s" "$middle"
-    _hc_repeat_char "-" $(( _HC_COL_UPTIME + 2 ))
+    _hc_repeat_char "$hchar" $(( _HC_COL_UPTIME + 2 ))
     printf "%s" "$middle"
-    _hc_repeat_char "-" $(( _HC_COL_MEMORY + 2 ))
-    printf "%s\n" "$right"
+    _hc_repeat_char "$hchar" $(( _HC_COL_MEMORY + 2 ))
+    printf "%s${_HC_RESET}\n" "$right"
 }
 
 _hc_render_table_row() {
@@ -259,20 +297,20 @@ _hc_render_table_row() {
     local memory="$5"
     local color="${6:-${_HC_RESET}}"
 
-    printf "| ${color}%-${_HC_COL_NAME}s${_HC_RESET} " "$name"
-    printf "| ${color}%-${_HC_COL_STATUS}s${_HC_RESET} " "$status"
-    printf "| ${color}%-${_HC_COL_HEALTH}s${_HC_RESET} " "$health"
-    printf "| ${color}%-${_HC_COL_UPTIME}s${_HC_RESET} " "$uptime"
-    printf "| ${color}%-${_HC_COL_MEMORY}s${_HC_RESET} |\n" "$memory"
+    printf "${_HC_BLUE}║${_HC_RESET} ${color}%-${_HC_COL_NAME}s${_HC_RESET} " "$name"
+    printf "${_HC_BLUE}║${_HC_RESET} ${color}%-${_HC_COL_STATUS}s${_HC_RESET} " "$status"
+    printf "${_HC_BLUE}║${_HC_RESET} ${color}%-${_HC_COL_HEALTH}s${_HC_RESET} " "$health"
+    printf "${_HC_BLUE}║${_HC_RESET} ${color}%-${_HC_COL_UPTIME}s${_HC_RESET} " "$uptime"
+    printf "${_HC_BLUE}║${_HC_RESET} ${color}%-${_HC_COL_MEMORY}s${_HC_RESET} ${_HC_BLUE}║${_HC_RESET}\n" "$memory"
 }
 
 _hc_render_header() {
     _hc_render_table_border "top"
-    printf "| ${_HC_BOLD}${_HC_CYAN}%-${_HC_COL_NAME}s${_HC_RESET} " "CONTAINER"
-    printf "| ${_HC_BOLD}${_HC_CYAN}%-${_HC_COL_STATUS}s${_HC_RESET} " "STATE"
-    printf "| ${_HC_BOLD}${_HC_CYAN}%-${_HC_COL_HEALTH}s${_HC_RESET} " "HEALTH"
-    printf "| ${_HC_BOLD}${_HC_CYAN}%-${_HC_COL_UPTIME}s${_HC_RESET} " "UPTIME"
-    printf "| ${_HC_BOLD}${_HC_CYAN}%-${_HC_COL_MEMORY}s${_HC_RESET} |\n" "MEMORY"
+    printf "${_HC_BLUE}║${_HC_RESET} ${_HC_BOLD}${_HC_CYAN}%-${_HC_COL_NAME}s${_HC_RESET} " "CONTAINER"
+    printf "${_HC_BLUE}║${_HC_RESET} ${_HC_BOLD}${_HC_CYAN}%-${_HC_COL_STATUS}s${_HC_RESET} " "STATE"
+    printf "${_HC_BLUE}║${_HC_RESET} ${_HC_BOLD}${_HC_CYAN}%-${_HC_COL_HEALTH}s${_HC_RESET} " "HEALTH"
+    printf "${_HC_BLUE}║${_HC_RESET} ${_HC_BOLD}${_HC_CYAN}%-${_HC_COL_UPTIME}s${_HC_RESET} " "UPTIME"
+    printf "${_HC_BLUE}║${_HC_RESET} ${_HC_BOLD}${_HC_CYAN}%-${_HC_COL_MEMORY}s${_HC_RESET} ${_HC_BLUE}║${_HC_RESET}\n" "MEMORY"
     _hc_render_table_border "middle"
 }
 
@@ -455,7 +493,7 @@ run_health_check() {
             local container_line
             while IFS= read -r container_line; do
                 [[ -n "$container_line" ]] && stack_containers+=("$container_line")
-            done < <(docker compose -f "$compose_file" ps --format '{{.Name}}' 2>/dev/null)
+            done < <($DOCKER_COMPOSE_CMD -f "$compose_file" ps --format '{{.Name}}' 2>/dev/null)
 
             # If no containers from compose, try project label
             if [[ ${#stack_containers[@]} -eq 0 ]]; then
@@ -470,11 +508,11 @@ run_health_check() {
             if [[ "$output_mode" == "table" ]]; then
                 local stack_label
                 stack_label="$(echo "$stack_name" | tr '-' ' ' | sed 's/\b\(.\)/\u\1/g')"
-                printf "| ${_HC_BOLD}${_HC_MAGENTA}%-${_HC_COL_NAME}s${_HC_RESET} " "$stack_label"
-                printf "| ${_HC_DIM}${_HC_GRAY}%-${_HC_COL_STATUS}s${_HC_RESET} " ""
-                printf "| ${_HC_DIM}${_HC_GRAY}%-${_HC_COL_HEALTH}s${_HC_RESET} " ""
-                printf "| ${_HC_DIM}${_HC_GRAY}%-${_HC_COL_UPTIME}s${_HC_RESET} " ""
-                printf "| ${_HC_DIM}${_HC_GRAY}%-${_HC_COL_MEMORY}s${_HC_RESET} |\n" ""
+                printf "${_HC_BLUE}║${_HC_RESET} ${_HC_BOLD}${_HC_MAGENTA}%-${_HC_COL_NAME}s${_HC_RESET} " "$stack_label"
+                printf "${_HC_BLUE}║${_HC_RESET} ${_HC_DIM}${_HC_GRAY}%-${_HC_COL_STATUS}s${_HC_RESET} " ""
+                printf "${_HC_BLUE}║${_HC_RESET} ${_HC_DIM}${_HC_GRAY}%-${_HC_COL_HEALTH}s${_HC_RESET} " ""
+                printf "${_HC_BLUE}║${_HC_RESET} ${_HC_DIM}${_HC_GRAY}%-${_HC_COL_UPTIME}s${_HC_RESET} " ""
+                printf "${_HC_BLUE}║${_HC_RESET} ${_HC_DIM}${_HC_GRAY}%-${_HC_COL_MEMORY}s${_HC_RESET} ${_HC_BLUE}║${_HC_RESET}\n" ""
             fi
 
             for container in "${stack_containers[@]}"; do
@@ -657,4 +695,4 @@ fi
 export -f run_health_check
 export -f _hc_inspect_container _hc_format_uptime _hc_format_memory
 export -f _hc_render_table_border _hc_render_table_row _hc_render_header
-export -f _hc_render_summary _hc_log _hc_repeat_char
+export -f _hc_render_summary _hc_log _hc_repeat_char _hc_load_stats_cache
