@@ -8,7 +8,6 @@ COMPOSE_DIR="/home/howson/.Docker-Services/Stacks"
 
 # Setting executable permissions for the script components
 chmod +x "$COMPOSE_DIR/start.sh"
-chmod +x "$COMPOSE_DIR/restart-system.sh"
 chmod +x "$COMPOSE_DIR/stop.sh"
 chmod +x "$COMPOSE_DIR/.lib/"*
 chmod +x "$COMPOSE_DIR/.scripts/"*
