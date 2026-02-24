@@ -85,9 +85,11 @@ OPTIONS:
 WHAT IT DOES:
   1. Copies .env.example -> .env (if .env does not exist)
   2. Creates App-Data/ and logs/ directories
-  3. Sets executable permissions on all .sh scripts
-  4. Sets ownership to the current user (${CURRENT_USER})
-  5. Verifies Docker and Docker Compose are installed
+  3. Creates stack directories from DOCKER_STACKS in .env
+     (each gets a base docker-compose.yml and .env template)
+  4. Sets executable permissions on all .sh scripts
+  5. Sets ownership to the current user (${CURRENT_USER})
+  6. Verifies Docker and Docker Compose are installed
 
 EOF
     exit 0
@@ -183,10 +185,97 @@ for dir in "${REQUIRED_DIRS[@]}"; do
 done
 
 # =============================================================================
-# STEP 3: Set Executable Permissions
+# STEP 3: Stack Directories
 # =============================================================================
 
-_header "Step 3/5: Script Permissions"
+_header "Step 3/6: Stack Directories"
+_divider
+
+# Read stack list from .env (DOCKER_STACKS), or use defaults
+if [[ -n "${DOCKER_STACKS:-}" ]]; then
+    read -ra _SETUP_STACKS <<< "$DOCKER_STACKS"
+    _info "Using DOCKER_STACKS from .env (${#_SETUP_STACKS[@]} stacks)"
+else
+    _SETUP_STACKS=(
+        "core-infrastructure"
+        "networking-security"
+        "monitoring-management"
+        "development-tools"
+        "media-services"
+        "web-applications"
+        "storage-backup"
+        "communication-collaboration"
+        "entertainment-personal"
+        "miscellaneous-services"
+    )
+    _info "Using default stack list (${#_SETUP_STACKS[@]} stacks)"
+fi
+
+stacks_created=0
+stacks_existed=0
+
+for stack_name in "${_SETUP_STACKS[@]}"; do
+    stack_dir="$COMPOSE_DIR/$stack_name"
+    if [[ -d "$stack_dir" ]]; then
+        ((stacks_existed++))
+        [[ "$VERBOSE" == "true" ]] && _skip "Stack exists: $stack_name"
+    else
+        _run mkdir -p "$stack_dir"
+
+        # Create base docker-compose.yml
+        if [[ "$DRY_RUN" != "true" ]]; then
+            cat > "$stack_dir/docker-compose.yml" <<COMPOSE_EOF
+# =============================================================================
+# $stack_name — Docker Compose Stack
+# Add your services below. See https://docs.docker.com/compose/ for reference.
+# =============================================================================
+
+services:
+  # example:
+  #   image: hello-world
+  #   container_name: example
+  #   restart: unless-stopped
+  #   env_file:
+  #     - .env
+  #   # ports:
+  #   #   - "8080:80"
+  #   # volumes:
+  #   #   - \${APP_DATA_DIR}/example:/data
+COMPOSE_EOF
+        fi
+
+        # Create base .env
+        if [[ "$DRY_RUN" != "true" ]]; then
+            cat > "$stack_dir/.env" <<ENV_EOF
+# =============================================================================
+# $stack_name — Stack Environment Variables
+# These override root .env values for services in this stack.
+# =============================================================================
+
+# Inherit from root .env:
+# PUID, PGID, TZ, APP_DATA_DIR, PROXY_DOMAIN
+ENV_EOF
+        fi
+
+        _ok "Created stack: $stack_name (with docker-compose.yml + .env)"
+        ((stacks_created++))
+    fi
+done
+
+if [[ "$stacks_created" -gt 0 ]]; then
+    _ok "Created $stacks_created new stack director${stacks_created:+ies}"
+fi
+if [[ "$stacks_existed" -gt 0 ]]; then
+    _info "$stacks_existed stack directories already existed"
+fi
+
+unset _SETUP_STACKS
+
+# =============================================================================
+# STEP 4: Set Executable Permissions
+# =============================================================================
+
+_header "Step 4/6: Script Permissions"
 _divider
 
 chmod_count=0
@@ -235,7 +324,7 @@ _ok "Set executable on $chmod_count script files"
 # STEP 4: Set Ownership
 # =============================================================================
 
-_header "Step 4/5: File Ownership"
+_header "Step 5/6: File Ownership"
 _divider
 
 # Only attempt chown if we can (avoids errors in unprivileged containers)
@@ -253,7 +342,7 @@ fi
 # STEP 5: Verify Docker Environment
 # =============================================================================
 
-_header "Step 5/5: Docker Environment"
+_header "Step 6/6: Docker Environment"
 _divider
 
 docker_ok=true

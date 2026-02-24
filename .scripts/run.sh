@@ -34,25 +34,37 @@
 
 # Service startup order (dependency order — first started, last stopped).
 # Each entry corresponds to a subdirectory under $COMPOSE_DIR.
-declare -a DOCKER_SERVICES=(
-    "core-infrastructure"
-    "networking-security"
-    "monitoring-management"
-    "development-tools"
-    "media-services"
-    "web-applications"
-    "storage-backup"
-    "communication-collaboration"
-    "entertainment-personal"
-    "miscellaneous-services"
-)
+#
+# If DOCKER_STACKS is set in .env, use that (space-separated string).
+# Otherwise fall back to the built-in default order.
+if [[ -n "${DOCKER_STACKS:-}" ]]; then
+    read -ra DOCKER_SERVICES <<< "$DOCKER_STACKS"
+else
+    declare -a DOCKER_SERVICES=(
+        "core-infrastructure"
+        "networking-security"
+        "monitoring-management"
+        "development-tools"
+        "media-services"
+        "web-applications"
+        "storage-backup"
+        "communication-collaboration"
+        "entertainment-personal"
+        "miscellaneous-services"
+    )
+fi
 
 # Stacks that should trigger a push notification on successful start.
-declare -a NOTIFICATION_SERVICES=(
-    "core-infrastructure"
-    "web-applications"
-    "communication-collaboration"
-)
+# Configurable via NOTIFICATION_STACKS in .env (space-separated).
+if [[ -n "${NOTIFICATION_STACKS:-}" ]]; then
+    read -ra NOTIFICATION_SERVICES <<< "$NOTIFICATION_STACKS"
+else
+    declare -a NOTIFICATION_SERVICES=(
+        "core-infrastructure"
+        "web-applications"
+        "communication-collaboration"
+    )
+fi
 
 # =============================================================================
 # CORE SERVICE MANAGEMENT
