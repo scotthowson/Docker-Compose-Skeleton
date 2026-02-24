@@ -129,18 +129,30 @@ done
 # =============================================================================
 
 if [[ "$STOP_SERVER" == "true" ]]; then
+    stopped=false
     if [[ -f "$API_PID_FILE" ]]; then
         pid=$(cat "$API_PID_FILE")
         if kill -0 "$pid" 2>/dev/null; then
-            kill "$pid"
+            # Kill the process group to ensure socat children are also stopped
+            kill -- -"$pid" 2>/dev/null || kill "$pid" 2>/dev/null
             rm -f "$API_PID_FILE"
             echo "API server stopped (PID $pid)"
+            stopped=true
         else
             rm -f "$API_PID_FILE"
-            echo "API server was not running (stale PID file removed)"
         fi
-    else
-        echo "No API server PID file found"
+    fi
+
+    # Also try to kill any socat listening on API_PORT as a fallback
+    if [[ "$stopped" == "false" ]]; then
+        found_pid=$(lsof -ti "tcp:${API_PORT}" -sTCP:LISTEN 2>/dev/null || true)
+        if [[ -n "$found_pid" ]]; then
+            kill $found_pid 2>/dev/null
+            rm -f "$API_PID_FILE"
+            echo "API server stopped (found listening on port ${API_PORT})"
+        else
+            echo "API server is not running"
+        fi
     fi
     exit 0
 fi
@@ -166,15 +178,20 @@ fi
 # JSON HELPERS
 # =============================================================================
 
-# Escape a string for safe JSON embedding
+# Escape a string for safe JSON embedding (handles all control characters)
 _api_json_escape() {
     local str="$1"
-    str="${str//\\/\\\\}"
-    str="${str//\"/\\\"}"
-    str="${str//$'\n'/\\n}"
-    str="${str//$'\r'/\\r}"
-    str="${str//$'\t'/\\t}"
-    echo -n "$str"
+    # First strip ANSI escape sequences before doing JSON escaping
+    # Use perl if available (most reliable), otherwise sed
+    if command -v perl >/dev/null 2>&1; then
+        str=$(printf '%s' "$str" | perl -pe 's/\e\[[0-9;]*[a-zA-Z]//g; s/\e\][^\a]*\a//g; s/[\x00-\x08\x0B\x0C\x0E-\x1F]//g' 2>/dev/null) || true
+    fi
+    str="${str//\\/\\\\}"      # backslash
+    str="${str//\"/\\\"}"      # double quote
+    str="${str//$'\n'/\\n}"    # newline
+    str="${str//$'\r'/\\r}"    # carriage return
+    str="${str//$'\t'/\\t}"    # tab
+    printf '%s' "$str"
 }
 
 # Build a standard JSON response envelope
@@ -192,13 +209,15 @@ _api_response() {
         500) status_text="Internal Server Error" ;;
     esac
 
-    local content_length=${#body}
+    # Use byte count (not char count) for Content-Length — critical for UTF-8
+    local content_length
+    content_length=$(printf '%s' "$body" | wc -c)
 
     printf "HTTP/1.1 %s %s\r\n" "$status_code" "$status_text"
-    printf "Content-Type: application/json\r\n"
+    printf "Content-Type: application/json; charset=utf-8\r\n"
     printf "Content-Length: %d\r\n" "$content_length"
     printf "Access-Control-Allow-Origin: *\r\n"
-    printf "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+    printf "Access-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\n"
     printf "Access-Control-Allow-Headers: Content-Type, Authorization\r\n"
     printf "X-API-Version: %s\r\n" "$API_VERSION"
     printf "Connection: close\r\n"
@@ -361,14 +380,32 @@ handle_status() {
     local uptime_seconds
     uptime_seconds=$(awk '{printf "%d", $1}' /proc/uptime 2>/dev/null || echo 0)
 
+    # Fast stack status: run all checks in parallel subshells
     local stacks
     stacks=($(_api_get_stacks))
     local running_stacks=0
+    local tmpdir
+    tmpdir=$(mktemp -d)
+
     for s in "${stacks[@]}"; do
-        local st
-        st=$(_api_stack_status "$s")
-        [[ "$st" == running:* ]] && (( running_stacks++ ))
+        (
+            local compose_file="$COMPOSE_DIR/$s/docker-compose.yml"
+            local env_file="$COMPOSE_DIR/$s/.env"
+            local -a args=(-f "$compose_file")
+            [[ -f "$env_file" ]] && args+=(--env-file "$env_file")
+            local count
+            count=$($DOCKER_COMPOSE_CMD "${args[@]}" ps -q 2>/dev/null | wc -l)
+            echo "$count" > "$tmpdir/$s"
+        ) &
     done
+    wait
+
+    for s in "${stacks[@]}"; do
+        local count=0
+        [[ -f "$tmpdir/$s" ]] && count=$(cat "$tmpdir/$s")
+        [[ "$count" -gt 0 ]] && running_stacks=$(( running_stacks + 1 ))
+    done
+    rm -rf "$tmpdir"
 
     _api_success "{\"timestamp\": \"$(date -u '+%Y-%m-%dT%H:%M:%SZ')\", \"hostname\": \"$(hostname)\", \"uptime_seconds\": $uptime_seconds, \"docker\": {\"containers\": {\"total\": $total_containers, \"running\": $running_containers, \"stopped\": $stopped_containers}, \"images\": $total_images, \"volumes\": $total_volumes, \"networks\": $total_networks}, \"stacks\": {\"total\": ${#stacks[@]}, \"running\": $running_stacks}, \"system\": {\"load_average\": $load_avg, \"memory_mb\": {\"total\": $mem_total, \"available\": $mem_available}, \"disk\": $disk_usage}}"
 }
@@ -379,7 +416,7 @@ handle_health() {
 
     while IFS= read -r cid; do
         [[ -z "$cid" ]] && continue
-        (( total++ ))
+        total=$(( total + 1 ))
 
         local name state health
         name=$(docker inspect --format='{{.Name}}' "$cid" 2>/dev/null | sed 's|^/||')
@@ -387,11 +424,11 @@ handle_health() {
         health=$(docker inspect --format='{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$cid" 2>/dev/null)
 
         if [[ "$state" != "running" ]]; then
-            (( stopped++ ))
+            stopped=$(( stopped + 1 ))
         elif [[ "$health" == "unhealthy" ]]; then
-            (( unhealthy++ ))
+            unhealthy=$(( unhealthy + 1 ))
         else
-            (( healthy++ ))
+            healthy=$(( healthy + 1 ))
         fi
 
         results+=("{\"name\": \"$(_api_json_escape "$name")\", \"state\": \"$state\", \"health\": \"$health\"}")
@@ -730,6 +767,12 @@ handle_config() {
     config+="\"api_port\": $API_PORT,"
     config+="\"api_bind\": \"$API_BIND\","
     config+="\"ntfy_configured\": $([[ -n "${NTFY_URL:-}" ]] && echo true || echo false),"
+    config+="\"ntfy_url\": \"$(_api_json_escape "${NTFY_URL:-}")\","
+    config+="\"ntfy_topic\": \"$(_api_json_escape "${NTFY_TOPIC:-}")\","
+    config+="\"ntfy_priority\": \"$(_api_json_escape "${NTFY_PRIORITY:-default}")\","
+    config+="\"enable_colors\": ${ENABLE_COLORS:-true},"
+    config+="\"color_mode\": \"${COLOR_MODE:-auto}\","
+    config+="\"api_enabled\": ${API_ENABLED:-true},"
     config+="\"server_name\": \"$(_api_json_escape "${SERVER_NAME:-Docker Server}")\","
     config+="\"timezone\": \"${TZ:-UTC}\""
     config+="}"
@@ -761,6 +804,26 @@ handle_system() {
     docker_version=$(_api_json_escape "$(docker --version 2>/dev/null)")
 
     _api_success "{\"hostname\": \"$(hostname)\", \"kernel\": \"$kernel_version\", \"cpu_count\": $cpu_count, \"memory_total_mb\": $mem_total_mb, \"swap_total_mb\": $swap_total_mb, \"docker_version\": \"$docker_version\", \"docker_disk_usage\": $df_json}"
+}
+
+handle_disks() {
+    local -a disk_entries=()
+    while IFS='|' read -r device mount total used available percent; do
+        [[ -z "$device" || "$device" == "Filesystem" ]] && continue
+        # Skip system/firmware mounts that aren't user-relevant
+        case "$mount" in
+            /sys/*|/proc/*|/dev/*|/run/*|/snap/*|/boot/efi|/boot/grub) continue ;;
+        esac
+        # Skip entries with no device path (virtual filesystems)
+        [[ "$device" != /* ]] && continue
+        disk_entries+=("{\"device\": \"$(_api_json_escape "$device")\", \"mount\": \"$(_api_json_escape "$mount")\", \"total\": \"$(_api_json_escape "$total")\", \"used\": \"$(_api_json_escape "$used")\", \"available\": \"$(_api_json_escape "$available")\", \"percent\": \"$(_api_json_escape "$percent")\"}")
+    done < <(df -h --output=source,target,size,used,avail,pcent -x tmpfs -x devtmpfs -x squashfs -x overlay -x efivarfs -x vfat 2>/dev/null | tail -n +2 | awk '{print $1"|"$2"|"$3"|"$4"|"$5"|"$6}')
+
+    local json
+    json=$(printf '%s,' "${disk_entries[@]}")
+    json="[${json%,}]"
+
+    _api_success "{\"total\": ${#disk_entries[@]}, \"disks\": $json}"
 }
 
 handle_networks() {
@@ -810,6 +873,200 @@ handle_volumes() {
     _api_success "{\"total\": ${#entries[@]}, \"volumes\": $json}"
 }
 
+handle_create_network() {
+    local body="$1"
+    if ! command -v jq >/dev/null 2>&1; then
+        _api_error 500 "jq is required for network creation"
+        return
+    fi
+
+    local name driver subnet gateway internal
+    name=$(echo "$body" | jq -r '.name // empty' 2>/dev/null)
+    driver=$(echo "$body" | jq -r '.driver // "bridge"' 2>/dev/null)
+    subnet=$(echo "$body" | jq -r '.subnet // empty' 2>/dev/null)
+    gateway=$(echo "$body" | jq -r '.gateway // empty' 2>/dev/null)
+    internal=$(echo "$body" | jq -r '.internal // false' 2>/dev/null)
+
+    if [[ -z "$name" ]]; then
+        _api_error 400 "Network name is required"
+        return
+    fi
+
+    # Validate name (alphanumeric, hyphens, underscores)
+    if [[ ! "$name" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]*$ ]]; then
+        _api_error 400 "Invalid network name. Use alphanumeric characters, hyphens, underscores, and dots."
+        return
+    fi
+
+    # Check if network already exists
+    if docker network inspect "$name" >/dev/null 2>&1; then
+        _api_error 409 "Network '$name' already exists"
+        return
+    fi
+
+    # Build docker command
+    local -a cmd=(docker network create --driver "$driver")
+    if [[ -n "$subnet" ]]; then
+        cmd+=(--subnet "$subnet")
+    fi
+    if [[ -n "$gateway" ]]; then
+        cmd+=(--gateway "$gateway")
+    fi
+    if [[ "$internal" == "true" ]]; then
+        cmd+=(--internal)
+    fi
+    cmd+=("$name")
+
+    local output
+    output=$("${cmd[@]}" 2>&1) || {
+        _api_error 500 "Failed to create network: $(_api_json_escape "$output")"
+        return
+    }
+
+    _api_success "{\"success\": true, \"name\": \"$(_api_json_escape "$name")\", \"driver\": \"$(_api_json_escape "$driver")\", \"message\": \"Network '$name' created successfully\"}"
+}
+
+handle_delete_network() {
+    local name="$1"
+
+    if [[ -z "$name" ]]; then
+        _api_error 400 "Network name is required"
+        return
+    fi
+
+    # Check if network exists
+    if ! docker network inspect "$name" >/dev/null 2>&1; then
+        _api_error 404 "Network '$name' not found"
+        return
+    fi
+
+    # Prevent deleting built-in networks
+    if [[ "$name" == "bridge" || "$name" == "host" || "$name" == "none" ]]; then
+        _api_error 403 "Cannot delete built-in network '$name'"
+        return
+    fi
+
+    # Check for connected containers
+    local connected
+    connected=$(docker network inspect --format='{{range $k, $v := .Containers}}{{$v.Name}} {{end}}' "$name" 2>/dev/null | tr ' ' '\n' | grep -v '^$' | wc -l || true)
+    if [[ "$connected" -gt 0 ]]; then
+        _api_error 409 "Network '$name' has $connected connected container(s). Disconnect them first."
+        return
+    fi
+
+    local output
+    output=$(docker network rm "$name" 2>&1) || {
+        _api_error 500 "Failed to delete network: $(_api_json_escape "$output")"
+        return
+    }
+
+    _api_success "{\"success\": true, \"name\": \"$(_api_json_escape "$name")\", \"message\": \"Network '$name' deleted successfully\"}"
+}
+
+handle_network_connect() {
+    local name="$1" body="$2"
+    if ! command -v jq >/dev/null 2>&1; then
+        _api_error 500 "jq is required"
+        return
+    fi
+
+    local container
+    container=$(echo "$body" | jq -r '.container // empty' 2>/dev/null)
+
+    if [[ -z "$container" ]]; then
+        _api_error 400 "Container name is required"
+        return
+    fi
+
+    local output
+    output=$(docker network connect "$name" "$container" 2>&1) || {
+        _api_error 500 "Failed to connect: $(_api_json_escape "$output")"
+        return
+    }
+
+    _api_success "{\"success\": true, \"network\": \"$(_api_json_escape "$name")\", \"container\": \"$(_api_json_escape "$container")\", \"message\": \"Connected '$container' to '$name'\"}"
+}
+
+handle_network_disconnect() {
+    local name="$1" body="$2"
+    if ! command -v jq >/dev/null 2>&1; then
+        _api_error 500 "jq is required"
+        return
+    fi
+
+    local container
+    container=$(echo "$body" | jq -r '.container // empty' 2>/dev/null)
+
+    if [[ -z "$container" ]]; then
+        _api_error 400 "Container name is required"
+        return
+    fi
+
+    local output
+    output=$(docker network disconnect "$name" "$container" 2>&1) || {
+        _api_error 500 "Failed to disconnect: $(_api_json_escape "$output")"
+        return
+    }
+
+    _api_success "{\"success\": true, \"network\": \"$(_api_json_escape "$name")\", \"container\": \"$(_api_json_escape "$container")\", \"message\": \"Disconnected '$container' from '$name'\"}"
+}
+
+handle_network_detail() {
+    local name="$1"
+
+    if ! docker network inspect "$name" >/dev/null 2>&1; then
+        _api_error 404 "Network '$name' not found"
+        return
+    fi
+
+    local inspect_json
+    inspect_json=$(docker network inspect "$name" 2>/dev/null)
+
+    local id driver scope internal ipam_subnet ipam_gateway
+    id=$(echo "$inspect_json" | jq -r '.[0].Id // empty' 2>/dev/null)
+    driver=$(echo "$inspect_json" | jq -r '.[0].Driver // empty' 2>/dev/null)
+    scope=$(echo "$inspect_json" | jq -r '.[0].Scope // empty' 2>/dev/null)
+    internal=$(echo "$inspect_json" | jq -r '.[0].Internal // false' 2>/dev/null)
+    ipam_subnet=$(echo "$inspect_json" | jq -r '.[0].IPAM.Config[0].Subnet // empty' 2>/dev/null)
+    ipam_gateway=$(echo "$inspect_json" | jq -r '.[0].IPAM.Config[0].Gateway // empty' 2>/dev/null)
+
+    # Get containers with their IPs
+    local -a container_entries=()
+    while IFS='|' read -r cid cname cipv4; do
+        [[ -z "$cid" ]] && continue
+        container_entries+=("{\"id\": \"$(_api_json_escape "$cid")\", \"name\": \"$(_api_json_escape "$cname")\", \"ipv4\": \"$(_api_json_escape "$cipv4")\"}")
+    done < <(echo "$inspect_json" | jq -r '.[0].Containers | to_entries[] | "\(.key)|\(.value.Name)|\(.value.IPv4Address)"' 2>/dev/null)
+
+    local ce_json
+    ce_json=$(printf '%s,' "${container_entries[@]}")
+    ce_json="[${ce_json%,}]"
+
+    _api_success "{\"id\": \"$(_api_json_escape "$id")\", \"name\": \"$(_api_json_escape "$name")\", \"driver\": \"$(_api_json_escape "$driver")\", \"scope\": \"$(_api_json_escape "$scope")\", \"internal\": $internal, \"subnet\": \"$(_api_json_escape "$ipam_subnet")\", \"gateway\": \"$(_api_json_escape "$ipam_gateway")\", \"containers\": $ce_json}"
+}
+
+handle_delete_volume() {
+    local name="$1"
+
+    if [[ -z "$name" ]]; then
+        _api_error 400 "Volume name is required"
+        return
+    fi
+
+    # Check if volume exists
+    if ! docker volume inspect "$name" >/dev/null 2>&1; then
+        _api_error 404 "Volume '$name' not found"
+        return
+    fi
+
+    local output
+    output=$(docker volume rm "$name" 2>&1) || {
+        _api_error 500 "Failed to delete volume: $(_api_json_escape "$output"). It may be in use by a container."
+        return
+    }
+
+    _api_success "{\"success\": true, \"name\": \"$(_api_json_escape "$name")\", \"message\": \"Volume '$name' deleted successfully\"}"
+}
+
 handle_logs() {
     local log_file="${BASE_DIR}/logs/docker-services.log"
 
@@ -844,6 +1101,268 @@ handle_events() {
 }
 
 # =============================================================================
+# CONTAINER ACTION HANDLERS
+# =============================================================================
+
+handle_container_action() {
+    local name="$1"
+    local action="$2"
+
+    if ! docker inspect "$name" >/dev/null 2>&1; then
+        _api_error 404 "Container not found: $name"
+        return
+    fi
+
+    local output=""
+    local success=true
+
+    case "$action" in
+        start)   output=$(docker start "$name" 2>&1) || success=false ;;
+        stop)    output=$(docker stop "$name" 2>&1) || success=false ;;
+        restart) output=$(docker restart "$name" 2>&1) || success=false ;;
+        *)       _api_error 400 "Unknown action: $action"; return ;;
+    esac
+
+    local escaped_output
+    escaped_output=$(_api_json_escape "$output")
+
+    _api_success "{\"container\": \"$(_api_json_escape "$name")\", \"action\": \"$action\", \"success\": $success, \"output\": \"$escaped_output\"}"
+}
+
+handle_container_logs() {
+    local name="$1"
+
+    if ! docker inspect "$name" >/dev/null 2>&1; then
+        _api_error 404 "Container not found: $name"
+        return
+    fi
+
+    local logs_raw
+    logs_raw=$(docker logs --tail 100 "$name" 2>&1)
+    local escaped
+    escaped=$(_api_json_escape "$logs_raw")
+
+    _api_success "{\"container\": \"$(_api_json_escape "$name")\", \"lines\": 100, \"logs\": \"$escaped\"}"
+}
+
+# =============================================================================
+# MAINTENANCE HANDLERS
+# =============================================================================
+
+handle_maintenance_prune() {
+    local output=""
+    local success=true
+
+    output=$(docker system prune -f 2>&1) || success=false
+    local escaped
+    escaped=$(_api_json_escape "$output")
+
+    _api_success "{\"action\": \"prune\", \"success\": $success, \"output\": \"$escaped\"}"
+}
+
+handle_maintenance_image_prune() {
+    local output=""
+    local success=true
+
+    if [[ "${AGGRESSIVE_IMAGE_PRUNE:-false}" == "true" ]]; then
+        output=$(docker image prune -a -f 2>&1) || success=false
+    else
+        output=$(docker image prune -f 2>&1) || success=false
+    fi
+    local escaped
+    escaped=$(_api_json_escape "$output")
+
+    _api_success "{\"action\": \"image_prune\", \"success\": $success, \"output\": \"$escaped\"}"
+}
+
+# =============================================================================
+# STACK CREATE / DELETE HANDLERS
+# =============================================================================
+
+handle_create_stack() {
+    local body="$1"
+
+    if ! command -v jq >/dev/null 2>&1; then
+        _api_error 500 "jq is required for stack creation"
+        return
+    fi
+
+    local name
+    name=$(echo "$body" | jq -r '.name // empty' 2>/dev/null)
+
+    if [[ -z "$name" ]]; then
+        _api_error 400 "Missing required field: name"
+        return
+    fi
+
+    # Validate name: lowercase letters, numbers, hyphens only
+    if [[ ! "$name" =~ ^[a-z0-9][a-z0-9-]*[a-z0-9]$ ]] && [[ ! "$name" =~ ^[a-z0-9]$ ]]; then
+        _api_error 400 "Invalid stack name. Use lowercase letters, numbers, and hyphens only."
+        return
+    fi
+
+    local stack_dir="$COMPOSE_DIR/$name"
+
+    if [[ -d "$stack_dir" ]]; then
+        _api_error 409 "Stack already exists: $name"
+        return
+    fi
+
+    # Create directory
+    mkdir -p "$stack_dir" 2>/dev/null
+    if [[ ! -d "$stack_dir" ]]; then
+        _api_error 500 "Failed to create stack directory"
+        return
+    fi
+
+    # Create base docker-compose.yml
+    cat > "$stack_dir/docker-compose.yml" <<'COMPOSE_EOF'
+services:
+  # Add your services here
+  # Example:
+  # my-service:
+  #   container_name: my-service
+  #   image: alpine:latest
+  #   restart: unless-stopped
+  #   environment:
+  #     - TZ=${TZ:-UTC}
+  #   volumes:
+  #     - ${APP_DATA_DIR:-./App-Data}/my-service:/data
+COMPOSE_EOF
+
+    # Create base .env
+    cat > "$stack_dir/.env" <<ENV_EOF
+# =============================================================================
+# Stack: $name
+# =============================================================================
+# Stack-specific environment variables.
+# Variables are inherited from the root .env file.
+# Add any stack-specific overrides below.
+# =============================================================================
+
+# APP_DATA_DIR is inherited from root .env
+# TZ is inherited from root .env
+# PUID and PGID are inherited from root .env
+ENV_EOF
+
+    # Create App-Data directory
+    mkdir -p "$stack_dir/App-Data" 2>/dev/null
+
+    _api_success "{\"success\": true, \"name\": \"$name\", \"message\": \"Stack '$name' created successfully\"}"
+}
+
+handle_delete_stack() {
+    local name="$1"
+
+    if [[ -z "$name" ]]; then
+        _api_error 400 "Missing stack name"
+        return
+    fi
+
+    local stack_dir="$COMPOSE_DIR/$name"
+
+    if [[ ! -d "$stack_dir" ]]; then
+        _api_error 404 "Stack not found: $name"
+        return
+    fi
+
+    # Safety: check if stack has running containers
+    local running_count=0
+    if [[ -f "$stack_dir/docker-compose.yml" ]]; then
+        running_count=$($DOCKER_COMPOSE_CMD -f "$stack_dir/docker-compose.yml" ps -q 2>/dev/null | wc -l || true)
+    fi
+
+    if [[ "$running_count" -gt 0 ]] 2>/dev/null; then
+        _api_error 409 "Cannot delete stack with running containers. Stop the stack first."
+        return
+    fi
+
+    # Remove the stack directory
+    rm -rf "$stack_dir" 2>/dev/null
+
+    if [[ -d "$stack_dir" ]]; then
+        _api_error 500 "Failed to delete stack directory"
+        return
+    fi
+
+    _api_success "{\"success\": true, \"name\": \"$name\", \"message\": \"Stack '$name' deleted successfully\"}"
+}
+
+# =============================================================================
+# CONFIG UPDATE HANDLER
+# =============================================================================
+
+handle_config_update() {
+    local body="$1"
+    local env_file="$BASE_DIR/.env"
+
+    if [[ ! -f "$env_file" ]]; then
+        _api_error 500 "Configuration file not found: $env_file"
+        return
+    fi
+
+    if ! command -v jq >/dev/null 2>&1; then
+        _api_error 500 "jq is required for config updates"
+        return
+    fi
+
+    # Parse the JSON body and update .env file
+    # Expected format: { "key": "value", "key2": "value2" }
+    local -A updates=()
+    local keys
+    keys=$(echo "$body" | jq -r 'keys[]' 2>/dev/null)
+    if [[ $? -ne 0 ]] || [[ -z "$keys" ]]; then
+        _api_error 400 "Invalid JSON body"
+        return
+    fi
+
+    # Allowed config keys that can be updated (safety whitelist)
+    local -A allowed_keys=(
+        [ENVIRONMENT]=1 [LOG_LEVEL]=1 [SKIP_HEALTHCHECK_WAIT]=1
+        [CONTINUE_ON_FAILURE]=1 [REMOVE_VOLUMES_ON_STOP]=1
+        [AGGRESSIVE_IMAGE_PRUNE]=1 [UPDATE_NOTIFICATION]=1
+        [SHOW_BANNERS]=1 [API_PORT]=1 [API_BIND]=1 [API_ENABLED]=1
+        [SERVER_NAME]=1 [TZ]=1 [NTFY_URL]=1 [NTFY_TOPIC]=1
+        [NTFY_PRIORITY]=1 [ENABLE_COLORS]=1 [COLOR_MODE]=1
+    )
+
+    local changed=0
+    while IFS= read -r key; do
+        [[ -z "$key" ]] && continue
+        if [[ -z "${allowed_keys[$key]:-}" ]]; then
+            _api_error 400 "Key not allowed: $key"
+            return
+        fi
+        local value
+        value=$(echo "$body" | jq -r ".[\"$key\"]" 2>/dev/null)
+        updates["$key"]="$value"
+    done <<< "$keys"
+
+    # Backup current .env
+    cp "$env_file" "${env_file}.bak" 2>/dev/null
+
+    # Apply updates to .env file
+    for key in "${!updates[@]}"; do
+        local value="${updates[$key]}"
+        if grep -q "^${key}=" "$env_file" 2>/dev/null; then
+            # Update existing key
+            sed -i "s|^${key}=.*|${key}=${value}|" "$env_file"
+        else
+            # Append new key
+            echo "${key}=${value}" >> "$env_file"
+        fi
+        changed=$(( changed + 1 ))
+    done
+
+    # Re-source .env to pick up changes
+    set -a
+    source "$env_file"
+    set +a
+
+    _api_success "{\"success\": true, \"updated\": $changed, \"message\": \"Configuration updated. Some changes may require a restart.\"}"
+}
+
+# =============================================================================
 # REQUEST ROUTER
 # =============================================================================
 
@@ -858,12 +1377,23 @@ handle_request() {
     method=$(echo "$request_line" | awk '{print $1}')
     path=$(echo "$request_line" | awk '{print $2}')
 
-    # Consume remaining headers (read until empty line)
-    local header=""
+    # Consume remaining headers and capture Content-Length
+    local header="" content_length=0
     while IFS= read -r header; do
         header="${header%%$'\r'}"
         [[ -z "$header" ]] && break
+        # Capture content-length (case-insensitive)
+        if [[ "${header,,}" == content-length:* ]]; then
+            content_length="${header#*: }"
+            content_length="${content_length// /}"
+        fi
     done
+
+    # Read request body if present
+    local request_body=""
+    if [[ "$content_length" -gt 0 ]] 2>/dev/null; then
+        request_body=$(dd bs=1 count="$content_length" 2>/dev/null)
+    fi
 
     # Normalize path: strip trailing slash, lowercase
     path="${path%/}"
@@ -890,6 +1420,7 @@ handle_request() {
             /containers)                handle_containers ;;
             /config)                    handle_config ;;
             /system)                    handle_system ;;
+            /disks)                     handle_disks ;;
             /networks)                  handle_networks ;;
             /volumes)                   handle_volumes ;;
             /logs)                      handle_logs ;;
@@ -915,6 +1446,15 @@ handle_request() {
                 container="${container%/stats}"
                 handle_container_stats "$container"
                 ;;
+            /containers/*/logs)
+                local container="${path#/containers/}"
+                container="${container%/logs}"
+                handle_container_logs "$container"
+                ;;
+            /networks/*)
+                local network="${path#/networks/}"
+                handle_network_detail "$network"
+                ;;
             /containers/*)
                 local container="${path#/containers/}"
                 handle_container_detail "$container"
@@ -929,6 +1469,61 @@ handle_request() {
     # ── Route: POST endpoints ─────────────────────────────────────────
     if [[ "$method" == "POST" ]]; then
         case "$path" in
+            /stacks)
+                handle_create_stack "$request_body"
+                ;;
+            /stacks/*/delete)
+                local stack="${path#/stacks/}"
+                stack="${stack%/delete}"
+                handle_delete_stack "$stack"
+                ;;
+            /config)
+                handle_config_update "$request_body"
+                ;;
+            /containers/*/start)
+                local container="${path#/containers/}"
+                container="${container%/start}"
+                handle_container_action "$container" "start"
+                ;;
+            /containers/*/stop)
+                local container="${path#/containers/}"
+                container="${container%/stop}"
+                handle_container_action "$container" "stop"
+                ;;
+            /containers/*/restart)
+                local container="${path#/containers/}"
+                container="${container%/restart}"
+                handle_container_action "$container" "restart"
+                ;;
+            /networks)
+                handle_create_network "$request_body"
+                ;;
+            /networks/*/delete)
+                local network="${path#/networks/}"
+                network="${network%/delete}"
+                handle_delete_network "$network"
+                ;;
+            /networks/*/connect)
+                local network="${path#/networks/}"
+                network="${network%/connect}"
+                handle_network_connect "$network" "$request_body"
+                ;;
+            /networks/*/disconnect)
+                local network="${path#/networks/}"
+                network="${network%/disconnect}"
+                handle_network_disconnect "$network" "$request_body"
+                ;;
+            /volumes/*/delete)
+                local volume="${path#/volumes/}"
+                volume="${volume%/delete}"
+                handle_delete_volume "$volume"
+                ;;
+            /maintenance/prune)
+                handle_maintenance_prune
+                ;;
+            /maintenance/image-prune)
+                handle_maintenance_image_prune
+                ;;
             /stacks/*/start)
                 local stack="${path#/stacks/}"
                 stack="${stack%/start}"
@@ -1011,8 +1606,8 @@ start_server() {
     echo "  ${_A_BOLD}${_A_BLUE}${border}${_A_RST}"
     echo ""
 
-    # Write PID file
-    echo $$ > "$API_PID_FILE"
+    # Write PID file (use $BASHPID for the actual process PID, not $$ which is always the parent)
+    echo "${BASHPID:-$$}" > "$API_PID_FILE"
 
     local self_path
     self_path="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
@@ -1041,8 +1636,11 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
 
     if [[ "$DAEMON_MODE" == "true" ]]; then
         start_server >> "$API_LOG_FILE" 2>&1 &
+        bg_pid=$!
         disown
-        echo "API server started in background (PID: $!)"
+        # Overwrite PID file with the actual background PID
+        echo "$bg_pid" > "$API_PID_FILE"
+        echo "API server started in background (PID: $bg_pid)"
         echo "Log: $API_LOG_FILE"
         echo "Stop: $0 --stop"
     else

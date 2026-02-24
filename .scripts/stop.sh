@@ -34,18 +34,30 @@
 
 # Service shutdown order (reverse of startup dependency order).
 # Each entry corresponds to a subdirectory under $COMPOSE_DIR.
-declare -a DOCKER_SERVICES_STOP=(
-    "miscellaneous-services"
-    "entertainment-personal"
-    "communication-collaboration"
-    "storage-backup"
-    "web-applications"
-    "media-services"
-    "development-tools"
-    "monitoring-management"
-    "networking-security"
-    "core-infrastructure"
-)
+#
+# If DOCKER_STACKS is set in .env, auto-reverse it for shutdown.
+# Otherwise fall back to the built-in default reverse order.
+if [[ -n "${DOCKER_STACKS:-}" ]]; then
+    read -ra _start_order <<< "$DOCKER_STACKS"
+    declare -a DOCKER_SERVICES_STOP=()
+    for (( i=${#_start_order[@]}-1; i>=0; i-- )); do
+        DOCKER_SERVICES_STOP+=("${_start_order[i]}")
+    done
+    unset _start_order
+else
+    declare -a DOCKER_SERVICES_STOP=(
+        "miscellaneous-services"
+        "entertainment-personal"
+        "communication-collaboration"
+        "storage-backup"
+        "web-applications"
+        "media-services"
+        "development-tools"
+        "monitoring-management"
+        "networking-security"
+        "core-infrastructure"
+    )
+fi
 
 # =============================================================================
 # CORE SERVICE MANAGEMENT

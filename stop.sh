@@ -67,14 +67,15 @@ OPTIONS:
   --force, -f    Force stop with shorter timeout (5s instead of 30s)
 
 SHUTDOWN ORDER (reverse of startup):
-  miscellaneous-services -> entertainment-personal -> communication-collaboration
-  -> storage-backup -> web-applications -> media-services -> development-tools
-  -> monitoring-management -> networking-security -> core-infrastructure
+  Determined by DOCKER_STACKS in .env (automatically reversed).
+  Default: miscellaneous-services -> ... -> core-infrastructure
 
 CONFIGURATION (.env):
+  DOCKER_STACKS="..."            Customize stack categories and order
   REMOVE_VOLUMES_ON_STOP=true    Also remove named volumes (DESTRUCTIVE!)
   SERVICE_STOP_DELAY=2           Delay between stopping stacks (seconds)
   SHOW_STARTUP_BANNER=true       Show the shutdown banner
+  API_ENABLED=true               Also stops the REST API server on shutdown
 
 ENVIRONMENT OVERRIDES:
   LOG_LEVEL=DEBUG ./stop.sh      Override log level
@@ -183,6 +184,7 @@ main() {
     log_keyvalue "Volumes on Stop" "$([[ "${REMOVE_VOLUMES_ON_STOP:-false}" == "true" ]] && echo "REMOVE (destructive)" || echo "Preserve")"
     log_keyvalue "Force Mode"      "$([[ "${FORCE_STOP_MODE:-false}" == "true" ]] && echo "Enabled (5s timeout)" || echo "Disabled (30s timeout)")"
     log_keyvalue "Notifications"   "$([[ -n "${NTFY_URL:-}" ]] && echo "Enabled" || echo "Disabled")"
+    log_keyvalue "API Server"      "$([[ "${API_ENABLED:-false}" == "true" ]] && echo "Will be stopped" || echo "Not enabled")"
     log_keyvalue "Initiated at"    "$(date '+%Y-%m-%d %H:%M:%S')"
     log_separator "-" 60
 
@@ -208,6 +210,16 @@ main() {
     log_keyvalue "Docker" "$(docker --version 2>/dev/null | sed 's/Docker version /v/' | cut -d, -f1)"
     log_keyvalue "Compose" "$(_docker_compose_version_string)"
     log_success "Docker environment verified"
+
+    # ── Stop REST API server if running ──────────────────────────────
+    # Stop if: PID file exists OR API_ENABLED=true (covers orphaned processes)
+    local api_script="$BASE_DIR/.scripts/api-server.sh"
+    if [[ -x "$api_script" ]]; then
+        if [[ -f "/tmp/dcs-api-server.pid" ]] || [[ "${API_ENABLED:-false}" == "true" ]]; then
+            log_info "Stopping REST API server..."
+            "$api_script" --stop 2>/dev/null && log_success "REST API server stopped" || log_debug "REST API server was not running"
+        fi
+    fi
 
     # ══════════════════════════════════════════════════════════════════
     # Step 2: Stop All Stacks (Reverse Dependency Order)

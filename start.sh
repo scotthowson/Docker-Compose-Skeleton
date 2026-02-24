@@ -127,6 +127,7 @@ source "$BASE_DIR/.scripts/run.sh"
 # Optional libraries (graceful skip if missing)
 # _source_optional is provided by docker-utils.sh
 _source_optional "$BASE_DIR/.lib/banner.sh"                  "banner.sh"
+_source_optional "$BASE_DIR/.lib/environment.sh"             "environment.sh"
 _source_optional "$BASE_DIR/.scripts/update.sh"              "update.sh"
 _source_optional "$BASE_DIR/.scripts/update_all_stacks.sh"   "update_all_stacks.sh"
 _source_optional "$BASE_DIR/.scripts/clean-up.sh"            "clean-up.sh"
@@ -245,6 +246,11 @@ main() {
         _graceful_exit 1
     fi
 
+    # Run tool verification (curl, docker, jq, socat, ncat) if available
+    if command -v verify_environment >/dev/null 2>&1; then
+        verify_environment
+    fi
+
     # ══════════════════════════════════════════════════════════════════
     # Step 2: Update Docker Compose Binary
     # ══════════════════════════════════════════════════════════════════
@@ -309,6 +315,22 @@ main() {
         fi
     else
         log_info "Post-startup health check disabled"
+    fi
+
+    # ══════════════════════════════════════════════════════════════════
+    # Optional: Start REST API Server
+    # ══════════════════════════════════════════════════════════════════
+    if [[ "${API_ENABLED:-false}" == "true" ]]; then
+        local api_script="$BASE_DIR/.scripts/api-server.sh"
+        if [[ -x "$api_script" ]]; then
+            # Stop any existing instance first
+            "$api_script" --stop 2>/dev/null || true
+            log_info "Starting REST API server on ${API_BIND:-127.0.0.1}:${API_PORT:-9876}..."
+            "$api_script" --daemon --port "${API_PORT:-9876}" --bind "${API_BIND:-127.0.0.1}"
+            log_success "REST API server started (daemon mode)"
+        else
+            log_warning "API_ENABLED=true but api-server.sh not found or not executable at: $api_script"
+        fi
     fi
 
     # ── Disable debug trace ───────────────────────────────────────────

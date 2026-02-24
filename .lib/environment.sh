@@ -74,7 +74,7 @@ _ensure_tool_installed() {
 verify_environment() {
     log_nodate_important "Environment Verification: Ensuring Compatibility..."
 
-    local -a required_tools=("curl" "docker" "jq")
+    local -a required_tools=("curl" "docker" "jq" "socat" "ncat")
 
     for tool in "${required_tools[@]}"; do
         _ensure_tool_installed "$tool"
