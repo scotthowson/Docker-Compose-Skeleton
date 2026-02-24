@@ -17,6 +17,7 @@
 #   GET  /stacks/:name              Detailed info for a specific stack
 #   GET  /stacks/:name/containers   Containers in a specific stack
 #   GET  /stacks/:name/logs         Recent logs for a stack (last 50 lines)
+#   GET  /stacks/:name/compose      Raw docker-compose.yml content for a stack
 #   POST /stacks/:name/start        Start a specific stack
 #   POST /stacks/:name/stop         Stop a specific stack
 #   POST /stacks/:name/restart      Restart a specific stack
@@ -26,6 +27,7 @@
 #   GET  /containers                All containers with status
 #   GET  /containers/:name          Detailed info for a specific container
 #   GET  /containers/:name/stats    Live resource stats for a container
+#   GET  /containers/:name/processes Process list for a container
 #   GET  /config                    Current configuration (sanitized)
 #   GET  /system                    System resource information
 #   GET  /networks                  Docker networks and connections
@@ -33,6 +35,17 @@
 #   GET  /logs                      Framework log (last 100 lines)
 #   GET  /events                    Recent Docker events (last 50)
 #   GET  /version                   API and framework version info
+#
+# Authentication Endpoints:
+#   POST   /auth/setup              Create first admin account (no auth required)
+#   POST   /auth/login              Authenticate and get session token (no auth required)
+#   POST   /auth/register           Register with invite code (no auth required)
+#   GET    /auth/verify             Verify a token is valid (no auth required)
+#   POST   /auth/invite             Generate an invite code (admin only)
+#   GET    /auth/users              List all users (admin only)
+#   POST   /auth/revoke             Revoke a user's access (admin only)
+#   GET    /auth/invites            List active invite codes (admin only)
+#   DELETE /auth/invite/:code       Delete an invite code (admin only)
 #
 # All responses are JSON with Content-Type: application/json.
 # CORS headers are included for Electron app compatibility.
@@ -68,6 +81,41 @@ API_BIND="${API_BIND:-127.0.0.1}"
 API_VERSION="1.0.0"
 API_PID_FILE="/tmp/dcs-api-server.pid"
 API_LOG_FILE="${BASE_DIR}/logs/api-server.log"
+
+# Authentication configuration
+API_AUTH_DIR="${BASE_DIR}/.api-auth"
+API_TOKEN_EXPIRY="${API_TOKEN_EXPIRY:-86400}"       # 24 hours in seconds
+API_INVITE_EXPIRY="${API_INVITE_EXPIRY:-604800}"     # 7 days in seconds
+API_MAX_LOGIN_ATTEMPTS="${API_MAX_LOGIN_ATTEMPTS:-5}"
+API_LOCKOUT_DURATION="${API_LOCKOUT_DURATION:-900}"  # 15 minutes in seconds
+
+# Auto-detect whether auth is required based on bind address
+# Auth is optional for localhost-only, required for external access
+if [[ -n "${API_AUTH_ENABLED:-}" ]]; then
+    # Explicit override from config
+    API_AUTH_ENABLED="${API_AUTH_ENABLED}"
+else
+    case "$API_BIND" in
+        127.0.0.1|localhost|::1)
+            API_AUTH_ENABLED="false"
+            ;;
+        *)
+            API_AUTH_ENABLED="true"
+            ;;
+    esac
+fi
+
+# IP Whitelist — comma-separated list of allowed IPs/CIDRs (empty = allow all)
+# Example: API_IP_WHITELIST="192.168.1.0/24,10.0.0.5"
+API_IP_WHITELIST="${API_IP_WHITELIST:-}"
+
+# Global rate limiting — max requests per minute per IP (0 = disabled)
+API_RATE_LIMIT="${API_RATE_LIMIT:-120}"
+API_RATE_WINDOW="${API_RATE_WINDOW:-60}"  # window in seconds
+
+# Rate limit tracking directory
+API_RATE_DIR="/tmp/dcs-api-rates"
+mkdir -p "$API_RATE_DIR" 2>/dev/null
 
 # =============================================================================
 # DOCKER COMPOSE DETECTION
@@ -204,8 +252,12 @@ _api_response() {
         200) status_text="OK" ;;
         201) status_text="Created" ;;
         400) status_text="Bad Request" ;;
+        401) status_text="Unauthorized" ;;
+        403) status_text="Forbidden" ;;
         404) status_text="Not Found" ;;
         405) status_text="Method Not Allowed" ;;
+        409) status_text="Conflict" ;;
+        429) status_text="Too Many Requests" ;;
         500) status_text="Internal Server Error" ;;
     esac
 
@@ -236,6 +288,571 @@ _api_error() {
 _api_success() {
     local body="$1"
     _api_response 200 "$body"
+}
+
+# =============================================================================
+# QUERY STRING PARSER
+# =============================================================================
+
+declare -gA QUERY_PARAMS=()
+
+_api_parse_query() {
+    QUERY_PARAMS=()
+    local full_path="$1"
+    if [[ "$full_path" == *"?"* ]]; then
+        local query_string="${full_path#*\?}"
+        local IFS='&'
+        local -a pairs
+        read -ra pairs <<< "$query_string"
+        for pair in "${pairs[@]}"; do
+            local key="${pair%%=*}"
+            local value="${pair#*=}"
+            value="${value//+/ }"
+            QUERY_PARAMS["$key"]="$value"
+        done
+    fi
+}
+
+# =============================================================================
+# AUTHENTICATION HELPERS
+# =============================================================================
+
+# Initialize auth data directory and files
+_api_init_auth_dir() {
+    if [[ ! -d "$API_AUTH_DIR" ]]; then
+        mkdir -p "$API_AUTH_DIR" 2>/dev/null
+        chmod 700 "$API_AUTH_DIR"
+    fi
+    [[ ! -f "$API_AUTH_DIR/users.json" ]]  && echo '[]' > "$API_AUTH_DIR/users.json"
+    [[ ! -f "$API_AUTH_DIR/tokens.json" ]] && echo '[]' > "$API_AUTH_DIR/tokens.json"
+    [[ ! -f "$API_AUTH_DIR/invites.json" ]] && echo '[]' > "$API_AUTH_DIR/invites.json"
+    [[ ! -f "$API_AUTH_DIR/rate_limits.json" ]] && echo '{}' > "$API_AUTH_DIR/rate_limits.json"
+}
+
+# Hash a password with a given salt using SHA-256
+_api_hash_password() {
+    local salt="$1"
+    local password="$2"
+    echo -n "${salt}${password}" | sha256sum | cut -d' ' -f1
+}
+
+# Generate a random token
+_api_generate_token() {
+    openssl rand -hex 32 2>/dev/null || {
+        # Fallback if openssl is not available
+        local hex=""
+        for i in $(seq 1 32); do
+            hex+=$(printf '%02x' $(( RANDOM % 256 )))
+        done
+        echo "$hex"
+    }
+}
+
+# Generate a random salt
+_api_generate_salt() {
+    openssl rand -hex 16 2>/dev/null || {
+        local hex=""
+        for i in $(seq 1 16); do
+            hex+=$(printf '%02x' $(( RANDOM % 256 )))
+        done
+        echo "$hex"
+    }
+}
+
+# Read a JSON auth file (returns contents)
+_api_read_auth_file() {
+    local file="$API_AUTH_DIR/$1"
+    if [[ -f "$file" ]]; then
+        cat "$file" 2>/dev/null
+    else
+        echo '[]'
+    fi
+}
+
+# Write a JSON auth file
+_api_write_auth_file() {
+    local file="$API_AUTH_DIR/$1"
+    local content="$2"
+    printf '%s' "$content" > "$file" 2>/dev/null
+}
+
+# Get current epoch timestamp
+_api_now_epoch() {
+    date +%s
+}
+
+# Get current ISO timestamp
+_api_now_iso() {
+    date -u '+%Y-%m-%dT%H:%M:%SZ'
+}
+
+# Check if a user exists (returns 0 if exists, 1 if not)
+_api_user_exists() {
+    local username="$1"
+    local users
+    users=$(_api_read_auth_file "users.json")
+    if command -v jq >/dev/null 2>&1; then
+        local count
+        count=$(echo "$users" | jq -r --arg u "$username" '[.[] | select(.username == $u)] | length' 2>/dev/null)
+        [[ "$count" -gt 0 ]] && return 0
+    else
+        echo "$users" | grep -q "\"username\": *\"$username\"" && return 0
+    fi
+    return 1
+}
+
+# Get user count
+_api_user_count() {
+    local users
+    users=$(_api_read_auth_file "users.json")
+    if command -v jq >/dev/null 2>&1; then
+        echo "$users" | jq 'length' 2>/dev/null
+    else
+        # Rough count by counting username fields
+        echo "$users" | grep -c '"username"' 2>/dev/null || echo "0"
+    fi
+}
+
+# Get user record as JSON (requires jq)
+_api_get_user() {
+    local username="$1"
+    local users
+    users=$(_api_read_auth_file "users.json")
+    echo "$users" | jq -r --arg u "$username" '.[] | select(.username == $u)' 2>/dev/null
+}
+
+# Add a user record
+_api_add_user() {
+    local username="$1" password_hash="$2" salt="$3" role="$4"
+    local created_at
+    created_at=$(_api_now_iso)
+    local users
+    users=$(_api_read_auth_file "users.json")
+    if command -v jq >/dev/null 2>&1; then
+        local new_users
+        new_users=$(echo "$users" | jq \
+            --arg u "$username" \
+            --arg h "$password_hash" \
+            --arg s "$salt" \
+            --arg r "$role" \
+            --arg c "$created_at" \
+            '. + [{"username": $u, "password_hash": $h, "salt": $s, "role": $r, "created_at": $c}]' 2>/dev/null)
+        _api_write_auth_file "users.json" "$new_users"
+    else
+        # Fallback: manual JSON construction
+        local entry="{\"username\": \"$username\", \"password_hash\": \"$password_hash\", \"salt\": \"$salt\", \"role\": \"$role\", \"created_at\": \"$created_at\"}"
+        if [[ "$users" == "[]" ]]; then
+            _api_write_auth_file "users.json" "[$entry]"
+        else
+            # Remove trailing ] and append
+            local trimmed="${users%]}"
+            _api_write_auth_file "users.json" "${trimmed}, $entry]"
+        fi
+    fi
+}
+
+# Store a session token
+_api_store_token() {
+    local token="$1" username="$2" role="$3"
+    local now
+    now=$(_api_now_epoch)
+    local expires_at=$(( now + API_TOKEN_EXPIRY ))
+    local created_at
+    created_at=$(_api_now_iso)
+    local tokens
+    tokens=$(_api_read_auth_file "tokens.json")
+    if command -v jq >/dev/null 2>&1; then
+        local new_tokens
+        new_tokens=$(echo "$tokens" | jq \
+            --arg t "$token" \
+            --arg u "$username" \
+            --arg r "$role" \
+            --arg c "$created_at" \
+            --argjson e "$expires_at" \
+            '. + [{"token": $t, "username": $u, "role": $r, "created_at": $c, "expires_at": $e}]' 2>/dev/null)
+        _api_write_auth_file "tokens.json" "$new_tokens"
+    else
+        local entry="{\"token\": \"$token\", \"username\": \"$username\", \"role\": \"$role\", \"created_at\": \"$created_at\", \"expires_at\": $expires_at}"
+        if [[ "$tokens" == "[]" ]]; then
+            _api_write_auth_file "tokens.json" "[$entry]"
+        else
+            local trimmed="${tokens%]}"
+            _api_write_auth_file "tokens.json" "${trimmed}, $entry]"
+        fi
+    fi
+}
+
+# Validate a token — sets AUTH_USERNAME and AUTH_ROLE on success; returns 1 on failure
+_api_validate_token() {
+    local token="$1"
+    AUTH_USERNAME=""
+    AUTH_ROLE=""
+
+    if [[ -z "$token" ]]; then
+        return 1
+    fi
+
+    local tokens
+    tokens=$(_api_read_auth_file "tokens.json")
+    local now
+    now=$(_api_now_epoch)
+
+    if command -v jq >/dev/null 2>&1; then
+        local record
+        record=$(echo "$tokens" | jq -r --arg t "$token" --argjson n "$now" \
+            '.[] | select(.token == $t and .expires_at > $n)' 2>/dev/null)
+        if [[ -n "$record" ]]; then
+            AUTH_USERNAME=$(echo "$record" | jq -r '.username' 2>/dev/null)
+            AUTH_ROLE=$(echo "$record" | jq -r '.role' 2>/dev/null)
+            return 0
+        fi
+    else
+        # Fallback: grep-based token search
+        if echo "$tokens" | grep -q "\"token\": *\"$token\""; then
+            # Basic extraction — limited without jq
+            AUTH_USERNAME=$(echo "$tokens" | grep -A5 "\"token\": *\"$token\"" | grep '"username"' | head -1 | sed 's/.*: *"\([^"]*\)".*/\1/')
+            AUTH_ROLE=$(echo "$tokens" | grep -A5 "\"token\": *\"$token\"" | grep '"role"' | head -1 | sed 's/.*: *"\([^"]*\)".*/\1/')
+            if [[ -n "$AUTH_USERNAME" ]]; then
+                return 0
+            fi
+        fi
+    fi
+    return 1
+}
+
+# =============================================================================
+# IP WHITELIST & RATE LIMITING
+# =============================================================================
+
+# Check if a given IP is within a CIDR range (supports /8 /16 /24 /32)
+_api_ip_in_cidr() {
+    local ip="$1" cidr="$2"
+    local net mask
+    net="${cidr%/*}"
+    mask="${cidr#*/}"
+    [[ "$mask" == "$cidr" ]] && mask=32  # no slash means exact match
+
+    # Convert IP to integer
+    local IFS='.'
+    local -a ip_parts=($ip) net_parts=($net)
+    local ip_int=$(( (ip_parts[0] << 24) + (ip_parts[1] << 16) + (ip_parts[2] << 8) + ip_parts[3] ))
+    local net_int=$(( (net_parts[0] << 24) + (net_parts[1] << 16) + (net_parts[2] << 8) + net_parts[3] ))
+    local mask_int=$(( 0xFFFFFFFF << (32 - mask) ))
+
+    (( (ip_int & mask_int) == (net_int & mask_int) ))
+}
+
+# Check if the connecting IP is allowed
+# Uses SOCAT_PEERADDR environment variable set by socat
+_api_check_ip_whitelist() {
+    [[ -z "$API_IP_WHITELIST" ]] && return 0  # no whitelist = allow all
+
+    local client_ip="${SOCAT_PEERADDR:-127.0.0.1}"
+
+    # Always allow localhost
+    case "$client_ip" in
+        127.0.0.1|::1|localhost) return 0 ;;
+    esac
+
+    # Check each entry in the whitelist
+    local IFS=','
+    for entry in $API_IP_WHITELIST; do
+        entry="${entry// /}"  # trim spaces
+        [[ -z "$entry" ]] && continue
+
+        # Exact match
+        [[ "$client_ip" == "$entry" ]] && return 0
+
+        # CIDR match
+        if [[ "$entry" == */* ]]; then
+            _api_ip_in_cidr "$client_ip" "$entry" && return 0
+        fi
+    done
+
+    return 1  # not in whitelist
+}
+
+# Check global rate limit for the connecting IP
+# Returns 0 if within limit, 1 if rate limited
+_api_check_global_rate_limit() {
+    (( API_RATE_LIMIT <= 0 )) && return 0  # rate limiting disabled
+
+    local client_ip="${SOCAT_PEERADDR:-127.0.0.1}"
+    local now
+    now=$(date +%s)
+
+    # Always allow localhost without rate limiting
+    case "$client_ip" in
+        127.0.0.1|::1|localhost) return 0 ;;
+    esac
+
+    # Rate file per IP (sanitize the IP for filename)
+    local safe_ip="${client_ip//[^0-9a-fA-F.]/_}"
+    local rate_file="${API_RATE_DIR}/${safe_ip}"
+
+    # Clean up old entries and count recent requests
+    local count=0
+    local cutoff=$(( now - API_RATE_WINDOW ))
+
+    if [[ -f "$rate_file" ]]; then
+        # Remove expired timestamps and count valid ones
+        local tmp_file="${rate_file}.tmp"
+        while IFS= read -r ts; do
+            if (( ts > cutoff )); then
+                echo "$ts"
+                count=$(( count + 1 ))
+            fi
+        done < "$rate_file" > "$tmp_file" 2>/dev/null
+        mv -f "$tmp_file" "$rate_file" 2>/dev/null
+    fi
+
+    # Check if over limit
+    if (( count >= API_RATE_LIMIT )); then
+        return 1
+    fi
+
+    # Record this request
+    echo "$now" >> "$rate_file"
+    return 0
+}
+
+# Check authentication from request headers — sets AUTH_USERNAME and AUTH_ROLE
+# Returns 0 on success, 1 on failure
+_api_check_auth() {
+    AUTH_USERNAME=""
+    AUTH_ROLE=""
+
+    # If auth is disabled, allow everything
+    if [[ "$API_AUTH_ENABLED" != "true" ]]; then
+        AUTH_USERNAME="anonymous"
+        AUTH_ROLE="admin"
+        return 0
+    fi
+
+    # If no users exist yet, allow access (setup not complete)
+    local user_count
+    user_count=$(_api_user_count)
+    if [[ "$user_count" -eq 0 ]]; then
+        AUTH_USERNAME="anonymous"
+        AUTH_ROLE="admin"
+        return 0
+    fi
+
+    _api_init_auth_dir
+
+    # Extract token from Authorization header
+    local token=""
+    if [[ -n "${REQUEST_AUTH_HEADER:-}" ]]; then
+        # Strip "Bearer " prefix
+        token="${REQUEST_AUTH_HEADER#Bearer }"
+        token="${token#bearer }"
+    fi
+
+    if [[ -z "$token" ]]; then
+        return 1
+    fi
+
+    _api_validate_token "$token"
+    return $?
+}
+
+# Check if authenticated user is admin — call after _api_check_auth
+_api_check_admin() {
+    if [[ "${AUTH_ROLE:-}" != "admin" ]]; then
+        return 1
+    fi
+    return 0
+}
+
+# Rate limiting: check if an IP is locked out
+_api_check_rate_limit() {
+    local client_ip="${1:-unknown}"
+    local rate_file="$API_AUTH_DIR/rate_limits.json"
+    [[ ! -f "$rate_file" ]] && return 0
+
+    if command -v jq >/dev/null 2>&1; then
+        local now
+        now=$(_api_now_epoch)
+        local record
+        record=$(cat "$rate_file" | jq -r --arg ip "$client_ip" '.[$ip] // empty' 2>/dev/null)
+        if [[ -n "$record" ]]; then
+            local attempts locked_until
+            attempts=$(echo "$record" | jq -r '.attempts // 0' 2>/dev/null)
+            locked_until=$(echo "$record" | jq -r '.locked_until // 0' 2>/dev/null)
+            if [[ "$locked_until" -gt "$now" ]] 2>/dev/null; then
+                return 1  # Still locked out
+            fi
+            # Reset if lock has expired
+            if [[ "$locked_until" -gt 0 ]] && [[ "$locked_until" -le "$now" ]] 2>/dev/null; then
+                _api_reset_rate_limit "$client_ip"
+            fi
+        fi
+    fi
+    return 0
+}
+
+# Rate limiting: record a failed login attempt
+_api_record_failed_login() {
+    local client_ip="${1:-unknown}"
+    local rate_file="$API_AUTH_DIR/rate_limits.json"
+    [[ ! -f "$rate_file" ]] && echo '{}' > "$rate_file"
+
+    if command -v jq >/dev/null 2>&1; then
+        local now
+        now=$(_api_now_epoch)
+        local rates
+        rates=$(cat "$rate_file")
+        local current_attempts
+        current_attempts=$(echo "$rates" | jq -r --arg ip "$client_ip" '.[$ip].attempts // 0' 2>/dev/null)
+        current_attempts=$(( current_attempts + 1 ))
+
+        local locked_until=0
+        if [[ "$current_attempts" -ge "$API_MAX_LOGIN_ATTEMPTS" ]]; then
+            locked_until=$(( now + API_LOCKOUT_DURATION ))
+        fi
+
+        local new_rates
+        new_rates=$(echo "$rates" | jq \
+            --arg ip "$client_ip" \
+            --argjson a "$current_attempts" \
+            --argjson l "$locked_until" \
+            --argjson t "$now" \
+            '.[$ip] = {"attempts": $a, "locked_until": $l, "last_attempt": $t}' 2>/dev/null)
+        printf '%s' "$new_rates" > "$rate_file"
+    fi
+}
+
+# Rate limiting: reset after successful login
+_api_reset_rate_limit() {
+    local client_ip="${1:-unknown}"
+    local rate_file="$API_AUTH_DIR/rate_limits.json"
+    [[ ! -f "$rate_file" ]] && return
+
+    if command -v jq >/dev/null 2>&1; then
+        local rates
+        rates=$(cat "$rate_file")
+        local new_rates
+        new_rates=$(echo "$rates" | jq --arg ip "$client_ip" 'del(.[$ip])' 2>/dev/null)
+        printf '%s' "$new_rates" > "$rate_file"
+    fi
+}
+
+# Clean up expired tokens (called periodically)
+_api_cleanup_expired_tokens() {
+    local tokens
+    tokens=$(_api_read_auth_file "tokens.json")
+    local now
+    now=$(_api_now_epoch)
+
+    if command -v jq >/dev/null 2>&1; then
+        local cleaned
+        cleaned=$(echo "$tokens" | jq --argjson n "$now" '[.[] | select(.expires_at > $n)]' 2>/dev/null)
+        [[ -n "$cleaned" ]] && _api_write_auth_file "tokens.json" "$cleaned"
+    fi
+}
+
+# Store an invite code
+_api_store_invite() {
+    local code="$1" role="$2" created_by="$3"
+    local now
+    now=$(_api_now_epoch)
+    local expires_at=$(( now + API_INVITE_EXPIRY ))
+    local created_at
+    created_at=$(_api_now_iso)
+    local invites
+    invites=$(_api_read_auth_file "invites.json")
+
+    if command -v jq >/dev/null 2>&1; then
+        local new_invites
+        new_invites=$(echo "$invites" | jq \
+            --arg c "$code" \
+            --arg r "$role" \
+            --arg b "$created_by" \
+            --arg ca "$created_at" \
+            --argjson e "$expires_at" \
+            '. + [{"code": $c, "role": $r, "created_by": $b, "created_at": $ca, "expires_at": $e, "used": false, "used_by": ""}]' 2>/dev/null)
+        _api_write_auth_file "invites.json" "$new_invites"
+    else
+        local entry="{\"code\": \"$code\", \"role\": \"$role\", \"created_by\": \"$created_by\", \"created_at\": \"$created_at\", \"expires_at\": $expires_at, \"used\": false, \"used_by\": \"\"}"
+        if [[ "$invites" == "[]" ]]; then
+            _api_write_auth_file "invites.json" "[$entry]"
+        else
+            local trimmed="${invites%]}"
+            _api_write_auth_file "invites.json" "${trimmed}, $entry]"
+        fi
+    fi
+}
+
+# Validate an invite code — returns role on success, empty on failure
+_api_validate_invite() {
+    local code="$1"
+    local invites
+    invites=$(_api_read_auth_file "invites.json")
+    local now
+    now=$(_api_now_epoch)
+
+    if command -v jq >/dev/null 2>&1; then
+        local record
+        record=$(echo "$invites" | jq -r --arg c "$code" --argjson n "$now" \
+            '.[] | select(.code == $c and .expires_at > $n and (.used != true))' 2>/dev/null)
+        if [[ -n "$record" ]]; then
+            echo "$record" | jq -r '.role' 2>/dev/null
+            return 0
+        fi
+    else
+        if echo "$invites" | grep -q "\"code\": *\"$code\""; then
+            echo "user"
+            return 0
+        fi
+    fi
+    return 1
+}
+
+# Consume an invite code after use — marks as used instead of deleting
+_api_consume_invite() {
+    local code="$1" username="${2:-unknown}"
+    local invites
+    invites=$(_api_read_auth_file "invites.json")
+
+    if command -v jq >/dev/null 2>&1; then
+        local new_invites
+        new_invites=$(echo "$invites" | jq --arg c "$code" --arg u "$username" \
+            '[.[] | if .code == $c then . + {"used": true, "used_by": $u} else . end]' 2>/dev/null)
+        _api_write_auth_file "invites.json" "$new_invites"
+    fi
+}
+
+# Delete a specific invite code by value
+_api_delete_invite() {
+    local code="$1"
+    local invites
+    invites=$(_api_read_auth_file "invites.json")
+
+    if command -v jq >/dev/null 2>&1; then
+        local exists
+        exists=$(echo "$invites" | jq -r --arg c "$code" '[.[] | select(.code == $c)] | length' 2>/dev/null)
+        if [[ "$exists" -eq 0 ]]; then
+            return 1
+        fi
+        local new_invites
+        new_invites=$(echo "$invites" | jq --arg c "$code" '[.[] | select(.code != $c)]' 2>/dev/null)
+        _api_write_auth_file "invites.json" "$new_invites"
+        return 0
+    fi
+    return 1
+}
+
+# Revoke all tokens for a user
+_api_revoke_user_tokens() {
+    local username="$1"
+    local tokens
+    tokens=$(_api_read_auth_file "tokens.json")
+
+    if command -v jq >/dev/null 2>&1; then
+        local new_tokens
+        new_tokens=$(echo "$tokens" | jq --arg u "$username" '[.[] | select(.username != $u)]' 2>/dev/null)
+        _api_write_auth_file "tokens.json" "$new_tokens"
+    fi
 }
 
 # =============================================================================
@@ -325,6 +942,7 @@ handle_root() {
     {"method": "GET",  "path": "/stacks/:name",              "description": "Detailed info for a stack"},
     {"method": "GET",  "path": "/stacks/:name/containers",   "description": "Containers in a stack"},
     {"method": "GET",  "path": "/stacks/:name/logs",         "description": "Recent logs for a stack"},
+    {"method": "GET",  "path": "/stacks/:name/compose",      "description": "Raw docker-compose.yml content"},
     {"method": "POST", "path": "/stacks/:name/start",        "description": "Start a stack"},
     {"method": "POST", "path": "/stacks/:name/stop",         "description": "Stop a stack"},
     {"method": "POST", "path": "/stacks/:name/restart",      "description": "Restart a stack"},
@@ -334,16 +952,26 @@ handle_root() {
     {"method": "GET",  "path": "/containers",                "description": "All containers with status"},
     {"method": "GET",  "path": "/containers/:name",          "description": "Detailed container info"},
     {"method": "GET",  "path": "/containers/:name/stats",    "description": "Live resource stats"},
+    {"method": "GET",  "path": "/containers/:name/processes","description": "Container process list"},
     {"method": "GET",  "path": "/config",                    "description": "Current configuration"},
     {"method": "GET",  "path": "/system",                    "description": "System resource info"},
     {"method": "GET",  "path": "/networks",                  "description": "Docker networks"},
     {"method": "GET",  "path": "/volumes",                   "description": "Docker volumes"},
     {"method": "GET",  "path": "/logs",                      "description": "Framework log tail"},
     {"method": "GET",  "path": "/events",                    "description": "Recent Docker events"},
-    {"method": "GET",  "path": "/version",                   "description": "Version information"}
+    {"method": "GET",  "path": "/version",                   "description": "Version information"},
+    {"method": "POST",   "path": "/auth/setup",              "description": "Create first admin account", "auth": false},
+    {"method": "POST",   "path": "/auth/login",              "description": "Authenticate and get token", "auth": false},
+    {"method": "POST",   "path": "/auth/register",           "description": "Register with invite code", "auth": false},
+    {"method": "GET",    "path": "/auth/verify",             "description": "Verify a token", "auth": false},
+    {"method": "POST",   "path": "/auth/invite",             "description": "Generate invite code", "auth": "admin"},
+    {"method": "GET",    "path": "/auth/users",              "description": "List all users", "auth": "admin"},
+    {"method": "POST",   "path": "/auth/revoke",             "description": "Revoke user access", "auth": "admin"},
+    {"method": "GET",    "path": "/auth/invites",            "description": "List active invites", "auth": "admin"},
+    {"method": "DELETE",  "path": "/auth/invite/:code",      "description": "Delete invite code", "auth": "admin"}
   ]'
 
-    _api_success "{\"name\": \"Docker Compose Skeleton API\", \"version\": \"$API_VERSION\", \"endpoints\": $endpoints}"
+    _api_success "{\"name\": \"Docker Compose Skeleton API\", \"version\": \"$API_VERSION\", \"auth_enabled\": $API_AUTH_ENABLED, \"endpoints\": $endpoints}"
 }
 
 handle_version() {
@@ -434,9 +1062,14 @@ handle_health() {
         results+=("{\"name\": \"$(_api_json_escape "$name")\", \"state\": \"$state\", \"health\": \"$health\"}")
     done < <(docker ps -a -q 2>/dev/null)
 
+    # Status logic: stopped containers are expected/normal and don't affect health.
+    # Only actually unhealthy containers (failed healthchecks) trigger warnings.
     local overall="healthy"
-    (( unhealthy > 0 )) && overall="degraded"
-    (( stopped > 0 )) && overall="critical"
+    if (( unhealthy >= 3 )); then
+        overall="critical"
+    elif (( unhealthy > 0 )); then
+        overall="degraded"
+    fi
 
     local containers_json
     containers_json=$(printf '%s,' "${results[@]}")
@@ -575,6 +1208,215 @@ handle_stack_logs() {
     escaped=$(_api_json_escape "$logs_raw")
 
     _api_success "{\"stack\": \"$stack\", \"lines\": 50, \"logs\": \"$escaped\"}"
+}
+
+handle_stack_compose() {
+    local stack="$1"
+    local compose_file="$COMPOSE_DIR/$stack/docker-compose.yml"
+
+    if [[ ! -f "$compose_file" ]]; then
+        _api_error 404 "Stack not found: $stack"
+        return
+    fi
+
+    local content
+    content=$(cat "$compose_file" 2>/dev/null) || {
+        _api_error 500 "Failed to read compose file for stack: $stack"
+        return
+    }
+
+    local escaped
+    escaped=$(_api_json_escape "$content")
+
+    _api_success "{\"stack\": \"$(_api_json_escape "$stack")\", \"content\": \"$escaped\"}"
+}
+
+# =============================================================================
+# COMPOSE EDITOR & STACK ENV HANDLERS (Phase 1)
+# =============================================================================
+
+handle_stack_compose_validate() {
+    local stack="$1"
+    local body="$2"
+
+    if [[ ! -d "$COMPOSE_DIR/$stack" ]]; then
+        _api_error 404 "Stack not found: $stack"
+        return
+    fi
+
+    if ! command -v jq >/dev/null 2>&1; then
+        _api_error 500 "jq is required for compose validation"
+        return
+    fi
+
+    local content
+    content=$(printf '%s' "$body" | jq -r '.content // empty' 2>/dev/null)
+    if [[ -z "$content" ]]; then
+        _api_error 400 "Missing 'content' field in request body"
+        return
+    fi
+
+    local tmpfile
+    tmpfile=$(mktemp /tmp/dcs-compose-validate-XXXXXX.yml)
+    printf '%s' "$content" > "$tmpfile"
+
+    local env_args=()
+    if [[ -f "$COMPOSE_DIR/$stack/.env" ]]; then
+        env_args=(--env-file "$COMPOSE_DIR/$stack/.env")
+    fi
+
+    local validation_output
+    local valid=true
+    validation_output=$($DOCKER_COMPOSE_CMD -f "$tmpfile" "${env_args[@]}" config 2>&1) || valid=false
+    rm -f "$tmpfile"
+
+    local escaped_output
+    escaped_output=$(_api_json_escape "$validation_output")
+
+    _api_success "{\"valid\": $valid, \"stack\": \"$(_api_json_escape "$stack")\", \"output\": \"$escaped_output\"}"
+}
+
+handle_stack_compose_save() {
+    local stack="$1"
+    local body="$2"
+    local compose_file="$COMPOSE_DIR/$stack/docker-compose.yml"
+
+    if [[ ! -d "$COMPOSE_DIR/$stack" ]]; then
+        _api_error 404 "Stack not found: $stack"
+        return
+    fi
+
+    if ! command -v jq >/dev/null 2>&1; then
+        _api_error 500 "jq is required for compose save"
+        return
+    fi
+
+    local content
+    content=$(printf '%s' "$body" | jq -r '.content // empty' 2>/dev/null)
+    if [[ -z "$content" ]]; then
+        _api_error 400 "Missing 'content' field in request body"
+        return
+    fi
+
+    # Validate before saving
+    local tmpfile
+    tmpfile=$(mktemp /tmp/dcs-compose-save-XXXXXX.yml)
+    printf '%s' "$content" > "$tmpfile"
+
+    local env_args=()
+    if [[ -f "$COMPOSE_DIR/$stack/.env" ]]; then
+        env_args=(--env-file "$COMPOSE_DIR/$stack/.env")
+    fi
+
+    local validation_output
+    validation_output=$($DOCKER_COMPOSE_CMD -f "$tmpfile" "${env_args[@]}" config 2>&1)
+    local valid=$?
+    rm -f "$tmpfile"
+
+    if [[ $valid -ne 0 ]]; then
+        local escaped_errors
+        escaped_errors=$(_api_json_escape "$validation_output")
+        _api_success "{\"success\": false, \"stack\": \"$(_api_json_escape "$stack")\", \"message\": \"Validation failed\", \"validated\": false, \"validation_errors\": \"$escaped_errors\"}"
+        return
+    fi
+
+    # Backup original
+    if [[ -f "$compose_file" ]]; then
+        cp "$compose_file" "${compose_file}.bak" 2>/dev/null
+    fi
+
+    # Write new content
+    printf '%s' "$content" > "$compose_file" 2>/dev/null || {
+        _api_error 500 "Failed to write compose file"
+        return
+    }
+
+    _api_success "{\"success\": true, \"stack\": \"$(_api_json_escape "$stack")\", \"message\": \"Compose file saved successfully\", \"validated\": true}"
+}
+
+handle_stack_env() {
+    local stack="$1"
+    local env_file="$COMPOSE_DIR/$stack/.env"
+
+    if [[ ! -d "$COMPOSE_DIR/$stack" ]]; then
+        _api_error 404 "Stack not found: $stack"
+        return
+    fi
+
+    if [[ ! -f "$env_file" ]]; then
+        _api_success "{\"stack\": \"$(_api_json_escape "$stack")\", \"raw\": \"\", \"variables\": []}"
+        return
+    fi
+
+    local raw
+    raw=$(cat "$env_file" 2>/dev/null)
+    local escaped_raw
+    escaped_raw=$(_api_json_escape "$raw")
+
+    local -a vars=()
+    local line_num=0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        (( line_num++ ))
+        if [[ -z "$line" ]]; then
+            continue
+        fi
+        if [[ "$line" =~ ^[[:space:]]*# ]]; then
+            vars+=("{\"key\": \"\", \"value\": \"\", \"line\": $line_num, \"comment\": \"$(_api_json_escape "$line")\"}")
+            continue
+        fi
+        if [[ "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
+            local key="${BASH_REMATCH[1]}"
+            local value="${BASH_REMATCH[2]}"
+            value="${value#\"}" ; value="${value%\"}"
+            value="${value#\'}" ; value="${value%\'}"
+            vars+=("{\"key\": \"$(_api_json_escape "$key")\", \"value\": \"$(_api_json_escape "$value")\", \"line\": $line_num, \"comment\": \"\"}")
+        fi
+    done < "$env_file"
+
+    local vars_json
+    if [[ ${#vars[@]} -gt 0 ]]; then
+        vars_json=$(printf '%s,' "${vars[@]}")
+        vars_json="[${vars_json%,}]"
+    else
+        vars_json="[]"
+    fi
+
+    _api_success "{\"stack\": \"$(_api_json_escape "$stack")\", \"raw\": \"$escaped_raw\", \"variables\": $vars_json}"
+}
+
+handle_stack_env_save() {
+    local stack="$1"
+    local body="$2"
+    local env_file="$COMPOSE_DIR/$stack/.env"
+
+    if [[ ! -d "$COMPOSE_DIR/$stack" ]]; then
+        _api_error 404 "Stack not found: $stack"
+        return
+    fi
+
+    if ! command -v jq >/dev/null 2>&1; then
+        _api_error 500 "jq is required for env save"
+        return
+    fi
+
+    local content
+    content=$(printf '%s' "$body" | jq -r '.content // empty' 2>/dev/null)
+    if [[ -z "$content" ]]; then
+        _api_error 400 "Missing 'content' field in request body"
+        return
+    fi
+
+    # Backup existing
+    if [[ -f "$env_file" ]]; then
+        cp "$env_file" "${env_file}.bak" 2>/dev/null
+    fi
+
+    printf '%s' "$content" > "$env_file" 2>/dev/null || {
+        _api_error 500 "Failed to write .env file"
+        return
+    }
+
+    _api_success "{\"success\": true, \"stack\": \"$(_api_json_escape "$stack")\", \"message\": \"Stack .env file saved successfully\"}"
 }
 
 handle_stack_action() {
@@ -747,6 +1589,52 @@ handle_container_stats() {
     IFS='|' read -r cpu mem_usage mem_perc net_io block_io pids <<< "$stats_line"
 
     _api_success "{\"container\": \"$name\", \"cpu_percent\": \"$(_api_json_escape "$cpu")\", \"memory_usage\": \"$(_api_json_escape "$mem_usage")\", \"memory_percent\": \"$(_api_json_escape "$mem_perc")\", \"network_io\": \"$(_api_json_escape "$net_io")\", \"block_io\": \"$(_api_json_escape "$block_io")\", \"pids\": \"$(_api_json_escape "$pids")\"}"
+}
+
+handle_container_processes() {
+    local name="$1"
+
+    if ! docker inspect "$name" >/dev/null 2>&1; then
+        _api_error 404 "Container not found: $name"
+        return
+    fi
+
+    # Verify the container is running (docker top requires a running container)
+    local state
+    state=$(docker inspect --format='{{.State.Status}}' "$name" 2>/dev/null)
+    if [[ "$state" != "running" ]]; then
+        _api_error 400 "Container is not running: $name (state: $state)"
+        return
+    fi
+
+    local top_output
+    top_output=$(docker top "$name" -eo uid,pid,ppid,%cpu,time,cmd 2>&1) || {
+        _api_error 500 "Failed to get processes: $(_api_json_escape "$top_output")"
+        return
+    }
+
+    local -a entries=()
+    local header_skipped=false
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        # Skip the header line
+        if [[ "$header_skipped" == "false" ]]; then
+            header_skipped=true
+            continue
+        fi
+
+        # Parse columns: UID PID PPID %CPU TIME CMD (CMD may contain spaces)
+        local uid pid ppid cpu time cmd
+        read -r uid pid ppid cpu time cmd <<< "$line"
+
+        entries+=("{\"uid\": \"$(_api_json_escape "$uid")\", \"pid\": \"$(_api_json_escape "$pid")\", \"ppid\": \"$(_api_json_escape "$ppid")\", \"cpu\": \"$(_api_json_escape "$cpu")\", \"time\": \"$(_api_json_escape "$time")\", \"cmd\": \"$(_api_json_escape "$cmd")\"}")
+    done <<< "$top_output"
+
+    local json
+    json=$(printf '%s,' "${entries[@]}")
+    json="[${json%,}]"
+
+    _api_success "{\"container\": \"$(_api_json_escape "$name")\", \"processes\": $json}"
 }
 
 handle_config() {
@@ -1071,16 +1959,103 @@ handle_logs() {
     local log_file="${BASE_DIR}/logs/docker-services.log"
 
     if [[ ! -f "$log_file" ]]; then
-        _api_success "{\"lines\": 0, \"logs\": \"\"}"
+        _api_success "{\"log_file\": \"\", \"lines\": 0, \"logs\": \"\"}"
         return
     fi
 
+    local num_lines="${QUERY_PARAMS[lines]:-100}"
+    local level_filter="${QUERY_PARAMS[level]:-}"
+    local search_filter="${QUERY_PARAMS[search]:-}"
+
+    [[ "$num_lines" =~ ^[0-9]+$ ]] || num_lines=100
+    (( num_lines > 5000 )) && num_lines=5000
+
     local content
-    content=$(tail -100 "$log_file" 2>/dev/null)
+    if [[ -n "$level_filter" || -n "$search_filter" ]]; then
+        content=$(tail -"$num_lines" "$log_file" 2>/dev/null)
+        if [[ -n "$level_filter" ]]; then
+            content=$(printf '%s\n' "$content" | grep -i "\[$level_filter\]" 2>/dev/null || true)
+        fi
+        if [[ -n "$search_filter" ]]; then
+            content=$(printf '%s\n' "$content" | grep -i "$search_filter" 2>/dev/null || true)
+        fi
+    else
+        content=$(tail -"$num_lines" "$log_file" 2>/dev/null)
+    fi
+
     local escaped
     escaped=$(_api_json_escape "$content")
+    local actual_lines
+    actual_lines=$(printf '%s' "$content" | wc -l | tr -d ' ')
 
-    _api_success "{\"log_file\": \"$(_api_json_escape "$log_file")\", \"lines\": 100, \"logs\": \"$escaped\"}"
+    _api_success "{\"log_file\": \"$(_api_json_escape "$log_file")\", \"lines\": $actual_lines, \"logs\": \"$escaped\"}"
+}
+
+handle_logs_stats() {
+    local log_file="${BASE_DIR}/logs/docker-services.log"
+
+    if [[ ! -f "$log_file" ]]; then
+        _api_success "{\"total_lines\": 0, \"file_size\": \"0\", \"levels\": {\"error\":0,\"critical\":0,\"warning\":0,\"success\":0,\"info\":0,\"debug\":0,\"step\":0,\"timing\":0}, \"sessions\": 0, \"archives\": {\"count\": 0, \"total_size\": \"0\"}}"
+        return
+    fi
+
+    local total_lines file_size
+    total_lines=$(wc -l < "$log_file" 2>/dev/null | tr -d ' ')
+    file_size=$(du -h "$log_file" 2>/dev/null | awk '{print $1}')
+
+    local errors warnings successes infos debugs steps timings criticals
+    errors=$(grep -c '\[ERROR\]' "$log_file" 2>/dev/null || echo 0)
+    criticals=$(grep -c '\[CRITICAL\]' "$log_file" 2>/dev/null || echo 0)
+    warnings=$(grep -c '\[WARNING\]' "$log_file" 2>/dev/null || echo 0)
+    successes=$(grep -c '\[SUCCESS\]' "$log_file" 2>/dev/null || echo 0)
+    infos=$(grep -c '\[INFO\]' "$log_file" 2>/dev/null || echo 0)
+    debugs=$(grep -c '\[DEBUG\]' "$log_file" 2>/dev/null || echo 0)
+    steps=$(grep -c '\[STEP' "$log_file" 2>/dev/null || echo 0)
+    timings=$(grep -c '\[TIMING\]' "$log_file" 2>/dev/null || echo 0)
+
+    local sessions
+    sessions=$(grep -c 'Session Started' "$log_file" 2>/dev/null || echo 0)
+
+    local archive_count=0 archive_size="0"
+    local archive_dir="${BASE_DIR}/logs/archive"
+    if [[ -d "$archive_dir" ]]; then
+        archive_count=$(ls -1 "$archive_dir"/docker-services-*.log* 2>/dev/null | wc -l | tr -d ' ')
+        archive_size=$(du -sh "$archive_dir" 2>/dev/null | awk '{print $1}')
+    fi
+
+    _api_success "{\"total_lines\": $total_lines, \"file_size\": \"$(_api_json_escape "${file_size:-0}")\", \"levels\": {\"error\": $errors, \"critical\": $criticals, \"warning\": $warnings, \"success\": $successes, \"info\": $infos, \"debug\": $debugs, \"step\": $steps, \"timing\": $timings}, \"sessions\": $sessions, \"archives\": {\"count\": $archive_count, \"total_size\": \"$(_api_json_escape "${archive_size:-0}")\"}}"
+}
+
+handle_logs_archives() {
+    local archive_dir="${BASE_DIR}/logs/archive"
+
+    if [[ ! -d "$archive_dir" ]]; then
+        _api_success "{\"archives\": [], \"total_size\": \"0\"}"
+        return
+    fi
+
+    local -a archives=()
+    while IFS= read -r entry; do
+        [[ -z "$entry" ]] && continue
+        local filename size date_str
+        filename=$(echo "$entry" | awk '{print $NF}' | xargs basename 2>/dev/null)
+        size=$(echo "$entry" | awk '{print $5}')
+        date_str=$(echo "$entry" | awk '{print $6, $7, $8}')
+        archives+=("{\"filename\": \"$(_api_json_escape "$filename")\", \"size\": \"$(_api_json_escape "$size")\", \"date\": \"$(_api_json_escape "$date_str")\"}")
+    done < <(ls -lhtr "$archive_dir"/*.log* 2>/dev/null)
+
+    local archives_json
+    if [[ ${#archives[@]} -gt 0 ]]; then
+        archives_json=$(printf '%s,' "${archives[@]}")
+        archives_json="[${archives_json%,}]"
+    else
+        archives_json="[]"
+    fi
+
+    local total_size
+    total_size=$(du -sh "$archive_dir" 2>/dev/null | awk '{print $1}')
+
+    _api_success "{\"archives\": $archives_json, \"total_size\": \"$(_api_json_escape "${total_size:-0}")\"}"
 }
 
 handle_events() {
@@ -1098,6 +2073,402 @@ handle_events() {
     json="[${json%,}]"
 
     _api_success "{\"total\": ${#entries[@]}, \"events\": $json}"
+}
+
+# =============================================================================
+# AUTHENTICATION ENDPOINT HANDLERS
+# =============================================================================
+
+# POST /auth/setup — Create the first admin account (only when no users exist)
+handle_auth_setup() {
+    local body="$1"
+
+    _api_init_auth_dir
+
+    local user_count
+    user_count=$(_api_user_count)
+    if [[ "$user_count" -gt 0 ]]; then
+        _api_error 400 "Setup already complete. Users already exist."
+        return
+    fi
+
+    local username password
+    if command -v jq >/dev/null 2>&1; then
+        username=$(echo "$body" | jq -r '.username // empty' 2>/dev/null)
+        password=$(echo "$body" | jq -r '.password // empty' 2>/dev/null)
+    else
+        username=$(echo "$body" | sed -n 's/.*"username" *: *"\([^"]*\)".*/\1/p')
+        password=$(echo "$body" | sed -n 's/.*"password" *: *"\([^"]*\)".*/\1/p')
+    fi
+
+    if [[ -z "$username" ]] || [[ -z "$password" ]]; then
+        _api_error 400 "Missing required fields: username and password"
+        return
+    fi
+
+    # Validate username (alphanumeric, hyphens, underscores, 3-32 chars)
+    if [[ ! "$username" =~ ^[a-zA-Z0-9_-]{3,32}$ ]]; then
+        _api_error 400 "Invalid username. Use 3-32 alphanumeric characters, hyphens, or underscores."
+        return
+    fi
+
+    # Validate password length
+    if [[ ${#password} -lt 8 ]]; then
+        _api_error 400 "Password must be at least 8 characters"
+        return
+    fi
+
+    local salt
+    salt=$(_api_generate_salt)
+    local password_hash
+    password_hash=$(_api_hash_password "$salt" "$password")
+
+    _api_add_user "$username" "$password_hash" "$salt" "admin"
+
+    local token
+    token=$(_api_generate_token)
+    _api_store_token "$token" "$username" "admin"
+
+    _api_success "{\"success\": true, \"token\": \"$token\", \"username\": \"$(_api_json_escape "$username")\", \"role\": \"admin\", \"message\": \"Admin account created successfully\"}"
+}
+
+# POST /auth/login — Authenticate and get a session token
+handle_auth_login() {
+    local body="$1"
+
+    _api_init_auth_dir
+
+    # Rate limit check (use SOCAT_PEERADDR if available, fallback to "unknown")
+    local client_ip="${SOCAT_PEERADDR:-unknown}"
+    if ! _api_check_rate_limit "$client_ip"; then
+        _api_error 429 "Too many failed login attempts. Please try again later."
+        return
+    fi
+
+    local username password
+    if command -v jq >/dev/null 2>&1; then
+        username=$(echo "$body" | jq -r '.username // empty' 2>/dev/null)
+        password=$(echo "$body" | jq -r '.password // empty' 2>/dev/null)
+    else
+        username=$(echo "$body" | sed -n 's/.*"username" *: *"\([^"]*\)".*/\1/p')
+        password=$(echo "$body" | sed -n 's/.*"password" *: *"\([^"]*\)".*/\1/p')
+    fi
+
+    if [[ -z "$username" ]] || [[ -z "$password" ]]; then
+        _api_error 400 "Missing required fields: username and password"
+        return
+    fi
+
+    # Look up user
+    if ! _api_user_exists "$username"; then
+        _api_record_failed_login "$client_ip"
+        _api_error 401 "Invalid username or password"
+        return
+    fi
+
+    local user_record
+    user_record=$(_api_get_user "$username")
+    if [[ -z "$user_record" ]]; then
+        _api_record_failed_login "$client_ip"
+        _api_error 401 "Invalid username or password"
+        return
+    fi
+
+    local stored_hash stored_salt role
+    if command -v jq >/dev/null 2>&1; then
+        stored_hash=$(echo "$user_record" | jq -r '.password_hash' 2>/dev/null)
+        stored_salt=$(echo "$user_record" | jq -r '.salt' 2>/dev/null)
+        role=$(echo "$user_record" | jq -r '.role' 2>/dev/null)
+    else
+        stored_hash=$(echo "$user_record" | sed -n 's/.*"password_hash" *: *"\([^"]*\)".*/\1/p')
+        stored_salt=$(echo "$user_record" | sed -n 's/.*"salt" *: *"\([^"]*\)".*/\1/p')
+        role=$(echo "$user_record" | sed -n 's/.*"role" *: *"\([^"]*\)".*/\1/p')
+    fi
+
+    # Verify password
+    local computed_hash
+    computed_hash=$(_api_hash_password "$stored_salt" "$password")
+
+    if [[ "$computed_hash" != "$stored_hash" ]]; then
+        _api_record_failed_login "$client_ip"
+        _api_error 401 "Invalid username or password"
+        return
+    fi
+
+    # Success — reset rate limit and create token
+    _api_reset_rate_limit "$client_ip"
+
+    # Clean up expired tokens periodically
+    _api_cleanup_expired_tokens
+
+    local token
+    token=$(_api_generate_token)
+    _api_store_token "$token" "$username" "$role"
+
+    _api_success "{\"success\": true, \"token\": \"$token\", \"username\": \"$(_api_json_escape "$username")\", \"role\": \"$(_api_json_escape "$role")\"}"
+}
+
+# POST /auth/invite — Generate an invite code (admin only)
+handle_auth_invite() {
+    local body="$1"
+
+    _api_init_auth_dir
+
+    # Must be admin
+    if ! _api_check_admin; then
+        _api_error 403 "Admin access required"
+        return
+    fi
+
+    local role="user"
+    if command -v jq >/dev/null 2>&1 && [[ -n "$body" ]]; then
+        local body_role
+        body_role=$(echo "$body" | jq -r '.role // empty' 2>/dev/null)
+        [[ -n "$body_role" ]] && role="$body_role"
+    fi
+
+    # Validate role
+    if [[ "$role" != "user" ]] && [[ "$role" != "admin" ]]; then
+        _api_error 400 "Invalid role. Must be 'user' or 'admin'."
+        return
+    fi
+
+    local code
+    code=$(_api_generate_token)
+    # Use a shorter invite code (first 16 chars)
+    code="${code:0:16}"
+
+    _api_store_invite "$code" "$role" "${AUTH_USERNAME:-unknown}"
+
+    local now
+    now=$(_api_now_epoch)
+    local expires_at=$(( now + API_INVITE_EXPIRY ))
+    local expires_at_iso
+    expires_at_iso=$(date -u -d "@$expires_at" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date -u '+%Y-%m-%dT%H:%M:%SZ')
+
+    _api_success "{\"success\": true, \"code\": \"$code\", \"role\": \"$(_api_json_escape "$role")\", \"expires_at\": \"$expires_at_iso\"}"
+}
+
+# POST /auth/register — Register a new account with an invite code
+handle_auth_register() {
+    local body="$1"
+
+    _api_init_auth_dir
+
+    local username password invite_code
+    if command -v jq >/dev/null 2>&1; then
+        username=$(echo "$body" | jq -r '.username // empty' 2>/dev/null)
+        password=$(echo "$body" | jq -r '.password // empty' 2>/dev/null)
+        invite_code=$(echo "$body" | jq -r '.invite_code // empty' 2>/dev/null)
+    else
+        username=$(echo "$body" | sed -n 's/.*"username" *: *"\([^"]*\)".*/\1/p')
+        password=$(echo "$body" | sed -n 's/.*"password" *: *"\([^"]*\)".*/\1/p')
+        invite_code=$(echo "$body" | sed -n 's/.*"invite_code" *: *"\([^"]*\)".*/\1/p')
+    fi
+
+    if [[ -z "$username" ]] || [[ -z "$password" ]] || [[ -z "$invite_code" ]]; then
+        _api_error 400 "Missing required fields: username, password, and invite_code"
+        return
+    fi
+
+    # Validate username
+    if [[ ! "$username" =~ ^[a-zA-Z0-9_-]{3,32}$ ]]; then
+        _api_error 400 "Invalid username. Use 3-32 alphanumeric characters, hyphens, or underscores."
+        return
+    fi
+
+    # Validate password length
+    if [[ ${#password} -lt 8 ]]; then
+        _api_error 400 "Password must be at least 8 characters"
+        return
+    fi
+
+    # Check if username already exists
+    if _api_user_exists "$username"; then
+        _api_error 409 "Username already taken"
+        return
+    fi
+
+    # Validate invite code
+    local role
+    role=$(_api_validate_invite "$invite_code") || {
+        _api_error 400 "Invalid or expired invite code"
+        return
+    }
+
+    if [[ -z "$role" ]]; then
+        _api_error 400 "Invalid or expired invite code"
+        return
+    fi
+
+    # Create user
+    local salt
+    salt=$(_api_generate_salt)
+    local password_hash
+    password_hash=$(_api_hash_password "$salt" "$password")
+
+    _api_add_user "$username" "$password_hash" "$salt" "$role"
+
+    # Consume the invite code
+    _api_consume_invite "$invite_code" "$username"
+
+    # Generate session token
+    local token
+    token=$(_api_generate_token)
+    _api_store_token "$token" "$username" "$role"
+
+    _api_success "{\"success\": true, \"token\": \"$token\", \"username\": \"$(_api_json_escape "$username")\", \"role\": \"$(_api_json_escape "$role")\"}"
+}
+
+# GET /auth/verify — Verify a token is valid
+handle_auth_verify() {
+    _api_init_auth_dir
+
+    # Extract token from Authorization header
+    local token=""
+    if [[ -n "${REQUEST_AUTH_HEADER:-}" ]]; then
+        token="${REQUEST_AUTH_HEADER#Bearer }"
+        token="${token#bearer }"
+    fi
+
+    if [[ -z "$token" ]]; then
+        _api_success "{\"valid\": false, \"message\": \"No token provided\"}"
+        return
+    fi
+
+    if _api_validate_token "$token"; then
+        _api_success "{\"valid\": true, \"username\": \"$(_api_json_escape "$AUTH_USERNAME")\", \"role\": \"$(_api_json_escape "$AUTH_ROLE")\"}"
+    else
+        _api_success "{\"valid\": false, \"message\": \"Token is invalid or expired\"}"
+    fi
+}
+
+# GET /auth/users — List all users (admin only)
+handle_auth_users() {
+    _api_init_auth_dir
+
+    if ! _api_check_admin; then
+        _api_error 403 "Admin access required"
+        return
+    fi
+
+    local users
+    users=$(_api_read_auth_file "users.json")
+
+    if command -v jq >/dev/null 2>&1; then
+        # Strip sensitive fields (password_hash, salt)
+        local safe_users
+        safe_users=$(echo "$users" | jq '[.[] | {username: .username, role: .role, created_at: .created_at}]' 2>/dev/null)
+        _api_success "{\"users\": $safe_users}"
+    else
+        # Fallback: return raw but note it may contain hashes
+        _api_success "{\"users\": $users}"
+    fi
+}
+
+# POST /auth/revoke — Revoke a user's access (admin only)
+handle_auth_revoke() {
+    local body="$1"
+
+    _api_init_auth_dir
+
+    if ! _api_check_admin; then
+        _api_error 403 "Admin access required"
+        return
+    fi
+
+    local target_username
+    if command -v jq >/dev/null 2>&1; then
+        target_username=$(echo "$body" | jq -r '.username // empty' 2>/dev/null)
+    else
+        target_username=$(echo "$body" | sed -n 's/.*"username" *: *"\([^"]*\)".*/\1/p')
+    fi
+
+    if [[ -z "$target_username" ]]; then
+        _api_error 400 "Missing required field: username"
+        return
+    fi
+
+    # Prevent self-revocation
+    if [[ "$target_username" == "${AUTH_USERNAME:-}" ]]; then
+        _api_error 400 "Cannot revoke your own access"
+        return
+    fi
+
+    if ! _api_user_exists "$target_username"; then
+        _api_error 404 "User not found: $target_username"
+        return
+    fi
+
+    # Revoke all tokens for the user
+    _api_revoke_user_tokens "$target_username"
+
+    # Remove the user from users.json
+    if command -v jq >/dev/null 2>&1; then
+        local users
+        users=$(_api_read_auth_file "users.json")
+        local new_users
+        new_users=$(echo "$users" | jq --arg u "$target_username" '[.[] | select(.username != $u)]' 2>/dev/null)
+        _api_write_auth_file "users.json" "$new_users"
+    fi
+
+    _api_success "{\"success\": true, \"username\": \"$(_api_json_escape "$target_username")\", \"message\": \"User access revoked and all sessions invalidated\"}"
+}
+
+# DELETE /auth/invite/:code — Delete an invite code (admin only)
+handle_auth_delete_invite() {
+    local code="$1"
+
+    _api_init_auth_dir
+
+    if ! _api_check_admin; then
+        _api_error 403 "Admin access required"
+        return
+    fi
+
+    if [[ -z "$code" ]]; then
+        _api_error 400 "Missing invite code"
+        return
+    fi
+
+    if _api_delete_invite "$code"; then
+        _api_success "{\"success\": true, \"code\": \"$(_api_json_escape "$code")\", \"message\": \"Invite code deleted\"}"
+    else
+        _api_error 404 "Invite code not found: $code"
+    fi
+}
+
+# GET /auth/invites — List active invite codes (admin only)
+handle_auth_invites() {
+    _api_init_auth_dir
+
+    if ! _api_check_admin; then
+        _api_error 403 "Admin access required"
+        return
+    fi
+
+    local invites
+    invites=$(_api_read_auth_file "invites.json")
+    local now
+    now=$(_api_now_epoch)
+
+    if command -v jq >/dev/null 2>&1; then
+        # Return all invites with proper ISO dates and used field handling
+        local formatted_invites
+        formatted_invites=$(echo "$invites" | jq --argjson n "$now" '
+            [.[] | . + {
+                "used": (if .used then .used else false end),
+                "used_by": (if .used_by then .used_by else "" end),
+                "expires_at": (if (.expires_at | type) == "number" then (.expires_at | todate) else .expires_at end),
+                "expired": (if (.expires_at | type) == "number" then (.expires_at < $n) else false end)
+            }]
+        ' 2>/dev/null)
+        local count
+        count=$(echo "$formatted_invites" | jq 'length' 2>/dev/null)
+        _api_success "{\"total\": ${count:-0}, \"invites\": ${formatted_invites:-[]}}"
+    else
+        _api_success "{\"total\": 0, \"invites\": ${invites:-[]}}"
+    fi
 }
 
 # =============================================================================
@@ -1173,6 +2544,643 @@ handle_maintenance_image_prune() {
     escaped=$(_api_json_escape "$output")
 
     _api_success "{\"action\": \"image_prune\", \"success\": $success, \"output\": \"$escaped\"}"
+}
+
+# =============================================================================
+# ADVANCED MAINTENANCE HANDLERS (Phase 2)
+# =============================================================================
+
+handle_maintenance_report() {
+    local running stopped total_containers total_images dangling_images
+    local total_volumes dangling_volumes total_networks custom_networks
+
+    running=$(docker ps -q 2>/dev/null | wc -l | tr -d ' ')
+    total_containers=$(docker ps -aq 2>/dev/null | wc -l | tr -d ' ')
+    stopped=$(( total_containers - running ))
+    total_images=$(docker images -q 2>/dev/null | wc -l | tr -d ' ')
+    dangling_images=$(docker images -f 'dangling=true' -q 2>/dev/null | wc -l | tr -d ' ')
+    total_volumes=$(docker volume ls -q 2>/dev/null | wc -l | tr -d ' ')
+    dangling_volumes=$(docker volume ls -f 'dangling=true' -q 2>/dev/null | wc -l | tr -d ' ')
+    total_networks=$(docker network ls -q 2>/dev/null | wc -l | tr -d ' ')
+    custom_networks=$(docker network ls --format '{{.Name}}' 2>/dev/null | grep -cvE '^(bridge|host|none)$' || echo 0)
+
+    local docker_df
+    docker_df=$(_api_json_escape "$(docker system df 2>/dev/null)")
+
+    local app_data_size="N/A"
+    if [[ -d "$APP_DATA_DIR" ]]; then
+        app_data_size=$(du -sh "$APP_DATA_DIR" 2>/dev/null | cut -f1)
+    fi
+
+    local log_size="N/A"
+    local log_dir="${BASE_DIR}/logs"
+    if [[ -d "$log_dir" ]]; then
+        log_size=$(du -sh "$log_dir" 2>/dev/null | cut -f1)
+    fi
+
+    _api_success "{\"containers\": {\"total\": $total_containers, \"running\": $running, \"stopped\": $stopped}, \"images\": {\"total\": $total_images, \"dangling\": $dangling_images}, \"volumes\": {\"total\": $total_volumes, \"dangling\": $dangling_volumes}, \"networks\": {\"total\": $total_networks, \"custom\": $custom_networks}, \"docker_df\": \"$docker_df\", \"app_data_size\": \"$(_api_json_escape "$app_data_size")\", \"log_size\": \"$(_api_json_escape "$log_size")\"}"
+}
+
+handle_maintenance_orphans() {
+    local -a orphan_containers=()
+    while IFS='|' read -r name image status; do
+        [[ -z "$name" ]] && continue
+        orphan_containers+=("{\"name\": \"$(_api_json_escape "$name")\", \"image\": \"$(_api_json_escape "$image")\", \"status\": \"$(_api_json_escape "$status")\"}")
+    done < <(docker ps -a --filter 'status=exited' --format '{{.Names}}|{{.Image}}|{{.Status}}' 2>/dev/null)
+
+    local oc_json
+    if [[ ${#orphan_containers[@]} -gt 0 ]]; then
+        oc_json=$(printf '%s,' "${orphan_containers[@]}")
+        oc_json="[${oc_json%,}]"
+    else
+        oc_json="[]"
+    fi
+
+    local -a dangling_imgs=()
+    while IFS='|' read -r id size created; do
+        [[ -z "$id" ]] && continue
+        dangling_imgs+=("{\"id\": \"$(_api_json_escape "$id")\", \"size\": \"$(_api_json_escape "$size")\", \"created\": \"$(_api_json_escape "$created")\"}")
+    done < <(docker images -f 'dangling=true' --format '{{.ID}}|{{.Size}}|{{.CreatedAt}}' 2>/dev/null)
+
+    local di_json
+    if [[ ${#dangling_imgs[@]} -gt 0 ]]; then
+        di_json=$(printf '%s,' "${dangling_imgs[@]}")
+        di_json="[${di_json%,}]"
+    else
+        di_json="[]"
+    fi
+
+    local -a dangling_vols=()
+    while IFS='|' read -r name driver; do
+        [[ -z "$name" ]] && continue
+        dangling_vols+=("{\"name\": \"$(_api_json_escape "$name")\", \"driver\": \"$(_api_json_escape "$driver")\"}")
+    done < <(docker volume ls -f 'dangling=true' --format '{{.Name}}|{{.Driver}}' 2>/dev/null)
+
+    local dv_json
+    if [[ ${#dangling_vols[@]} -gt 0 ]]; then
+        dv_json=$(printf '%s,' "${dangling_vols[@]}")
+        dv_json="[${dv_json%,}]"
+    else
+        dv_json="[]"
+    fi
+
+    _api_success "{\"containers\": $oc_json, \"images\": $di_json, \"volumes\": $dv_json}"
+}
+
+handle_maintenance_disk() {
+    local -a stack_sizes=()
+    if [[ -d "$APP_DATA_DIR" ]]; then
+        while IFS=$'\t' read -r size dir; do
+            [[ -z "$size" ]] && continue
+            local dirname
+            dirname=$(basename "$dir")
+            stack_sizes+=("{\"name\": \"$(_api_json_escape "$dirname")\", \"size\": \"$(_api_json_escape "$size")\"}")
+        done < <(du -sh "$APP_DATA_DIR"/*/ 2>/dev/null | sort -rh)
+    fi
+
+    local ss_json
+    if [[ ${#stack_sizes[@]} -gt 0 ]]; then
+        ss_json=$(printf '%s,' "${stack_sizes[@]}")
+        ss_json="[${ss_json%,}]"
+    else
+        ss_json="[]"
+    fi
+
+    local -a df_entries=()
+    while IFS='|' read -r type total active size reclaimable; do
+        [[ -z "$type" || "$type" == "TYPE" ]] && continue
+        df_entries+=("{\"type\": \"$(_api_json_escape "$type")\", \"total\": \"$(_api_json_escape "$total")\", \"active\": \"$(_api_json_escape "$active")\", \"size\": \"$(_api_json_escape "$size")\", \"reclaimable\": \"$(_api_json_escape "$reclaimable")\"}")
+    done < <(docker system df --format '{{.Type}}|{{.TotalCount}}|{{.Active}}|{{.Size}}|{{.Reclaimable}}' 2>/dev/null)
+
+    local df_json
+    if [[ ${#df_entries[@]} -gt 0 ]]; then
+        df_json=$(printf '%s,' "${df_entries[@]}")
+        df_json="[${df_json%,}]"
+    else
+        df_json="[]"
+    fi
+
+    local total_app_data="N/A"
+    if [[ -d "$APP_DATA_DIR" ]]; then
+        total_app_data=$(du -sh "$APP_DATA_DIR" 2>/dev/null | cut -f1)
+    fi
+
+    _api_success "{\"stack_sizes\": $ss_json, \"docker_df\": $df_json, \"total_app_data\": \"$(_api_json_escape "$total_app_data")\"}"
+}
+
+handle_maintenance_deep_prune() {
+    local body="$1"
+
+    if ! command -v jq >/dev/null 2>&1; then
+        _api_error 500 "jq is required for deep prune"
+        return
+    fi
+
+    local confirm
+    confirm=$(printf '%s' "$body" | jq -r '.confirm // empty' 2>/dev/null)
+    if [[ "$confirm" != "CONFIRM" ]]; then
+        _api_error 400 "Deep prune requires {\"confirm\": \"CONFIRM\"} in request body"
+        return
+    fi
+
+    local output
+    local success=true
+    output=$(docker system prune -af --volumes 2>&1) || success=false
+    local escaped
+    escaped=$(_api_json_escape "$output")
+
+    _api_success "{\"action\": \"deep_prune\", \"success\": $success, \"output\": \"$escaped\"}"
+}
+
+handle_maintenance_log_rotate() {
+    local log_file="${BASE_DIR}/logs/docker-services.log"
+    local archive_dir="${BASE_DIR}/logs/archive"
+    local retention_count="${LOG_BACKUP_COUNT:-12}"
+
+    if [[ ! -f "$log_file" ]]; then
+        _api_success "{\"success\": true, \"message\": \"No active log file to rotate\"}"
+        return
+    fi
+
+    local log_size
+    log_size=$(du -sh "$log_file" 2>/dev/null | cut -f1)
+    local log_lines
+    log_lines=$(wc -l < "$log_file" 2>/dev/null | tr -d ' ')
+
+    mkdir -p "$archive_dir" 2>/dev/null
+
+    local timestamp
+    timestamp=$(date '+%Y%m%d-%H%M%S')
+    local archive_name="docker-services-${timestamp}.log"
+
+    cp "$log_file" "$archive_dir/$archive_name" 2>/dev/null
+    if command -v gzip >/dev/null 2>&1; then
+        gzip "$archive_dir/$archive_name" 2>/dev/null
+        archive_name="${archive_name}.gz"
+    fi
+
+    : > "$log_file"
+
+    local archive_count
+    archive_count=$(ls -1 "$archive_dir"/docker-services-*.log* 2>/dev/null | wc -l | tr -d ' ')
+    local purged=0
+    if [[ "$archive_count" -gt "$retention_count" ]]; then
+        purged=$(( archive_count - retention_count ))
+        ls -1t "$archive_dir"/docker-services-*.log* 2>/dev/null | tail -n "$purged" | while read -r old_file; do
+            rm -f "$old_file"
+        done
+    fi
+
+    _api_success "{\"success\": true, \"message\": \"Log rotated successfully\", \"archived_as\": \"$(_api_json_escape "$archive_name")\", \"previous_size\": \"$(_api_json_escape "$log_size")\", \"previous_lines\": $log_lines, \"purged_archives\": $purged}"
+}
+
+# =============================================================================
+# BATCH OPERATION HANDLERS (Phase 4)
+# =============================================================================
+
+handle_batch_stacks() {
+    local body="$1"
+
+    if ! command -v jq >/dev/null 2>&1; then
+        _api_error 500 "jq is required for batch operations"
+        return
+    fi
+
+    local action
+    action=$(printf '%s' "$body" | jq -r '.action // empty' 2>/dev/null)
+    if [[ -z "$action" || ! "$action" =~ ^(start|stop|restart)$ ]]; then
+        _api_error 400 "Invalid or missing 'action'. Must be start, stop, or restart."
+        return
+    fi
+
+    local stacks_input
+    stacks_input=$(printf '%s' "$body" | jq -r '.stacks' 2>/dev/null)
+
+    local -a ordered_stacks=(
+        "core-infrastructure"
+        "networking-security"
+        "monitoring-management"
+        "development-tools"
+        "media-services"
+        "web-applications"
+        "storage-backup"
+        "communication-collaboration"
+        "entertainment-personal"
+        "miscellaneous-services"
+    )
+
+    local -a target_stacks=()
+    if [[ "$stacks_input" == '"all"' || "$stacks_input" == 'all' ]]; then
+        for s in "${ordered_stacks[@]}"; do
+            [[ -d "$COMPOSE_DIR/$s" && -f "$COMPOSE_DIR/$s/docker-compose.yml" ]] && target_stacks+=("$s")
+        done
+    else
+        while IFS= read -r s; do
+            [[ -n "$s" ]] && target_stacks+=("$s")
+        done < <(printf '%s' "$body" | jq -r '.stacks[]' 2>/dev/null)
+    fi
+
+    # Reverse order for stop
+    if [[ "$action" == "stop" ]]; then
+        local -a reversed=()
+        for (( i=${#target_stacks[@]}-1; i>=0; i-- )); do
+            reversed+=("${target_stacks[$i]}")
+        done
+        target_stacks=("${reversed[@]}")
+    fi
+
+    local -a results=()
+    for stack in "${target_stacks[@]}"; do
+        local compose_file="$COMPOSE_DIR/$stack/docker-compose.yml"
+        if [[ ! -f "$compose_file" ]]; then
+            results+=("{\"stack\": \"$(_api_json_escape "$stack")\", \"success\": false, \"message\": \"Stack not found\"}")
+            continue
+        fi
+
+        local compose_args=(-f "$compose_file")
+        [[ -f "$COMPOSE_DIR/$stack/.env" ]] && compose_args+=(--env-file "$COMPOSE_DIR/$stack/.env")
+
+        local output success=true
+        case "$action" in
+            start)   output=$($DOCKER_COMPOSE_CMD "${compose_args[@]}" up -d 2>&1) || success=false ;;
+            stop)    output=$($DOCKER_COMPOSE_CMD "${compose_args[@]}" down 2>&1) || success=false ;;
+            restart) output=$($DOCKER_COMPOSE_CMD "${compose_args[@]}" restart 2>&1) || success=false ;;
+        esac
+
+        results+=("{\"stack\": \"$(_api_json_escape "$stack")\", \"success\": $success, \"message\": \"$(_api_json_escape "$output")\"}")
+    done
+
+    local results_json
+    if [[ ${#results[@]} -gt 0 ]]; then
+        results_json=$(printf '%s,' "${results[@]}")
+        results_json="[${results_json%,}]"
+    else
+        results_json="[]"
+    fi
+
+    _api_success "{\"action\": \"$action\", \"total\": ${#target_stacks[@]}, \"results\": $results_json}"
+}
+
+handle_batch_update() {
+    local body="$1"
+
+    if ! command -v jq >/dev/null 2>&1; then
+        _api_error 500 "jq is required for batch operations"
+        return
+    fi
+
+    local stacks_input
+    stacks_input=$(printf '%s' "$body" | jq -r '.stacks' 2>/dev/null)
+
+    local -a target_stacks=()
+    if [[ "$stacks_input" == '"all"' || "$stacks_input" == 'all' ]]; then
+        while IFS= read -r dir; do
+            [[ -f "$dir/docker-compose.yml" ]] && target_stacks+=("$(basename "$dir")")
+        done < <(find "$COMPOSE_DIR" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort)
+    else
+        while IFS= read -r s; do
+            [[ -n "$s" ]] && target_stacks+=("$s")
+        done < <(printf '%s' "$body" | jq -r '.stacks[]' 2>/dev/null)
+    fi
+
+    local -a results=()
+    for stack in "${target_stacks[@]}"; do
+        local compose_file="$COMPOSE_DIR/$stack/docker-compose.yml"
+        if [[ ! -f "$compose_file" ]]; then
+            results+=("{\"stack\": \"$(_api_json_escape "$stack")\", \"success\": false, \"changes_detected\": false, \"message\": \"Stack not found\"}")
+            continue
+        fi
+
+        local compose_args=(-f "$compose_file")
+        [[ -f "$COMPOSE_DIR/$stack/.env" ]] && compose_args+=(--env-file "$COMPOSE_DIR/$stack/.env")
+
+        local before_shas
+        before_shas=$($DOCKER_COMPOSE_CMD "${compose_args[@]}" images -q 2>/dev/null | sort)
+
+        local pull_output
+        pull_output=$($DOCKER_COMPOSE_CMD "${compose_args[@]}" pull 2>&1)
+
+        local after_shas
+        after_shas=$($DOCKER_COMPOSE_CMD "${compose_args[@]}" images -q 2>/dev/null | sort)
+
+        local changes_detected=false
+        if [[ "$before_shas" != "$after_shas" ]]; then
+            changes_detected=true
+            $DOCKER_COMPOSE_CMD "${compose_args[@]}" up -d 2>&1 || true
+        fi
+
+        results+=("{\"stack\": \"$(_api_json_escape "$stack")\", \"success\": true, \"changes_detected\": $changes_detected, \"message\": \"$(_api_json_escape "$pull_output")\"}")
+    done
+
+    local results_json
+    if [[ ${#results[@]} -gt 0 ]]; then
+        results_json=$(printf '%s,' "${results[@]}")
+        results_json="[${results_json%,}]"
+    else
+        results_json="[]"
+    fi
+
+    _api_success "{\"action\": \"update\", \"total\": ${#target_stacks[@]}, \"results\": $results_json}"
+}
+
+# =============================================================================
+# ROOT ENVIRONMENT HANDLERS (Phase 5)
+# =============================================================================
+
+handle_root_env() {
+    local env_file="$BASE_DIR/.env"
+
+    if [[ ! -f "$env_file" ]]; then
+        _api_success "{\"raw\": \"\", \"variables\": []}"
+        return
+    fi
+
+    local raw
+    raw=$(cat "$env_file" 2>/dev/null)
+    local escaped_raw
+    escaped_raw=$(_api_json_escape "$raw")
+
+    local -a vars=()
+    local line_num=0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        (( line_num++ ))
+        if [[ -z "$line" ]]; then continue; fi
+        if [[ "$line" =~ ^[[:space:]]*# ]]; then
+            vars+=("{\"key\": \"\", \"value\": \"\", \"line\": $line_num, \"comment\": \"$(_api_json_escape "$line")\"}")
+            continue
+        fi
+        if [[ "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
+            local key="${BASH_REMATCH[1]}"
+            local value="${BASH_REMATCH[2]}"
+            value="${value#\"}" ; value="${value%\"}"
+            value="${value#\'}" ; value="${value%\'}"
+            vars+=("{\"key\": \"$(_api_json_escape "$key")\", \"value\": \"$(_api_json_escape "$value")\", \"line\": $line_num, \"comment\": \"\"}")
+        fi
+    done < "$env_file"
+
+    local vars_json
+    if [[ ${#vars[@]} -gt 0 ]]; then
+        vars_json=$(printf '%s,' "${vars[@]}")
+        vars_json="[${vars_json%,}]"
+    else
+        vars_json="[]"
+    fi
+
+    _api_success "{\"raw\": \"$escaped_raw\", \"variables\": $vars_json}"
+}
+
+handle_root_env_update() {
+    local body="$1"
+    local env_file="$BASE_DIR/.env"
+
+    if ! command -v jq >/dev/null 2>&1; then
+        _api_error 500 "jq is required for env update"
+        return
+    fi
+
+    local content
+    content=$(printf '%s' "$body" | jq -r '.content // empty' 2>/dev/null)
+    if [[ -z "$content" ]]; then
+        _api_error 400 "Missing 'content' field in request body"
+        return
+    fi
+
+    if [[ -f "$env_file" ]]; then
+        cp "$env_file" "${env_file}.bak" 2>/dev/null
+    fi
+
+    printf '%s' "$content" > "$env_file" 2>/dev/null || {
+        _api_error 500 "Failed to write .env file"
+        return
+    }
+
+    _api_success "{\"success\": true, \"message\": \"Root .env file saved successfully\"}"
+}
+
+handle_env_validate() {
+    local body="$1"
+
+    if ! command -v jq >/dev/null 2>&1; then
+        _api_error 500 "jq is required for env validation"
+        return
+    fi
+
+    local content
+    content=$(printf '%s' "$body" | jq -r '.content // empty' 2>/dev/null)
+    if [[ -z "$content" ]]; then
+        _api_error 400 "Missing 'content' field in request body"
+        return
+    fi
+
+    local -a errors=()
+    local -a warnings=()
+    local -a seen_keys=()
+    local line_num=0
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        (( line_num++ ))
+        [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+        if [[ ! "$line" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]; then
+            errors+=("{\"line\": $line_num, \"message\": \"$(_api_json_escape "Invalid syntax: $line")\"}")
+            continue
+        fi
+        local key="${line%%=*}"
+        for seen in "${seen_keys[@]}"; do
+            if [[ "$seen" == "$key" ]]; then
+                warnings+=("{\"line\": $line_num, \"message\": \"$(_api_json_escape "Duplicate key: $key")\"}")
+                break
+            fi
+        done
+        seen_keys+=("$key")
+    done <<< "$content"
+
+    local valid=true
+    [[ ${#errors[@]} -gt 0 ]] && valid=false
+
+    local errors_json warnings_json
+    if [[ ${#errors[@]} -gt 0 ]]; then
+        errors_json=$(printf '%s,' "${errors[@]}")
+        errors_json="[${errors_json%,}]"
+    else
+        errors_json="[]"
+    fi
+    if [[ ${#warnings[@]} -gt 0 ]]; then
+        warnings_json=$(printf '%s,' "${warnings[@]}")
+        warnings_json="[${warnings_json%,}]"
+    else
+        warnings_json="[]"
+    fi
+
+    _api_success "{\"valid\": $valid, \"errors\": $errors_json, \"warnings\": $warnings_json}"
+}
+
+# =============================================================================
+# BACKUP & RESTORE HANDLERS (Phase 6)
+# =============================================================================
+
+handle_backup_list() {
+    local backup_dir="${BACKUP_DEST_DIR:-}"
+
+    if [[ -z "$backup_dir" || ! -d "$backup_dir" ]]; then
+        _api_success "{\"backups\": [], \"total\": 0}"
+        return
+    fi
+
+    local -a entries=()
+    while IFS= read -r file; do
+        [[ -z "$file" ]] && continue
+        local filename size date_epoch
+        filename=$(basename "$file")
+        size=$(du -h "$file" 2>/dev/null | cut -f1)
+        date_epoch=$(stat -c '%Y' "$file" 2>/dev/null || stat -f '%m' "$file" 2>/dev/null || echo "0")
+        entries+=("{\"filename\": \"$(_api_json_escape "$filename")\", \"size\": \"$(_api_json_escape "$size")\", \"timestamp\": $date_epoch}")
+    done < <(ls -1t "$backup_dir"/Docker-Compose-Backup-*.tar.gz 2>/dev/null)
+
+    local entries_json
+    if [[ ${#entries[@]} -gt 0 ]]; then
+        entries_json=$(printf '%s,' "${entries[@]}")
+        entries_json="[${entries_json%,}]"
+    else
+        entries_json="[]"
+    fi
+
+    _api_success "{\"backups\": $entries_json, \"total\": ${#entries[@]}}"
+}
+
+handle_backup_status() {
+    local status_file="$API_AUTH_DIR/backup-status.json"
+
+    if [[ -f "$status_file" ]]; then
+        local status_content
+        status_content=$(cat "$status_file" 2>/dev/null)
+        _api_success "$status_content"
+    else
+        _api_success "{\"status\": \"idle\", \"last_backup\": null, \"progress\": null}"
+    fi
+}
+
+handle_backup_config() {
+    local backup_dest="${BACKUP_DEST_DIR:-}"
+    local backup_source="${BACKUP_SOURCE_DIR:-$BASE_DIR}"
+    local retention="${BACKUP_RETENTION_COUNT:-5}"
+    local configured=false
+    [[ -n "$backup_dest" ]] && configured=true
+
+    _api_success "{\"configured\": $configured, \"destination\": \"$(_api_json_escape "$backup_dest")\", \"source\": \"$(_api_json_escape "$backup_source")\", \"retention_count\": $retention}"
+}
+
+handle_backup_trigger() {
+    local body="$1"
+    local backup_dir="${BACKUP_DEST_DIR:-}"
+
+    if [[ -z "$backup_dir" ]]; then
+        _api_error 400 "Backup not configured. Set BACKUP_DEST_DIR in .env"
+        return
+    fi
+
+    mkdir -p "$backup_dir" 2>/dev/null
+
+    local stack_filter=""
+    if command -v jq >/dev/null 2>&1 && [[ -n "$body" ]]; then
+        stack_filter=$(printf '%s' "$body" | jq -r '.stack // empty' 2>/dev/null)
+    fi
+
+    local status_file="$API_AUTH_DIR/backup-status.json"
+    local backup_date
+    backup_date=$(date '+%Y-%m-%d_%H%M%S')
+    local backup_file="Docker-Compose-Backup-${backup_date}.tar.gz"
+    local source_dir="${BACKUP_SOURCE_DIR:-$BASE_DIR}"
+
+    printf '{"status": "running", "started_at": "%s", "filename": "%s", "progress": "Starting backup..."}' \
+        "$(date -Iseconds)" "$backup_file" > "$status_file"
+
+    (
+        local tmpdir
+        tmpdir=$(mktemp -d /tmp/dcs-backup-XXXXXX)
+
+        printf '{"status": "running", "started_at": "%s", "filename": "%s", "progress": "Copying files..."}' \
+            "$(date -Iseconds)" "$backup_file" > "$status_file"
+
+        if [[ -n "$stack_filter" ]]; then
+            [[ -d "$COMPOSE_DIR/$stack_filter" ]] && rsync -a "$COMPOSE_DIR/$stack_filter/" "$tmpdir/$stack_filter/" 2>/dev/null || true
+            [[ -d "$APP_DATA_DIR/$stack_filter" ]] && rsync -a "$APP_DATA_DIR/$stack_filter/" "$tmpdir/App-Data/$stack_filter/" 2>/dev/null || true
+        else
+            rsync -a --exclude='.git' --exclude='node_modules' "$source_dir/" "$tmpdir/" 2>/dev/null || true
+        fi
+
+        printf '{"status": "running", "started_at": "%s", "filename": "%s", "progress": "Creating archive..."}' \
+            "$(date -Iseconds)" "$backup_file" > "$status_file"
+
+        if tar -czf "$backup_dir/$backup_file" -C "$tmpdir" . 2>/dev/null; then
+            local final_size
+            final_size=$(du -h "$backup_dir/$backup_file" 2>/dev/null | cut -f1)
+            printf '{"status": "idle", "last_backup": {"filename": "%s", "size": "%s", "timestamp": "%s"}, "progress": null}' \
+                "$backup_file" "$final_size" "$(date -Iseconds)" > "$status_file"
+        else
+            printf '{"status": "error", "error": "Archive creation failed", "progress": null}' > "$status_file"
+        fi
+
+        rm -rf "$tmpdir"
+
+        local retention="${BACKUP_RETENTION_COUNT:-5}"
+        local count
+        count=$(ls -1 "$backup_dir"/Docker-Compose-Backup-*.tar.gz 2>/dev/null | wc -l)
+        if [[ "$count" -gt "$retention" ]]; then
+            ls -1t "$backup_dir"/Docker-Compose-Backup-*.tar.gz 2>/dev/null | tail -n "$(( count - retention ))" | xargs -r rm -f
+        fi
+    ) &
+
+    _api_success "{\"success\": true, \"message\": \"Backup started in background\", \"filename\": \"$(_api_json_escape "$backup_file")\"}"
+}
+
+handle_backup_restore() {
+    local body="$1"
+    local backup_dir="${BACKUP_DEST_DIR:-}"
+
+    if ! command -v jq >/dev/null 2>&1; then
+        _api_error 500 "jq is required for restore"
+        return
+    fi
+
+    local filename confirm
+    filename=$(printf '%s' "$body" | jq -r '.filename // empty' 2>/dev/null)
+    confirm=$(printf '%s' "$body" | jq -r '.confirm // empty' 2>/dev/null)
+
+    if [[ -z "$filename" ]]; then
+        _api_error 400 "Missing 'filename' in request body"
+        return
+    fi
+
+    if [[ "$confirm" != "RESTORE" ]]; then
+        _api_error 400 "Restore requires {\"confirm\": \"RESTORE\"} in request body"
+        return
+    fi
+
+    local archive_path="$backup_dir/$filename"
+    if [[ ! -f "$archive_path" ]]; then
+        _api_error 404 "Backup file not found: $filename"
+        return
+    fi
+
+    if ! tar -tzf "$archive_path" >/dev/null 2>&1; then
+        _api_error 400 "Backup archive is corrupt or invalid"
+        return
+    fi
+
+    local status_file="$API_AUTH_DIR/backup-status.json"
+    printf '{"status": "restoring", "filename": "%s", "progress": "Restoring from backup..."}' "$filename" > "$status_file"
+
+    (
+        local target="${BACKUP_SOURCE_DIR:-$BASE_DIR}"
+        if tar -xzf "$archive_path" -C "$target" 2>/dev/null; then
+            printf '{"status": "idle", "last_restore": {"filename": "%s", "timestamp": "%s"}, "progress": null}' \
+                "$filename" "$(date -Iseconds)" > "$status_file"
+        else
+            printf '{"status": "error", "error": "Restore failed", "progress": null}' > "$status_file"
+        fi
+    ) &
+
+    _api_success "{\"success\": true, \"message\": \"Restore started in background\", \"filename\": \"$(_api_json_escape "$filename")\"}"
 }
 
 # =============================================================================
@@ -1377,8 +3385,9 @@ handle_request() {
     method=$(echo "$request_line" | awk '{print $1}')
     path=$(echo "$request_line" | awk '{print $2}')
 
-    # Consume remaining headers and capture Content-Length
+    # Consume remaining headers and capture Content-Length and Authorization
     local header="" content_length=0
+    REQUEST_AUTH_HEADER=""
     while IFS= read -r header; do
         header="${header%%$'\r'}"
         [[ -z "$header" ]] && break
@@ -1386,6 +3395,13 @@ handle_request() {
         if [[ "${header,,}" == content-length:* ]]; then
             content_length="${header#*: }"
             content_length="${content_length// /}"
+        fi
+        # Capture authorization header (case-insensitive)
+        if [[ "${header,,}" == authorization:* ]]; then
+            REQUEST_AUTH_HEADER="${header#*: }"
+            REQUEST_AUTH_HEADER="${REQUEST_AUTH_HEADER// /}"
+            # Re-extract preserving the space after "Bearer "
+            REQUEST_AUTH_HEADER="${header#*: }"
         fi
     done
 
@@ -1399,6 +3415,10 @@ handle_request() {
     path="${path%/}"
     [[ -z "$path" ]] && path="/"
 
+    # Parse query string and strip from path for clean routing
+    _api_parse_query "$path"
+    path="${path%%\?*}"
+
     # Handle CORS preflight
     if [[ "$method" == "OPTIONS" ]]; then
         _api_response 200 ""
@@ -1406,12 +3426,44 @@ handle_request() {
     fi
 
     # Log the request
-    echo "$(date '+%Y-%m-%d %H:%M:%S') $method $path" >> "$API_LOG_FILE" 2>/dev/null
+    local client_ip="${SOCAT_PEERADDR:-127.0.0.1}"
+    echo "$(date '+%Y-%m-%d %H:%M:%S') $method $path [${client_ip}]" >> "$API_LOG_FILE" 2>/dev/null
+
+    # IP whitelist check — reject before any processing
+    if ! _api_check_ip_whitelist; then
+        _api_error 403 "Access denied: IP ${client_ip} is not in the allowed list."
+        return
+    fi
+
+    # Global rate limit check — reject if too many requests from this IP
+    if ! _api_check_global_rate_limit; then
+        _api_error 429 "Rate limit exceeded. Maximum ${API_RATE_LIMIT} requests per ${API_RATE_WINDOW} seconds."
+        return
+    fi
 
     # ── Route: GET endpoints ──────────────────────────────────────────
     if [[ "$method" == "GET" ]]; then
+
+        # Auth endpoints that do NOT require authentication
         case "$path" in
-            /)                          handle_root ;;
+            /)              handle_root; return ;;
+            /auth/verify)   handle_auth_verify; return ;;
+        esac
+
+        # All other GET endpoints require authentication
+        if ! _api_check_auth; then
+            _api_error 401 "Authentication required. Provide Authorization: Bearer <token> header."
+            return
+        fi
+
+        # Admin-only auth endpoints
+        case "$path" in
+            /auth/users)    handle_auth_users; return ;;
+            /auth/invites)  handle_auth_invites; return ;;
+        esac
+
+        # Standard authenticated GET endpoints
+        case "$path" in
             /status)                    handle_status ;;
             /health)                    handle_health ;;
             /stacks)                    handle_stacks ;;
@@ -1424,8 +3476,17 @@ handle_request() {
             /networks)                  handle_networks ;;
             /volumes)                   handle_volumes ;;
             /logs)                      handle_logs ;;
+            /logs/stats)                handle_logs_stats ;;
+            /logs/archives)             handle_logs_archives ;;
             /events)                    handle_events ;;
             /version)                   handle_version ;;
+            /maintenance/report)        handle_maintenance_report ;;
+            /maintenance/orphans)       handle_maintenance_orphans ;;
+            /maintenance/disk)          handle_maintenance_disk ;;
+            /env)                       handle_root_env ;;
+            /backups)                   handle_backup_list ;;
+            /backups/status)            handle_backup_status ;;
+            /backups/config)            handle_backup_config ;;
 
             /stacks/*/containers)
                 local stack="${path#/stacks/}"
@@ -1436,6 +3497,16 @@ handle_request() {
                 local stack="${path#/stacks/}"
                 stack="${stack%/logs}"
                 handle_stack_logs "$stack"
+                ;;
+            /stacks/*/compose)
+                local stack="${path#/stacks/}"
+                stack="${stack%/compose}"
+                handle_stack_compose "$stack"
+                ;;
+            /stacks/*/env)
+                local stack="${path#/stacks/}"
+                stack="${stack%/env}"
+                handle_stack_env "$stack"
                 ;;
             /stacks/*)
                 local stack="${path#/stacks/}"
@@ -1450,6 +3521,11 @@ handle_request() {
                 local container="${path#/containers/}"
                 container="${container%/logs}"
                 handle_container_logs "$container"
+                ;;
+            /containers/*/processes)
+                local container="${path#/containers/}"
+                container="${container%/processes}"
+                handle_container_processes "$container"
                 ;;
             /networks/*)
                 local network="${path#/networks/}"
@@ -1468,6 +3544,27 @@ handle_request() {
 
     # ── Route: POST endpoints ─────────────────────────────────────────
     if [[ "$method" == "POST" ]]; then
+
+        # Auth endpoints that do NOT require authentication
+        case "$path" in
+            /auth/setup)    handle_auth_setup "$request_body"; return ;;
+            /auth/login)    handle_auth_login "$request_body"; return ;;
+            /auth/register) handle_auth_register "$request_body"; return ;;
+        esac
+
+        # All other POST endpoints require authentication
+        if ! _api_check_auth; then
+            _api_error 401 "Authentication required. Provide Authorization: Bearer <token> header."
+            return
+        fi
+
+        # Auth endpoints that require admin
+        case "$path" in
+            /auth/invite)   handle_auth_invite "$request_body"; return ;;
+            /auth/revoke)   handle_auth_revoke "$request_body"; return ;;
+        esac
+
+        # Standard authenticated POST endpoints
         case "$path" in
             /stacks)
                 handle_create_stack "$request_body"
@@ -1524,6 +3621,45 @@ handle_request() {
             /maintenance/image-prune)
                 handle_maintenance_image_prune
                 ;;
+            /maintenance/deep-prune)
+                handle_maintenance_deep_prune "$request_body"
+                ;;
+            /maintenance/log-rotate)
+                handle_maintenance_log_rotate
+                ;;
+            /batch/stacks)
+                handle_batch_stacks "$request_body"
+                ;;
+            /batch/update)
+                handle_batch_update "$request_body"
+                ;;
+            /env)
+                handle_root_env_update "$request_body"
+                ;;
+            /env/validate)
+                handle_env_validate "$request_body"
+                ;;
+            /backups/trigger)
+                handle_backup_trigger "$request_body"
+                ;;
+            /backups/restore)
+                handle_backup_restore "$request_body"
+                ;;
+            /stacks/*/compose/validate)
+                local stack="${path#/stacks/}"
+                stack="${stack%/compose/validate}"
+                handle_stack_compose_validate "$stack" "$request_body"
+                ;;
+            /stacks/*/compose)
+                local stack="${path#/stacks/}"
+                stack="${stack%/compose}"
+                handle_stack_compose_save "$stack" "$request_body"
+                ;;
+            /stacks/*/env)
+                local stack="${path#/stacks/}"
+                stack="${stack%/env}"
+                handle_stack_env_save "$stack" "$request_body"
+                ;;
             /stacks/*/start)
                 local stack="${path#/stacks/}"
                 stack="${stack%/start}"
@@ -1543,6 +3679,27 @@ handle_request() {
                 local stack="${path#/stacks/}"
                 stack="${stack%/update}"
                 handle_stack_action "$stack" "update"
+                ;;
+            *)
+                _api_error 404 "Endpoint not found: $path"
+                ;;
+        esac
+        return
+    fi
+
+    # ── Route: DELETE endpoints ────────────────────────────────────────
+    if [[ "$method" == "DELETE" ]]; then
+
+        # All DELETE endpoints require authentication
+        if ! _api_check_auth; then
+            _api_error 401 "Authentication required. Provide Authorization: Bearer <token> header."
+            return
+        fi
+
+        case "$path" in
+            /auth/invite/*)
+                local code="${path#/auth/invite/}"
+                handle_auth_delete_invite "$code"
                 ;;
             *)
                 _api_error 404 "Endpoint not found: $path"
@@ -1595,6 +3752,7 @@ start_server() {
     echo "  ${_A_BOLD}${_A_WHITE}Version${_A_RST}    ${_A_CYAN}v${API_VERSION}${_A_RST}"
     echo "  ${_A_BOLD}${_A_WHITE}Listen${_A_RST}     ${_A_GREEN}${API_BIND}:${API_PORT}${_A_RST}"
     echo "  ${_A_BOLD}${_A_WHITE}Transport${_A_RST}  ${_A_MAGENTA}${LISTENER_CMD}${_A_RST}"
+    echo "  ${_A_BOLD}${_A_WHITE}Auth${_A_RST}       $([[ "$API_AUTH_ENABLED" == "true" ]] && echo "${_A_GREEN}Enabled${_A_RST}" || echo "${_A_GRAY}Disabled (localhost)${_A_RST}")"
     echo "  ${_A_BOLD}${_A_WHITE}PID${_A_RST}        ${_A_GRAY}$$${_A_RST}"
     echo "  ${_A_BOLD}${_A_WHITE}Base Dir${_A_RST}   ${_A_DIM}${BASE_DIR}${_A_RST}"
     echo ""
@@ -1630,6 +3788,8 @@ start_server() {
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     # Internal: called by socat/ncat for each incoming connection
     if [[ "$HANDLE_REQUEST" == "true" ]]; then
+        # Disable errexit for request handling — we handle errors via JSON responses
+        set +e
         handle_request
         exit 0
     fi
