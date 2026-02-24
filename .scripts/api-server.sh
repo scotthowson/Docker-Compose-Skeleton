@@ -1035,7 +1035,10 @@ handle_status() {
     done
     rm -rf "$tmpdir"
 
-    _api_success "{\"timestamp\": \"$(date -u '+%Y-%m-%dT%H:%M:%SZ')\", \"hostname\": \"$(hostname)\", \"uptime_seconds\": $uptime_seconds, \"docker\": {\"containers\": {\"total\": $total_containers, \"running\": $running_containers, \"stopped\": $stopped_containers}, \"images\": $total_images, \"volumes\": $total_volumes, \"networks\": $total_networks}, \"stacks\": {\"total\": ${#stacks[@]}, \"running\": $running_stacks}, \"system\": {\"load_average\": $load_avg, \"memory_mb\": {\"total\": $mem_total, \"available\": $mem_available}, \"disk\": $disk_usage}}"
+    local cpu_count
+    cpu_count=$(nproc 2>/dev/null || echo 0)
+
+    _api_success "{\"timestamp\": \"$(date -u '+%Y-%m-%dT%H:%M:%SZ')\", \"hostname\": \"$(hostname)\", \"uptime_seconds\": $uptime_seconds, \"docker\": {\"containers\": {\"total\": $total_containers, \"running\": $running_containers, \"stopped\": $stopped_containers}, \"images\": $total_images, \"volumes\": $total_volumes, \"networks\": $total_networks}, \"stacks\": {\"total\": ${#stacks[@]}, \"running\": $running_stacks}, \"system\": {\"load_average\": $load_avg, \"memory_mb\": {\"total\": $mem_total, \"available\": $mem_available}, \"disk\": $disk_usage, \"cpu_count\": $cpu_count}}"
 }
 
 handle_health() {
@@ -1696,16 +1699,36 @@ handle_system() {
 
 handle_disks() {
     local -a disk_entries=()
-    while IFS='|' read -r device mount total used available percent; do
+    # Parse df output handling mount paths with spaces (e.g. "/media/user/Dev Drive")
+    # Split each line into words — last 4 are always size/used/avail/percent,
+    # first word is device, everything between is the mount path
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        local -a fields
+        read -ra fields <<< "$line"
+        local nf=${#fields[@]}
+        [[ $nf -lt 6 ]] && continue
+
+        local percent="${fields[$((nf-1))]}"
+        local available="${fields[$((nf-2))]}"
+        local used="${fields[$((nf-3))]}"
+        local total="${fields[$((nf-4))]}"
+        local device="${fields[0]}"
+        # Reconstruct mount path from fields[1] to fields[nf-5]
+        local mount=""
+        local i
+        for ((i=1; i<nf-4; i++)); do
+            [[ -n "$mount" ]] && mount+=" "
+            mount+="${fields[$i]}"
+        done
+
         [[ -z "$device" || "$device" == "Filesystem" ]] && continue
-        # Skip system/firmware mounts that aren't user-relevant
         case "$mount" in
             /sys/*|/proc/*|/dev/*|/run/*|/snap/*|/boot/efi|/boot/grub) continue ;;
         esac
-        # Skip entries with no device path (virtual filesystems)
         [[ "$device" != /* ]] && continue
         disk_entries+=("{\"device\": \"$(_api_json_escape "$device")\", \"mount\": \"$(_api_json_escape "$mount")\", \"total\": \"$(_api_json_escape "$total")\", \"used\": \"$(_api_json_escape "$used")\", \"available\": \"$(_api_json_escape "$available")\", \"percent\": \"$(_api_json_escape "$percent")\"}")
-    done < <(df -h --output=source,target,size,used,avail,pcent -x tmpfs -x devtmpfs -x squashfs -x overlay -x efivarfs -x vfat 2>/dev/null | tail -n +2 | awk '{print $1"|"$2"|"$3"|"$4"|"$5"|"$6}')
+    done < <(df -h --output=source,target,size,used,avail,pcent -x tmpfs -x devtmpfs -x squashfs -x overlay -x efivarfs -x vfat 2>/dev/null | tail -n +2)
 
     local json
     json=$(printf '%s,' "${disk_entries[@]}")
@@ -2498,6 +2521,52 @@ handle_container_action() {
     escaped_output=$(_api_json_escape "$output")
 
     _api_success "{\"container\": \"$(_api_json_escape "$name")\", \"action\": \"$action\", \"success\": $success, \"output\": \"$escaped_output\"}"
+}
+
+handle_container_exec() {
+    local name="$1"
+    local body="$2"
+
+    if ! docker inspect "$name" >/dev/null 2>&1; then
+        _api_error 404 "Container not found: $name"
+        return
+    fi
+
+    # Check container is running
+    local state
+    state=$(docker inspect --format '{{.State.Running}}' "$name" 2>/dev/null)
+    if [[ "$state" != "true" ]]; then
+        _api_error 400 "Container is not running"
+        return
+    fi
+
+    # Extract command from JSON body
+    local command
+    command=$(echo "$body" | _api_json_extract "command")
+
+    if [[ -z "$command" ]]; then
+        _api_error 400 "Missing required field: command"
+        return
+    fi
+
+    # Execute the command (with timeout to prevent hanging)
+    local output=""
+    local exit_code=0
+    output=$(timeout 30 docker exec -T "$name" sh -c "$command" 2>&1) || exit_code=$?
+
+    # Handle timeout specifically
+    if [[ $exit_code -eq 124 ]]; then
+        output="Command timed out after 30 seconds"
+    fi
+
+    local success=true
+    [[ $exit_code -ne 0 ]] && success=false
+
+    local escaped_output escaped_command
+    escaped_output=$(_api_json_escape "$output")
+    escaped_command=$(_api_json_escape "$command")
+
+    _api_success "{\"container\": \"$(_api_json_escape "$name")\", \"command\": \"$escaped_command\", \"exit_code\": $exit_code, \"output\": \"$escaped_output\", \"success\": $success}"
 }
 
 handle_container_logs() {
@@ -3371,6 +3440,1012 @@ handle_config_update() {
 }
 
 # =============================================================================
+# TERMINAL LINUX AUTHENTICATION
+# =============================================================================
+
+# Multi-strategy Linux credential validation
+_authenticate_linux_user() {
+    local username="$1" password="$2"
+    local auth_method=""
+
+    # Strategy 1: Python3 PAM (cleanest — requires python3-pam)
+    if python3 -c "import pam" 2>/dev/null; then
+        auth_method="pam"
+        TERM_AUTH_USER="$username" TERM_AUTH_PASS="$password" python3 << 'PYEOF' 2>/dev/null
+import pam, os, sys
+p = pam.pam()
+sys.exit(0 if p.authenticate(os.environ['TERM_AUTH_USER'], os.environ['TERM_AUTH_PASS']) else 1)
+PYEOF
+        [[ $? -eq 0 ]] && { echo "$auth_method"; return 0; }
+    fi
+
+    # Strategy 2: Python3 pty + su (built-in — works on any system with su)
+    if python3 -c "import pty" 2>/dev/null; then
+        auth_method="python3-pty"
+        TERM_AUTH_USER="$username" TERM_AUTH_PASS="$password" python3 << 'PYEOF' 2>/dev/null
+import pty, os, sys, select, time
+
+username = os.environ['TERM_AUTH_USER']
+password = os.environ['TERM_AUTH_PASS']
+marker = 'AUTH_OK_' + str(os.getpid()) + '_' + str(int(time.time()))
+
+pid, fd = pty.fork()
+if pid == 0:
+    os.execvp('su', ['su', '-c', 'echo ' + marker, '--', username])
+    os._exit(1)
+
+output = b''
+authenticated = False
+password_sent = False
+deadline = time.time() + 10
+
+while time.time() < deadline:
+    r, _, _ = select.select([fd], [], [], 0.5)
+    if r:
+        try:
+            data = os.read(fd, 4096)
+            if not data:
+                break
+            output += data
+        except OSError:
+            break
+    if not password_sent and b'assword' in output:
+        os.write(fd, (password + '\n').encode())
+        password_sent = True
+        output = b''
+    if password_sent and marker.encode() in output:
+        authenticated = True
+        break
+
+try:
+    os.close(fd)
+except OSError:
+    pass
+try:
+    os.waitpid(pid, 0)
+except ChildProcessError:
+    pass
+
+sys.exit(0 if authenticated else 1)
+PYEOF
+        [[ $? -eq 0 ]] && { echo "$auth_method"; return 0; }
+    fi
+
+    # Strategy 3: expect + su
+    if command -v expect >/dev/null 2>&1; then
+        auth_method="expect"
+        local marker="AUTH_OK_$$_$(date +%s)"
+        TERM_AUTH_PASS="$password" expect << EXPEOF 2>/dev/null
+log_user 0
+set timeout 10
+spawn su - $username -c "echo $marker"
+expect {
+    -re {[Pp]assword:} { send "\$env(TERM_AUTH_PASS)\r"; exp_continue }
+    "$marker" { exit 0 }
+    timeout { exit 1 }
+    eof { exit 1 }
+}
+EXPEOF
+        [[ $? -eq 0 ]] && { echo "$auth_method"; return 0; }
+    fi
+
+    # Strategy 4: sshpass + ssh localhost
+    if command -v sshpass >/dev/null 2>&1; then
+        auth_method="sshpass"
+        sshpass -p "$password" ssh -o StrictHostKeyChecking=no \
+            -o ConnectTimeout=5 -o BatchMode=no \
+            "$username@127.0.0.1" 'echo AUTH_OK' 2>/dev/null | grep -q AUTH_OK && { echo "$auth_method"; return 0; }
+    fi
+
+    return 1
+}
+
+# Validate terminal session token
+_validate_terminal_session() {
+    local token="$1"
+    local sessions_file="$BASE_DIR/.api-auth/terminal-sessions.json"
+
+    [[ -z "$token" ]] && return 1
+    [[ ! -f "$sessions_file" ]] && return 1
+
+    local now
+    now=$(date +%s)
+
+    if command -v jq >/dev/null 2>&1; then
+        local session
+        session=$(jq -r --arg t "$token" '.sessions[] | select(.token == $t)' "$sessions_file" 2>/dev/null)
+        [[ -z "$session" ]] && return 1
+
+        local expires_at
+        expires_at=$(echo "$session" | jq -r '.expires_at' 2>/dev/null)
+        [[ "$now" -gt "$expires_at" ]] && return 1
+
+        # Return username via stdout
+        echo "$session" | jq -r '.username' 2>/dev/null
+        return 0
+    else
+        # Fallback: grep-based validation
+        if grep -q "\"token\":\"$token\"" "$sessions_file" 2>/dev/null || \
+           grep -q "\"token\": \"$token\"" "$sessions_file" 2>/dev/null; then
+            # Basic expiry check not possible without jq — allow
+            echo "unknown"
+            return 0
+        fi
+        return 1
+    fi
+}
+
+# POST /terminal/auth — Authenticate with Linux credentials
+handle_terminal_auth() {
+    local body="$1"
+
+    if ! _api_check_admin; then return; fi
+
+    local username password
+    if command -v jq >/dev/null 2>&1; then
+        username=$(echo "$body" | jq -r '.username // empty' 2>/dev/null)
+        password=$(echo "$body" | jq -r '.password // empty' 2>/dev/null)
+    else
+        username=$(echo "$body" | sed -n 's/.*"username" *: *"\([^"]*\)".*/\1/p')
+        password=$(echo "$body" | sed -n 's/.*"password" *: *"\([^"]*\)".*/\1/p')
+    fi
+
+    [[ -z "$username" ]] && { _api_error 400 "Missing 'username' field"; return; }
+    [[ -z "$password" ]] && { _api_error 400 "Missing 'password' field"; return; }
+
+    local auth_audit="$BASE_DIR/.api-auth/terminal-auth-audit.log"
+    local rate_file="$BASE_DIR/.api-auth/terminal-auth-rate.json"
+    local sessions_file="$BASE_DIR/.api-auth/terminal-sessions.json"
+    mkdir -p "$BASE_DIR/.api-auth"
+
+    # Initialize sessions file if needed
+    [[ ! -f "$sessions_file" ]] && echo '{"sessions":[]}' > "$sessions_file"
+
+    # Rate limit: 5 failed attempts per 15 minutes per IP
+    local client_ip="${SOCAT_PEERADDR:-127.0.0.1}"
+    local now
+    now=$(date +%s)
+    local window_start=$(( now - 900 ))
+
+    if command -v jq >/dev/null 2>&1 && [[ -f "$rate_file" ]]; then
+        local fail_count
+        fail_count=$(jq -r --arg ip "$client_ip" --argjson cutoff "$window_start" \
+            '[.attempts[] | select(.ip == $ip and .timestamp > $cutoff and .success == false)] | length' \
+            "$rate_file" 2>/dev/null || echo 0)
+        if (( fail_count >= 5 )); then
+            echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') | RATE_LIMITED | ip=$client_ip | user=$username" >> "$auth_audit"
+            _api_error 429 "Too many failed attempts. Try again in 15 minutes."
+            return
+        fi
+    fi
+
+    # Initialize rate file if needed
+    [[ ! -f "$rate_file" ]] && echo '{"attempts":[]}' > "$rate_file"
+
+    # Authenticate against Linux system
+    local auth_method
+    auth_method=$(_authenticate_linux_user "$username" "$password")
+    local auth_result=$?
+
+    if [[ $auth_result -ne 0 ]]; then
+        # Log failed attempt
+        echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') | FAILED | ip=$client_ip | user=$username" >> "$auth_audit"
+
+        # Record rate limit
+        if command -v jq >/dev/null 2>&1; then
+            local tmp_rate
+            tmp_rate=$(jq --arg ip "$client_ip" --argjson ts "$now" \
+                '.attempts += [{"ip": $ip, "timestamp": $ts, "success": false}]' \
+                "$rate_file" 2>/dev/null)
+            [[ -n "$tmp_rate" ]] && echo "$tmp_rate" > "$rate_file"
+        fi
+
+        _api_error 401 "Invalid Linux credentials"
+        return
+    fi
+
+    # Generate session token
+    local token
+    token=$(head -c 32 /dev/urandom | xxd -p | tr -d '\n' 2>/dev/null || openssl rand -hex 32 2>/dev/null || cat /proc/sys/kernel/random/uuid | tr -d '-' | head -c 64)
+
+    local expiry_seconds="${TERMINAL_SESSION_EXPIRY:-14400}"
+    local expires_at=$(( now + expiry_seconds ))
+
+    # Store session
+    if command -v jq >/dev/null 2>&1; then
+        local tmp_sessions
+        # Clean expired sessions first
+        tmp_sessions=$(jq --argjson now "$now" \
+            '.sessions = [.sessions[] | select(.expires_at > $now)]' \
+            "$sessions_file" 2>/dev/null)
+        [[ -n "$tmp_sessions" ]] && echo "$tmp_sessions" > "$sessions_file"
+
+        # Add new session
+        tmp_sessions=$(jq --arg t "$token" --arg u "$username" --argjson c "$now" --argjson e "$expires_at" --arg m "$auth_method" \
+            '.sessions += [{"token": $t, "username": $u, "created_at": $c, "expires_at": $e, "auth_method": $m}]' \
+            "$sessions_file" 2>/dev/null)
+        [[ -n "$tmp_sessions" ]] && echo "$tmp_sessions" > "$sessions_file"
+    else
+        # Fallback: append to a simple log
+        echo "{\"token\":\"$token\",\"username\":\"$username\",\"created_at\":$now,\"expires_at\":$expires_at}" >> "$sessions_file.fallback"
+    fi
+
+    # Log success
+    echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') | SUCCESS | ip=$client_ip | user=$username | method=$auth_method" >> "$auth_audit"
+
+    # Record rate limit (success)
+    if command -v jq >/dev/null 2>&1; then
+        local tmp_rate
+        tmp_rate=$(jq --arg ip "$client_ip" --argjson ts "$now" \
+            '.attempts += [{"ip": $ip, "timestamp": $ts, "success": true}]' \
+            "$rate_file" 2>/dev/null)
+        [[ -n "$tmp_rate" ]] && echo "$tmp_rate" > "$rate_file"
+    fi
+
+    _api_success "{\"success\": true, \"token\": \"$token\", \"username\": \"$(_api_json_escape "$username")\", \"expires_in\": $expiry_seconds, \"auth_method\": \"$auth_method\", \"message\": \"Terminal session authenticated\"}"
+}
+
+# POST /terminal/auth/verify — Verify a terminal session token
+handle_terminal_auth_verify() {
+    local body="$1"
+
+    if ! _api_check_admin; then return; fi
+
+    local token
+    if command -v jq >/dev/null 2>&1; then
+        token=$(echo "$body" | jq -r '.token // empty' 2>/dev/null)
+    else
+        token=$(echo "$body" | sed -n 's/.*"token" *: *"\([^"]*\)".*/\1/p')
+    fi
+
+    [[ -z "$token" ]] && { _api_error 400 "Missing 'token' field"; return; }
+
+    local session_user
+    session_user=$(_validate_terminal_session "$token")
+    if [[ $? -eq 0 && -n "$session_user" ]]; then
+        local sessions_file="$BASE_DIR/.api-auth/terminal-sessions.json"
+        local expires_at=""
+        if command -v jq >/dev/null 2>&1; then
+            expires_at=$(jq -r --arg t "$token" '.sessions[] | select(.token == $t) | .expires_at' "$sessions_file" 2>/dev/null)
+        fi
+        _api_success "{\"valid\": true, \"username\": \"$(_api_json_escape "$session_user")\", \"expires_at\": ${expires_at:-0}}"
+    else
+        _api_success "{\"valid\": false, \"username\": \"\", \"expires_at\": 0}"
+    fi
+}
+
+# POST /terminal/auth/logout — Invalidate a terminal session
+handle_terminal_logout() {
+    local body="$1"
+
+    if ! _api_check_admin; then return; fi
+
+    local token
+    if command -v jq >/dev/null 2>&1; then
+        token=$(echo "$body" | jq -r '.token // empty' 2>/dev/null)
+    else
+        token=$(echo "$body" | sed -n 's/.*"token" *: *"\([^"]*\)".*/\1/p')
+    fi
+
+    [[ -z "$token" ]] && { _api_error 400 "Missing 'token' field"; return; }
+
+    local sessions_file="$BASE_DIR/.api-auth/terminal-sessions.json"
+
+    if command -v jq >/dev/null 2>&1 && [[ -f "$sessions_file" ]]; then
+        local tmp
+        tmp=$(jq --arg t "$token" '.sessions = [.sessions[] | select(.token != $t)]' "$sessions_file" 2>/dev/null)
+        [[ -n "$tmp" ]] && echo "$tmp" > "$sessions_file"
+    fi
+
+    local auth_audit="$BASE_DIR/.api-auth/terminal-auth-audit.log"
+    echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') | LOGOUT | token=${token:0:8}..." >> "$auth_audit"
+
+    _api_success "{\"success\": true, \"message\": \"Terminal session ended\"}"
+}
+
+# =============================================================================
+# TERMINAL EXEC / HISTORY
+# =============================================================================
+
+handle_terminal_exec() {
+    local body="$1"
+
+    if ! _api_check_admin; then return; fi
+
+    # Validate terminal session token
+    local terminal_token
+    if command -v jq >/dev/null 2>&1; then
+        terminal_token=$(echo "$body" | jq -r '.terminal_token // empty' 2>/dev/null)
+    else
+        terminal_token=$(echo "$body" | sed -n 's/.*"terminal_token" *: *"\([^"]*\)".*/\1/p')
+    fi
+
+    local session_user=""
+    if [[ -n "$terminal_token" ]]; then
+        session_user=$(_validate_terminal_session "$terminal_token")
+        if [[ $? -ne 0 || -z "$session_user" ]]; then
+            _api_error 401 "Terminal session expired. Please re-authenticate with Linux credentials."
+            return
+        fi
+    else
+        _api_error 401 "Terminal authentication required. Please authenticate with Linux credentials first."
+        return
+    fi
+
+    local command cwd
+    if command -v jq >/dev/null 2>&1; then
+        command=$(echo "$body" | jq -r '.command // empty' 2>/dev/null)
+        cwd=$(echo "$body" | jq -r '.cwd // empty' 2>/dev/null)
+    else
+        command=$(echo "$body" | sed -n 's/.*"command" *: *"\([^"]*\)".*/\1/p')
+        cwd=$(echo "$body" | sed -n 's/.*"cwd" *: *"\([^"]*\)".*/\1/p')
+    fi
+
+    [[ -z "$command" ]] && { _api_error 400 "Missing 'command' field"; return; }
+    [[ -z "$cwd" ]] && cwd="$BASE_DIR"
+
+    # Rate limit: 10 commands/minute
+    local rate_file="$BASE_DIR/.api-auth/terminal-rate.log"
+    local audit_file="$BASE_DIR/.api-auth/terminal-audit.log"
+    mkdir -p "$BASE_DIR/.api-auth"
+
+    local now
+    now=$(date +%s)
+    local one_min_ago=$(( now - 60 ))
+
+    if [[ -f "$rate_file" ]]; then
+        local recent_count
+        recent_count=$(awk -v cutoff="$one_min_ago" '$1 >= cutoff' "$rate_file" 2>/dev/null | wc -l)
+        if (( recent_count >= 10 )); then
+            _api_error 429 "Rate limit exceeded: 10 commands per minute"
+            return
+        fi
+    fi
+
+    echo "$now" >> "$rate_file"
+
+    # Execute command
+    local output exit_code
+    output=$(cd "$cwd" 2>/dev/null && timeout 60 bash -c "$command" 2>&1) || true
+    exit_code=${PIPESTATUS[0]:-$?}
+
+    # Audit log (includes Linux username)
+    echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') | linux_user=$session_user | exit=$exit_code | cwd=$cwd | cmd=$command" >> "$audit_file"
+
+    local success="true"
+    [[ "$exit_code" -ne 0 ]] && success="false"
+
+    _api_success "{\"command\": \"$(_api_json_escape "$command")\", \"cwd\": \"$(_api_json_escape "$cwd")\", \"exit_code\": $exit_code, \"output\": \"$(_api_json_escape "$output")\", \"success\": $success, \"timestamp\": \"$(date -u '+%Y-%m-%dT%H:%M:%SZ')\"}"
+}
+
+handle_terminal_history() {
+    if ! _api_check_admin; then return; fi
+
+    local audit_file="$BASE_DIR/.api-auth/terminal-audit.log"
+
+    if [[ ! -f "$audit_file" ]]; then
+        _api_success "{\"commands\": [], \"total\": 0}"
+        return
+    fi
+
+    local lines
+    lines=$(tail -50 "$audit_file" 2>/dev/null | tac)
+
+    local json_arr="["
+    local first=true
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        $first || json_arr+=","
+        first=false
+        json_arr+="\"$(_api_json_escape "$line")\""
+    done <<< "$lines"
+    json_arr+="]"
+
+    local total
+    total=$(wc -l < "$audit_file" 2>/dev/null || echo 0)
+
+    _api_success "{\"commands\": $json_arr, \"total\": $total}"
+}
+
+# =============================================================================
+# CONTAINER FILE BROWSER
+# =============================================================================
+
+# GET /containers/:name/files?path=/ — List directory contents inside a container
+handle_container_files() {
+    if ! _api_check_admin; then return; fi
+
+    local container="$1"
+    local query_path="$2"
+    [[ -z "$container" ]] && { _api_error 400 "Missing container name"; return; }
+    [[ -z "$query_path" ]] && query_path="/"
+
+    # Verify container exists and is running
+    local state
+    state=$(docker inspect -f '{{.State.Status}}' "$container" 2>/dev/null)
+    [[ -z "$state" ]] && { _api_error 404 "Container not found: $container"; return; }
+    [[ "$state" != "running" ]] && { _api_error 400 "Container is not running (state: $state)"; return; }
+
+    # List directory with detailed info
+    local output
+    output=$(docker exec "$container" ls -la --time-style=long-iso "$query_path" 2>&1)
+    local exit_code=$?
+
+    if [[ $exit_code -ne 0 ]]; then
+        _api_error 400 "Failed to list directory: $(_api_json_escape "$output")"
+        return
+    fi
+
+    # Parse ls -la output into JSON entries
+    local json_entries="["
+    local first=true
+    while IFS= read -r line; do
+        # Skip total line and . / .. entries
+        [[ "$line" =~ ^total ]] && continue
+        [[ -z "$line" ]] && continue
+
+        local perms type_char name_field size_field date_field
+        perms=$(echo "$line" | awk '{print $1}')
+        size_field=$(echo "$line" | awk '{print $5}')
+        date_field=$(echo "$line" | awk '{print $6" "$7}')
+        name_field=$(echo "$line" | awk '{for(i=8;i<=NF;i++) printf "%s ", $i; print ""}' | sed 's/ *$//')
+
+        # Skip . and ..
+        [[ "$name_field" == "." || "$name_field" == ".." ]] && continue
+        [[ -z "$name_field" ]] && continue
+
+        # Determine type
+        type_char="${perms:0:1}"
+        local ftype="file"
+        [[ "$type_char" == "d" ]] && ftype="directory"
+        [[ "$type_char" == "l" ]] && ftype="symlink"
+
+        $first || json_entries+=","
+        first=false
+        json_entries+="{\"name\": \"$(_api_json_escape "$name_field")\", \"type\": \"$ftype\", \"size\": ${size_field:-0}, \"permissions\": \"$perms\", \"modified\": \"$(_api_json_escape "$date_field")\"}"
+    done <<< "$output"
+    json_entries+="]"
+
+    _api_success "{\"container\": \"$(_api_json_escape "$container")\", \"path\": \"$(_api_json_escape "$query_path")\", \"entries\": $json_entries}"
+}
+
+# GET /containers/:name/files/content?path=/etc/hostname — Read file contents inside a container
+handle_container_file_content() {
+    if ! _api_check_admin; then return; fi
+
+    local container="$1"
+    local file_path="$2"
+    [[ -z "$container" ]] && { _api_error 400 "Missing container name"; return; }
+    [[ -z "$file_path" ]] && { _api_error 400 "Missing file path"; return; }
+
+    # Verify container exists and is running
+    local state
+    state=$(docker inspect -f '{{.State.Status}}' "$container" 2>/dev/null)
+    [[ -z "$state" ]] && { _api_error 404 "Container not found: $container"; return; }
+    [[ "$state" != "running" ]] && { _api_error 400 "Container is not running"; return; }
+
+    # Get file size first (limit to 1MB)
+    local file_size
+    file_size=$(docker exec "$container" stat -c %s "$file_path" 2>/dev/null || echo "0")
+    if (( file_size > 1048576 )); then
+        _api_error 400 "File too large (${file_size} bytes). Maximum 1MB."
+        return
+    fi
+
+    local content
+    content=$(docker exec "$container" cat "$file_path" 2>&1)
+    local exit_code=$?
+
+    if [[ $exit_code -ne 0 ]]; then
+        _api_error 400 "Failed to read file: $(_api_json_escape "$content")"
+        return
+    fi
+
+    _api_success "{\"container\": \"$(_api_json_escape "$container")\", \"path\": \"$(_api_json_escape "$file_path")\", \"content\": \"$(_api_json_escape "$content")\", \"size\": $file_size}"
+}
+
+# =============================================================================
+# ALERT THRESHOLDS CONFIGURATION
+# =============================================================================
+
+# GET /alerts/config — Read alert thresholds
+handle_alerts_config() {
+    if ! _api_check_admin; then return; fi
+
+    local alerts_file="$BASE_DIR/.api-auth/alerts.json"
+    mkdir -p "$BASE_DIR/.api-auth"
+
+    # Initialize with defaults if not exists
+    if [[ ! -f "$alerts_file" ]]; then
+        cat > "$alerts_file" << 'ALERTS_EOF'
+{
+    "thresholds": {
+        "cpu_warning": 80,
+        "cpu_critical": 95,
+        "memory_warning": 80,
+        "memory_critical": 95,
+        "disk_warning": 85,
+        "disk_critical": 95,
+        "restart_threshold": 5
+    }
+}
+ALERTS_EOF
+    fi
+
+    local config
+    if command -v jq >/dev/null 2>&1; then
+        config=$(jq -c '.' "$alerts_file" 2>/dev/null)
+    else
+        config=$(cat "$alerts_file" 2>/dev/null)
+    fi
+
+    _api_success "$config"
+}
+
+# POST /alerts/config — Update alert thresholds
+handle_alerts_config_update() {
+    if ! _api_check_admin; then return; fi
+
+    local body="$1"
+    local alerts_file="$BASE_DIR/.api-auth/alerts.json"
+    mkdir -p "$BASE_DIR/.api-auth"
+
+    if command -v jq >/dev/null 2>&1; then
+        # Validate it's valid JSON with expected structure
+        local thresholds
+        thresholds=$(echo "$body" | jq -r '.thresholds // empty' 2>/dev/null)
+        if [[ -z "$thresholds" ]]; then
+            _api_error 400 "Missing 'thresholds' object"
+            return
+        fi
+
+        # Merge with defaults
+        local defaults='{"thresholds":{"cpu_warning":80,"cpu_critical":95,"memory_warning":80,"memory_critical":95,"disk_warning":85,"disk_critical":95,"restart_threshold":5}}'
+        local merged
+        if [[ -f "$alerts_file" ]]; then
+            merged=$(jq -s '.[0] * .[1]' "$alerts_file" <(echo "$body") 2>/dev/null)
+        else
+            merged=$(jq -s '.[0] * .[1]' <(echo "$defaults") <(echo "$body") 2>/dev/null)
+        fi
+
+        [[ -n "$merged" ]] && echo "$merged" > "$alerts_file"
+        _api_success "{\"success\": true, \"message\": \"Alert thresholds updated\", \"thresholds\": $(echo "$merged" | jq '.thresholds' 2>/dev/null)}"
+    else
+        echo "$body" > "$alerts_file"
+        _api_success "{\"success\": true, \"message\": \"Alert thresholds updated\"}"
+    fi
+}
+
+# =============================================================================
+# CRONTAB VIEWER/EDITOR
+# =============================================================================
+
+# GET /system/crontab — User crontab entries
+handle_crontab() {
+    if ! _api_check_admin; then return; fi
+
+    local raw_crontab
+    raw_crontab=$(crontab -l 2>&1 || echo "")
+
+    # Parse cron entries into structured format
+    local entries="["
+    local first=true
+
+    while IFS= read -r line; do
+        # Skip empty lines and comments
+        [[ -z "$line" ]] && continue
+        [[ "$line" =~ ^# ]] && continue
+        [[ "$line" =~ "no crontab for" ]] && continue
+
+        # Parse: min hour day month dow command
+        local schedule cmd human_readable
+        schedule=$(echo "$line" | awk '{print $1,$2,$3,$4,$5}')
+        cmd=$(echo "$line" | awk '{for(i=6;i<=NF;i++) printf "%s ", $i; print ""}' | sed 's/ *$//')
+
+        [[ -z "$cmd" ]] && continue
+
+        # Generate human-readable description
+        human_readable=$(_cron_to_human "$schedule")
+
+        $first || entries+=","
+        first=false
+        entries+="{\"schedule\": \"$(_api_json_escape "$schedule")\", \"command\": \"$(_api_json_escape "$cmd")\", \"user\": \"$(whoami)\", \"source\": \"user\", \"human_readable\": \"$(_api_json_escape "$human_readable")\"}"
+    done <<< "$raw_crontab"
+    entries+="]"
+
+    _api_success "{\"entries\": $entries, \"raw\": \"$(_api_json_escape "$raw_crontab")\"}"
+}
+
+# GET /system/crontab/system — System-level cron entries
+handle_crontab_system() {
+    if ! _api_check_admin; then return; fi
+
+    local entries="["
+    local first=true
+
+    # Parse /etc/crontab
+    if [[ -r /etc/crontab ]]; then
+        while IFS= read -r line; do
+            [[ -z "$line" ]] && continue
+            [[ "$line" =~ ^# ]] && continue
+            [[ "$line" =~ ^[A-Z_]+= ]] && continue
+
+            local schedule user cmd human_readable
+            schedule=$(echo "$line" | awk '{print $1,$2,$3,$4,$5}')
+            user=$(echo "$line" | awk '{print $6}')
+            cmd=$(echo "$line" | awk '{for(i=7;i<=NF;i++) printf "%s ", $i; print ""}' | sed 's/ *$//')
+
+            [[ -z "$cmd" ]] && continue
+            human_readable=$(_cron_to_human "$schedule")
+
+            $first || entries+=","
+            first=false
+            entries+="{\"schedule\": \"$(_api_json_escape "$schedule")\", \"command\": \"$(_api_json_escape "$cmd")\", \"user\": \"$(_api_json_escape "$user")\", \"source\": \"system\", \"human_readable\": \"$(_api_json_escape "$human_readable")\"}"
+        done < /etc/crontab
+    fi
+
+    # List files in /etc/cron.d/
+    if [[ -d /etc/cron.d ]]; then
+        for cronfile in /etc/cron.d/*; do
+            [[ -f "$cronfile" ]] || continue
+            local fname
+            fname=$(basename "$cronfile")
+            while IFS= read -r line; do
+                [[ -z "$line" ]] && continue
+                [[ "$line" =~ ^# ]] && continue
+                [[ "$line" =~ ^[A-Z_]+= ]] && continue
+
+                local schedule user cmd human_readable
+                schedule=$(echo "$line" | awk '{print $1,$2,$3,$4,$5}')
+                user=$(echo "$line" | awk '{print $6}')
+                cmd=$(echo "$line" | awk '{for(i=7;i<=NF;i++) printf "%s ", $i; print ""}' | sed 's/ *$//')
+
+                [[ -z "$cmd" ]] && continue
+                human_readable=$(_cron_to_human "$schedule")
+
+                $first || entries+=","
+                first=false
+                entries+="{\"schedule\": \"$(_api_json_escape "$schedule")\", \"command\": \"$(_api_json_escape "$cmd")\", \"user\": \"$(_api_json_escape "$user")\", \"source\": \"cron.d\", \"human_readable\": \"$(_api_json_escape "$human_readable")\"}"
+            done < "$cronfile"
+        done
+    fi
+
+    entries+="]"
+    _api_success "{\"entries\": $entries}"
+}
+
+# POST /system/crontab — Update user crontab
+handle_crontab_update() {
+    if ! _api_check_admin; then return; fi
+
+    local body="$1"
+    local content
+    if command -v jq >/dev/null 2>&1; then
+        content=$(echo "$body" | jq -r '.content // empty' 2>/dev/null)
+    else
+        content=$(echo "$body" | sed -n 's/.*"content" *: *"\([^"]*\)".*/\1/p')
+    fi
+
+    [[ -z "$content" ]] && { _api_error 400 "Missing 'content' field"; return; }
+
+    # Backup current crontab
+    local backup_file="$BASE_DIR/.api-auth/crontab-backup-$(date +%s).txt"
+    mkdir -p "$BASE_DIR/.api-auth"
+    crontab -l > "$backup_file" 2>/dev/null || true
+
+    # Install new crontab
+    local output
+    output=$(echo "$content" | crontab - 2>&1)
+    local exit_code=$?
+
+    if [[ $exit_code -eq 0 ]]; then
+        _api_success "{\"success\": true, \"message\": \"Crontab updated\", \"backup\": \"$(_api_json_escape "$backup_file")\"}"
+    else
+        _api_error 400 "Failed to update crontab: $(_api_json_escape "$output")"
+    fi
+}
+
+# Helper: Convert cron expression to human-readable text
+_cron_to_human() {
+    local schedule="$1"
+    local min hour dom mon dow
+    read -r min hour dom mon dow <<< "$schedule"
+
+    # Handle common patterns
+    if [[ "$min" == "*" && "$hour" == "*" && "$dom" == "*" && "$mon" == "*" && "$dow" == "*" ]]; then
+        echo "Every minute"; return
+    fi
+    if [[ "$min" == "0" && "$hour" == "*" && "$dom" == "*" && "$mon" == "*" && "$dow" == "*" ]]; then
+        echo "Every hour"; return
+    fi
+    if [[ "$min" != "*" && "$hour" != "*" && "$dom" == "*" && "$mon" == "*" && "$dow" == "*" ]]; then
+        printf "Daily at %s:%02d" "$hour" "$min"; return
+    fi
+    if [[ "$min" != "*" && "$hour" != "*" && "$dom" == "*" && "$mon" == "*" && "$dow" == "0" ]]; then
+        printf "Weekly (Sun) at %s:%02d" "$hour" "$min"; return
+    fi
+    if [[ "$min" != "*" && "$hour" != "*" && "$dom" == "1" && "$mon" == "*" && "$dow" == "*" ]]; then
+        printf "Monthly (1st) at %s:%02d" "$hour" "$min"; return
+    fi
+    if [[ "$min" == "*/5" ]]; then
+        echo "Every 5 minutes"; return
+    fi
+    if [[ "$min" == "*/10" ]]; then
+        echo "Every 10 minutes"; return
+    fi
+    if [[ "$min" == "*/15" ]]; then
+        echo "Every 15 minutes"; return
+    fi
+    if [[ "$min" == "*/30" ]]; then
+        echo "Every 30 minutes"; return
+    fi
+    if [[ "$hour" == "*/2" ]]; then
+        echo "Every 2 hours at :${min}"; return
+    fi
+
+    echo "$schedule"
+}
+
+# =============================================================================
+# CONTAINER LOG STREAMING (LONG-POLL)
+# =============================================================================
+
+# GET /containers/:name/logs/live?lines=100&since=<timestamp> — Fetch recent logs for polling
+handle_container_logs_live() {
+    if ! _api_check_admin; then return; fi
+
+    local container="$1"
+    local lines="${2:-100}"
+    local since="$3"
+    [[ -z "$container" ]] && { _api_error 400 "Missing container name"; return; }
+
+    # Verify container exists
+    docker inspect "$container" >/dev/null 2>&1 || { _api_error 404 "Container not found: $container"; return; }
+
+    local log_output
+    if [[ -n "$since" ]]; then
+        log_output=$(docker logs --since "$since" --timestamps "$container" 2>&1 | tail -"${lines}")
+    else
+        log_output=$(docker logs --tail "$lines" --timestamps "$container" 2>&1)
+    fi
+
+    # Parse into structured entries
+    local json_entries="["
+    local first=true
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+
+        local ts="" content="" level=""
+        # Try to extract timestamp
+        if [[ "$line" =~ ^([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]+Z?) ]]; then
+            ts="${BASH_REMATCH[1]}"
+            content="${line#*Z }"
+            [[ "$content" == "$line" ]] && content="${line#* }"
+        else
+            ts=$(date -u '+%Y-%m-%dT%H:%M:%S.000Z')
+            content="$line"
+        fi
+
+        # Detect log level
+        if [[ "$content" =~ (ERROR|FATAL|CRIT) ]]; then
+            level="error"
+        elif [[ "$content" =~ (WARN|WARNING) ]]; then
+            level="warn"
+        elif [[ "$content" =~ (DEBUG|TRACE) ]]; then
+            level="debug"
+        else
+            level="info"
+        fi
+
+        $first || json_entries+=","
+        first=false
+        json_entries+="{\"timestamp\": \"$(_api_json_escape "$ts")\", \"line\": \"$(_api_json_escape "$content")\", \"level\": \"$level\"}"
+    done <<< "$log_output"
+    json_entries+="]"
+
+    _api_success "{\"container\": \"$(_api_json_escape "$container")\", \"entries\": $json_entries, \"count\": $(echo "$log_output" | grep -c . || echo 0)}"
+}
+
+# GET /logs/live?lines=100&since=<timestamp> — Stream DCS application log
+handle_app_logs_live() {
+    if ! _api_check_admin; then return; fi
+
+    local lines="${1:-100}"
+    local since="$2"
+    local log_file="$BASE_DIR/logs/docker-services.log"
+
+    [[ ! -f "$log_file" ]] && { _api_success "{\"entries\": [], \"count\": 0}"; return; }
+
+    local log_output
+    if [[ -n "$since" ]]; then
+        # Get lines after the timestamp
+        log_output=$(awk -v ts="$since" '$0 >= ts' "$log_file" 2>/dev/null | tail -"${lines}")
+    else
+        log_output=$(tail -"${lines}" "$log_file" 2>/dev/null)
+    fi
+
+    local json_entries="["
+    local first=true
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+
+        local ts="" content="" level=""
+        # Try to parse timestamp from log format [YYYY-MM-DD HH:MM:SS]
+        if [[ "$line" =~ ^\[([0-9]{4}-[0-9]{2}-[0-9]{2}\ [0-9]{2}:[0-9]{2}:[0-9]{2})\] ]]; then
+            ts="${BASH_REMATCH[1]}"
+            content="${line#*] }"
+        else
+            ts=$(date -u '+%Y-%m-%dT%H:%M:%S')
+            content="$line"
+        fi
+
+        if [[ "$content" =~ (ERROR|FATAL|CRIT) ]]; then
+            level="error"
+        elif [[ "$content" =~ (WARN|WARNING) ]]; then
+            level="warn"
+        elif [[ "$content" =~ (DEBUG|TRACE) ]]; then
+            level="debug"
+        else
+            level="info"
+        fi
+
+        $first || json_entries+=","
+        first=false
+        json_entries+="{\"timestamp\": \"$(_api_json_escape "$ts")\", \"line\": \"$(_api_json_escape "$content")\", \"level\": \"$level\"}"
+    done <<< "$log_output"
+    json_entries+="]"
+
+    _api_success "{\"entries\": $json_entries, \"count\": $(echo "$log_output" | grep -c . || echo 0)}"
+}
+
+# =============================================================================
+# IMAGE DELETE
+# =============================================================================
+
+handle_image_delete() {
+    if ! _api_check_admin; then return; fi
+
+    local image_id="$1"
+    [[ -z "$image_id" ]] && { _api_error 400 "Missing image ID"; return; }
+
+    local output
+    output=$(docker rmi "$image_id" 2>&1)
+    local exit_code=$?
+
+    if [[ $exit_code -eq 0 ]]; then
+        _api_success "{\"success\": true, \"image\": \"$(_api_json_escape "$image_id")\", \"message\": \"Image removed successfully\"}"
+    else
+        _api_error 500 "Failed to remove image: $(_api_json_escape "$output")"
+    fi
+}
+
+# =============================================================================
+# CONTAINER RENAME
+# =============================================================================
+
+handle_container_rename() {
+    if ! _api_check_admin; then return; fi
+
+    local name="$1"
+    local body="$2"
+    [[ -z "$name" ]] && { _api_error 400 "Missing container name"; return; }
+
+    local new_name
+    if command -v jq >/dev/null 2>&1; then
+        new_name=$(echo "$body" | jq -r '.new_name // empty' 2>/dev/null)
+    else
+        new_name=$(echo "$body" | sed -n 's/.*"new_name" *: *"\([^"]*\)".*/\1/p')
+    fi
+    [[ -z "$new_name" ]] && { _api_error 400 "Missing 'new_name' field"; return; }
+
+    local output
+    output=$(docker rename "$name" "$new_name" 2>&1)
+    local exit_code=$?
+
+    if [[ $exit_code -eq 0 ]]; then
+        _api_success "{\"success\": true, \"old_name\": \"$(_api_json_escape "$name")\", \"new_name\": \"$(_api_json_escape "$new_name")\", \"message\": \"Container renamed successfully\"}"
+    else
+        _api_error 500 "Failed to rename container: $(_api_json_escape "$output")"
+    fi
+}
+
+# =============================================================================
+# STACK SERVICES DETAIL
+# =============================================================================
+
+handle_stack_services() {
+    local stack_name="$1"
+    [[ -z "$stack_name" ]] && { _api_error 400 "Missing stack name"; return; }
+
+    local compose_file="$COMPOSE_DIR/$stack_name/docker-compose.yml"
+    [[ ! -f "$compose_file" ]] && { _api_error 404 "Stack not found"; return; }
+
+    local env_file="$COMPOSE_DIR/$stack_name/.env"
+    local -a compose_args=(-f "$compose_file")
+    [[ -f "$env_file" ]] && compose_args+=(--env-file "$env_file")
+
+    local services_json="["
+    local first=true
+
+    while IFS= read -r svc; do
+        [[ -z "$svc" ]] && continue
+        $first || services_json+=","
+        first=false
+
+        local container_name state health image
+        container_name=$($DOCKER_COMPOSE_CMD "${compose_args[@]}" ps --format '{{.Name}}' "$svc" 2>/dev/null | head -1)
+
+        if [[ -n "$container_name" ]]; then
+            state=$(docker inspect --format='{{.State.Status}}' "$container_name" 2>/dev/null || echo "unknown")
+            health=$(docker inspect --format='{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$container_name" 2>/dev/null || echo "none")
+            image=$(docker inspect --format='{{.Config.Image}}' "$container_name" 2>/dev/null || echo "unknown")
+        else
+            state="not_created"
+            health="none"
+            image=""
+            container_name=""
+        fi
+
+        services_json+="{\"name\": \"$(_api_json_escape "$svc")\", \"state\": \"$state\", \"health\": \"$health\", \"image\": \"$(_api_json_escape "$image")\", \"container\": \"$(_api_json_escape "$container_name")\"}"
+    done < <($DOCKER_COMPOSE_CMD "${compose_args[@]}" config --services 2>/dev/null)
+
+    services_json+="]"
+
+    _api_success "{\"stack\": \"$(_api_json_escape "$stack_name")\", \"services\": $services_json}"
+}
+
+# =============================================================================
+# SYSTEM METRICS SNAPSHOT
+# =============================================================================
+
+handle_system_metrics() {
+    local cpu_count load1 load5 load15
+    cpu_count=$(nproc 2>/dev/null || echo 0)
+    read -r load1 load5 load15 _ _ < /proc/loadavg 2>/dev/null || { load1=0; load5=0; load15=0; }
+
+    local mem_total mem_used mem_available mem_cached swap_total swap_used
+    mem_total=$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo 2>/dev/null || echo 0)
+    mem_available=$(awk '/MemAvailable/ {print int($2/1024)}' /proc/meminfo 2>/dev/null || echo 0)
+    mem_cached=$(awk '/^Cached:/ {print int($2/1024)}' /proc/meminfo 2>/dev/null || echo 0)
+    mem_used=$(( mem_total - mem_available ))
+    swap_total=$(awk '/SwapTotal/ {print int($2/1024)}' /proc/meminfo 2>/dev/null || echo 0)
+    swap_used=$(( swap_total - $(awk '/SwapFree/ {print int($2/1024)}' /proc/meminfo 2>/dev/null || echo 0) ))
+
+    # Disk: all mount points (word-split parsing to handle mount paths with spaces)
+    local disk_json="["
+    local first=true
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        local -a fields
+        read -ra fields <<< "$line"
+        local nf=${#fields[@]}
+        [[ $nf -lt 6 ]] && continue
+
+        local pct="${fields[$((nf-1))]}"
+        local avail="${fields[$((nf-2))]}"
+        local used="${fields[$((nf-3))]}"
+        local total="${fields[$((nf-4))]}"
+        local dev="${fields[0]}"
+        local mount="" i
+        for ((i=1; i<nf-4; i++)); do
+            [[ -n "$mount" ]] && mount+=" "
+            mount+="${fields[$i]}"
+        done
+
+        [[ -z "$dev" || "$dev" != /* ]] && continue
+        case "$mount" in
+            /sys/*|/proc/*|/dev/*|/run/*|/snap/*) continue ;;
+        esac
+        $first || disk_json+=","
+        first=false
+        disk_json+="{\"device\": \"$(_api_json_escape "$dev")\", \"mount\": \"$(_api_json_escape "$mount")\", \"total\": \"$total\", \"used\": \"$used\", \"available\": \"$avail\", \"percent\": \"$pct\"}"
+    done < <(df -h --output=source,target,size,used,avail,pcent -x tmpfs -x devtmpfs -x squashfs -x overlay -x efivarfs 2>/dev/null | tail -n +2)
+    disk_json+="]"
+
+    _api_success "{\"cpu\": {\"count\": $cpu_count, \"load_average\": [$load1, $load5, $load15]}, \"memory\": {\"total_mb\": $mem_total, \"used_mb\": $mem_used, \"available_mb\": $mem_available, \"cached_mb\": $mem_cached, \"swap_total_mb\": $swap_total, \"swap_used_mb\": $swap_used}, \"disks\": $disk_json}"
+}
+
+# =============================================================================
 # REQUEST ROUTER
 # =============================================================================
 
@@ -3487,7 +4562,35 @@ handle_request() {
             /backups)                   handle_backup_list ;;
             /backups/status)            handle_backup_status ;;
             /backups/config)            handle_backup_config ;;
+            /terminal/history)          handle_terminal_history ;;
+            /system/metrics)            handle_system_metrics ;;
+            /alerts/config)             handle_alerts_config ;;
+            /system/crontab)            handle_crontab ;;
+            /system/crontab/system)     handle_crontab_system ;;
 
+            /containers/*/files)
+                local container="${path#/containers/}"
+                container="${container%/files}"
+                handle_container_files "$container" "${QUERY_PARAMS[path]:-/}"
+                ;;
+            /containers/*/files/content)
+                local container="${path#/containers/}"
+                container="${container%/files/content}"
+                handle_container_file_content "$container" "${QUERY_PARAMS[path]:-}"
+                ;;
+            /containers/*/logs/live)
+                local container="${path#/containers/}"
+                container="${container%/logs/live}"
+                handle_container_logs_live "$container" "${QUERY_PARAMS[lines]:-100}" "${QUERY_PARAMS[since]:-}"
+                ;;
+            /logs/live)
+                handle_app_logs_live "${QUERY_PARAMS[lines]:-100}" "${QUERY_PARAMS[since]:-}"
+                ;;
+            /stacks/*/services)
+                local stack="${path#/stacks/}"
+                stack="${stack%/services}"
+                handle_stack_services "$stack"
+                ;;
             /stacks/*/containers)
                 local stack="${path#/stacks/}"
                 stack="${stack%/containers}"
@@ -3566,6 +4669,24 @@ handle_request() {
 
         # Standard authenticated POST endpoints
         case "$path" in
+            /terminal/exec)
+                handle_terminal_exec "$request_body"
+                ;;
+            /terminal/auth)
+                handle_terminal_auth "$request_body"
+                ;;
+            /terminal/auth/verify)
+                handle_terminal_auth_verify "$request_body"
+                ;;
+            /terminal/auth/logout)
+                handle_terminal_logout "$request_body"
+                ;;
+            /alerts/config)
+                handle_alerts_config_update "$request_body"
+                ;;
+            /system/crontab)
+                handle_crontab_update "$request_body"
+                ;;
             /stacks)
                 handle_create_stack "$request_body"
                 ;;
@@ -3592,6 +4713,16 @@ handle_request() {
                 container="${container%/restart}"
                 handle_container_action "$container" "restart"
                 ;;
+            /containers/*/exec)
+                local container="${path#/containers/}"
+                container="${container%/exec}"
+                handle_container_exec "$container" "$request_body"
+                ;;
+            /containers/*/rename)
+                local container="${path#/containers/}"
+                container="${container%/rename}"
+                handle_container_rename "$container" "$request_body"
+                ;;
             /networks)
                 handle_create_network "$request_body"
                 ;;
@@ -3609,6 +4740,11 @@ handle_request() {
                 local network="${path#/networks/}"
                 network="${network%/disconnect}"
                 handle_network_disconnect "$network" "$request_body"
+                ;;
+            /images/*/delete)
+                local image="${path#/images/}"
+                image="${image%/delete}"
+                handle_image_delete "$image"
                 ;;
             /volumes/*/delete)
                 local volume="${path#/volumes/}"

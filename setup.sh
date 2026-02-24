@@ -24,8 +24,10 @@ fi
 COMPOSE_DIR="$BASE_DIR/Stacks"
 export COMPOSE_DIR
 
-# Resolve APP_DATA_DIR (default to $BASE_DIR/App-Data)
-APP_DATA_DIR="${APP_DATA_DIR:-$BASE_DIR/App-Data}"
+# APP_DATA_DIR is relative — defaults to ./App-Data inside each stack folder.
+# Docker Compose resolves this relative to each stack's directory, keeping data
+# self-contained per stack (e.g., Stacks/core-infrastructure/App-Data/).
+APP_DATA_DIR="${APP_DATA_DIR:-./App-Data}"
 
 # Detect current user (never hardcode)
 CURRENT_USER="$(whoami)"
@@ -170,7 +172,6 @@ _header "Step 2/5: Directory Structure"
 _divider
 
 declare -a REQUIRED_DIRS=(
-    "$APP_DATA_DIR"
     "$BASE_DIR/logs"
     "$BASE_DIR/logs/archive"
 )
@@ -218,29 +219,30 @@ for stack_name in "${_SETUP_STACKS[@]}"; do
     stack_dir="$COMPOSE_DIR/$stack_name"
     if [[ -d "$stack_dir" ]]; then
         ((stacks_existed++))
+        # Ensure App-Data exists even for pre-existing stacks
+        if [[ ! -d "$stack_dir/App-Data" ]]; then
+            _run mkdir -p "$stack_dir/App-Data"
+            _ok "Created App-Data/ in existing stack: $stack_name"
+        fi
         [[ "$VERBOSE" == "true" ]] && _skip "Stack exists: $stack_name"
     else
         _run mkdir -p "$stack_dir"
+        _run mkdir -p "$stack_dir/App-Data"
 
         # Create base docker-compose.yml
         if [[ "$DRY_RUN" != "true" ]]; then
-            cat > "$stack_dir/docker-compose.yml" <<COMPOSE_EOF
-# =============================================================================
-# $stack_name — Docker Compose Stack
-# Add your services below. See https://docs.docker.com/compose/ for reference.
-# =============================================================================
-
+            cat > "$stack_dir/docker-compose.yml" <<'COMPOSE_EOF'
 services:
-  # example:
-  #   image: hello-world
-  #   container_name: example
+  # Add your services here
+  # Example:
+  # my-service:
+  #   container_name: my-service
+  #   image: alpine:latest
   #   restart: unless-stopped
-  #   env_file:
-  #     - .env
-  #   # ports:
-  #   #   - "8080:80"
-  #   # volumes:
-  #   #   - \${APP_DATA_DIR}/example:/data
+  #   environment:
+  #     - TZ=${TZ:-UTC}
+  #   volumes:
+  #     - ${APP_DATA_DIR:-./App-Data}/my-service:/data
 COMPOSE_EOF
         fi
 
@@ -257,7 +259,7 @@ COMPOSE_EOF
 ENV_EOF
         fi
 
-        _ok "Created stack: $stack_name (with docker-compose.yml + .env)"
+        _ok "Created stack: $stack_name (docker-compose.yml + .env + App-Data/)"
         ((stacks_created++))
     fi
 done
