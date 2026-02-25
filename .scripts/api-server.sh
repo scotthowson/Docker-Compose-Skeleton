@@ -968,7 +968,36 @@ handle_root() {
     {"method": "GET",    "path": "/auth/users",              "description": "List all users", "auth": "admin"},
     {"method": "POST",   "path": "/auth/revoke",             "description": "Revoke user access", "auth": "admin"},
     {"method": "GET",    "path": "/auth/invites",            "description": "List active invites", "auth": "admin"},
-    {"method": "DELETE",  "path": "/auth/invite/:code",      "description": "Delete invite code", "auth": "admin"}
+    {"method": "DELETE",  "path": "/auth/invite/:code",      "description": "Delete invite code", "auth": "admin"},
+    {"method": "POST",   "path": "/metrics/snapshot",        "description": "Capture system metrics snapshot"},
+    {"method": "GET",    "path": "/metrics/trends",           "description": "Query metrics history (range: 1h|6h|24h|7d)"},
+    {"method": "GET",    "path": "/images/check-updates",     "description": "Quick local image staleness check"},
+    {"method": "POST",   "path": "/images/check-updates",     "description": "Registry check for image updates (slow)"},
+    {"method": "POST",   "path": "/images/:name/update",      "description": "Pull image and restart containers"},
+    {"method": "GET",    "path": "/notifications/rules",      "description": "List notification rules"},
+    {"method": "POST",   "path": "/notifications/rules",      "description": "Create a notification rule"},
+    {"method": "DELETE", "path": "/notifications/rules/:id",  "description": "Delete a notification rule"},
+    {"method": "GET",    "path": "/notifications/history",    "description": "Notification send history"},
+    {"method": "POST",   "path": "/notifications/test",       "description": "Send a test NTFY notification"},
+    {"method": "GET",    "path": "/snapshots",                "description": "List all config snapshots"},
+    {"method": "POST",   "path": "/snapshots/create",         "description": "Create a new config snapshot"},
+    {"method": "GET",    "path": "/snapshots/:id/download",   "description": "Download a snapshot archive"},
+    {"method": "POST",   "path": "/snapshots/:id/restore",    "description": "Restore from a snapshot"},
+    {"method": "DELETE", "path": "/snapshots/:id",            "description": "Delete a snapshot"},
+    {"method": "GET",    "path": "/stacks/:name/compose/history", "description": "Compose file version history"},
+    {"method": "POST",   "path": "/stacks/:name/compose/rollback", "description": "Rollback compose to a previous version"},
+    {"method": "GET",    "path": "/templates",                "description": "List available templates"},
+    {"method": "GET",    "path": "/templates/:name",          "description": "Template detail with compose content"},
+    {"method": "POST",   "path": "/templates/:name/deploy",   "description": "Deploy a template to a new stack"},
+    {"method": "POST",   "path": "/templates/import",         "description": "Import a custom template"},
+    {"method": "POST",   "path": "/templates/:name/update",   "description": "Update an existing template"},
+    {"method": "DELETE", "path": "/templates/:name",           "description": "Delete a template"},
+    {"method": "GET",    "path": "/automations",              "description": "List automation rules"},
+    {"method": "POST",   "path": "/automations",              "description": "Create an automation rule"},
+    {"method": "POST",   "path": "/automations/:id/update",   "description": "Update an automation rule"},
+    {"method": "DELETE", "path": "/automations/:id",          "description": "Delete an automation rule"},
+    {"method": "GET",    "path": "/automations/:id/history",  "description": "Automation run history"},
+    {"method": "GET",    "path": "/topology",                 "description": "Network topology graph data"}
   ]'
 
     _api_success "{\"name\": \"Docker Compose Skeleton API\", \"version\": \"$API_VERSION\", \"auth_enabled\": $API_AUTH_ENABLED, \"endpoints\": $endpoints}"
@@ -1326,6 +1355,8 @@ handle_stack_compose_save() {
     # Backup original
     if [[ -f "$compose_file" ]]; then
         cp "$compose_file" "${compose_file}.bak" 2>/dev/null
+        # Save version history before overwriting
+        _save_compose_version "$stack"
     fi
 
     # Write new content
@@ -2542,7 +2573,7 @@ handle_container_exec() {
 
     # Extract command from JSON body
     local command
-    command=$(echo "$body" | _api_json_extract "command")
+    command=$(echo "$body" | jq -r '.command // empty' 2>/dev/null)
 
     if [[ -z "$command" ]]; then
         _api_error 400 "Missing required field: command"
@@ -3868,7 +3899,9 @@ handle_container_files() {
 
     # List directory with detailed info
     local output
-    output=$(docker exec "$container" ls -la --time-style=long-iso "$query_path" 2>&1)
+    # Use ls -la; try --time-style=long-iso (GNU) first, fall back to plain ls -la (BusyBox)
+    output=$(docker exec "$container" ls -la --time-style=long-iso "$query_path" 2>/dev/null) || \
+    output=$(docker exec "$container" ls -la "$query_path" 2>&1)
     local exit_code=$?
 
     if [[ $exit_code -ne 0 ]]; then
@@ -3877,6 +3910,8 @@ handle_container_files() {
     fi
 
     # Parse ls -la output into JSON entries
+    # Supports both GNU (--time-style=long-iso: date in col 6-7, name at 8+)
+    # and BusyBox (date in col 6-8, name at 9+)
     local json_entries="["
     local first=true
     while IFS= read -r line; do
@@ -3887,8 +3922,18 @@ handle_container_files() {
         local perms type_char name_field size_field date_field
         perms=$(echo "$line" | awk '{print $1}')
         size_field=$(echo "$line" | awk '{print $5}')
-        date_field=$(echo "$line" | awk '{print $6" "$7}')
-        name_field=$(echo "$line" | awk '{for(i=8;i<=NF;i++) printf "%s ", $i; print ""}' | sed 's/ *$//')
+        # Detect format: GNU --time-style=long-iso has YYYY-MM-DD in col 6
+        local col6
+        col6=$(echo "$line" | awk '{print $6}')
+        if [[ "$col6" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+            # GNU format: date(6) time(7) name(8+)
+            date_field=$(echo "$line" | awk '{print $6" "$7}')
+            name_field=$(echo "$line" | awk '{for(i=8;i<=NF;i++) printf "%s ", $i; print ""}' | sed 's/ *$//')
+        else
+            # BusyBox format: month(6) day(7) time-or-year(8) name(9+)
+            date_field=$(echo "$line" | awk '{print $6" "$7" "$8}')
+            name_field=$(echo "$line" | awk '{for(i=9;i<=NF;i++) printf "%s ", $i; print ""}' | sed 's/ *$//')
+        fi
 
         # Skip . and ..
         [[ "$name_field" == "." || "$name_field" == ".." ]] && continue
@@ -4446,6 +4491,1149 @@ handle_system_metrics() {
 }
 
 # =============================================================================
+# FEATURE: RESOURCE USAGE TRENDS (metrics history)
+# =============================================================================
+
+METRICS_HISTORY_FILE="$BASE_DIR/.api-auth/metrics-history.jsonl"
+METRICS_MAX_ENTRIES=10080
+
+handle_metrics_snapshot() {
+    # Capture current CPU/memory/disk and append to JSONL history
+    local ts
+    ts=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+    local epoch
+    epoch=$(date +%s)
+
+    # CPU load
+    local load1 load5 load15
+    read -r load1 load5 load15 _ < /proc/loadavg 2>/dev/null || { load1=0; load5=0; load15=0; }
+    local cpu_count
+    cpu_count=$(nproc 2>/dev/null || echo 1)
+    local cpu_pct
+    cpu_pct=$(awk "BEGIN { printf \"%.1f\", ($load1 / $cpu_count) * 100 }")
+
+    # Memory
+    local mem_total=0 mem_available=0 mem_used=0
+    while IFS=':' read -r key val; do
+        val="${val// /}"; val="${val%%kB*}"
+        case "$key" in
+            MemTotal)     mem_total=$((val / 1024)) ;;
+            MemAvailable) mem_available=$((val / 1024)) ;;
+        esac
+    done < /proc/meminfo 2>/dev/null
+    mem_used=$((mem_total - mem_available))
+    local mem_pct=0
+    [[ $mem_total -gt 0 ]] && mem_pct=$(awk "BEGIN { printf \"%.1f\", ($mem_used / $mem_total) * 100 }")
+
+    # Disk
+    local disk_pct="0"
+    local disk_line
+    disk_line=$(df -h / 2>/dev/null | tail -1)
+    if [[ -n "$disk_line" ]]; then
+        disk_pct=$(echo "$disk_line" | awk '{print $5}' | tr -d '%')
+    fi
+
+    local entry="{\"ts\":\"$ts\",\"epoch\":$epoch,\"cpu_pct\":$cpu_pct,\"load1\":$load1,\"load5\":$load5,\"load15\":$load15,\"mem_used_mb\":$mem_used,\"mem_total_mb\":$mem_total,\"mem_pct\":$mem_pct,\"disk_pct\":$disk_pct}"
+
+    # Append and cap file
+    echo "$entry" >> "$METRICS_HISTORY_FILE"
+
+    # Trim to max entries
+    local line_count
+    line_count=$(wc -l < "$METRICS_HISTORY_FILE" 2>/dev/null || echo 0)
+    if [[ $line_count -gt $METRICS_MAX_ENTRIES ]]; then
+        local excess=$((line_count - METRICS_MAX_ENTRIES))
+        tail -n +"$((excess + 1))" "$METRICS_HISTORY_FILE" > "${METRICS_HISTORY_FILE}.tmp" && mv "${METRICS_HISTORY_FILE}.tmp" "$METRICS_HISTORY_FILE"
+    fi
+
+    _api_success "{\"success\": true, \"timestamp\": \"$ts\", \"cpu_pct\": $cpu_pct, \"mem_pct\": $mem_pct, \"disk_pct\": $disk_pct}"
+}
+
+handle_metrics_trends() {
+    local range="${QUERY_PARAMS[range]:-1h}"
+    local now
+    now=$(date +%s)
+    local cutoff=0
+
+    case "$range" in
+        1h)  cutoff=$((now - 3600)) ;;
+        6h)  cutoff=$((now - 21600)) ;;
+        24h) cutoff=$((now - 86400)) ;;
+        7d)  cutoff=$((now - 604800)) ;;
+        *)   cutoff=$((now - 3600)) ;;
+    esac
+
+    if [[ ! -f "$METRICS_HISTORY_FILE" ]]; then
+        _api_success "{\"range\": \"$range\", \"points\": [], \"count\": 0}"
+        return
+    fi
+
+    local -a points=()
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        local epoch
+        epoch=$(printf '%s' "$line" | grep -oP '"epoch":\K[0-9]+' 2>/dev/null || echo 0)
+        [[ $epoch -ge $cutoff ]] && points+=("$line")
+    done < "$METRICS_HISTORY_FILE"
+
+    local json
+    json=$(printf '%s,' "${points[@]}")
+    json="[${json%,}]"
+    [[ ${#points[@]} -eq 0 ]] && json="[]"
+
+    _api_success "{\"range\": \"$range\", \"points\": $json, \"count\": ${#points[@]}}"
+}
+
+# =============================================================================
+# FEATURE: IMAGE UPDATE CHECKER
+# =============================================================================
+
+UPDATE_HISTORY_FILE="$BASE_DIR/.api-auth/update-history.json"
+
+handle_images_check_updates_get() {
+    # Quick local staleness check (fast, no registry pull)
+    local -a entries=()
+    while IFS= read -r line; do
+        [[ -z "$line" || "$line" == "REPOSITORY"* ]] && continue
+        local repo tag id created size
+        read -r repo tag id created size <<< "$line"
+        [[ "$repo" == "<none>" ]] && continue
+
+        local full_image="${repo}:${tag}"
+        local age_days=0
+        local created_ts
+        created_ts=$(docker inspect --format '{{.Created}}' "$full_image" 2>/dev/null | head -1)
+        if [[ -n "$created_ts" ]]; then
+            local created_epoch
+            created_epoch=$(date -d "$created_ts" +%s 2>/dev/null || echo 0)
+            local now_epoch
+            now_epoch=$(date +%s)
+            age_days=$(( (now_epoch - created_epoch) / 86400 ))
+        fi
+
+        local staleness="current"
+        [[ $age_days -gt 30 ]] && staleness="stale"
+        [[ $age_days -gt 7 && $age_days -le 30 ]] && staleness="aging"
+
+        # Find containers using this image
+        local containers
+        containers=$(docker ps -a --filter "ancestor=$full_image" --format '{{.Names}}' 2>/dev/null | tr '\n' ',' | sed 's/,$//')
+
+        # Determine stack
+        local stack=""
+        if [[ -n "$containers" ]]; then
+            local first_container="${containers%%,*}"
+            local labels
+            labels=$(docker inspect --format '{{index .Config.Labels "com.docker.compose.project"}}' "$first_container" 2>/dev/null)
+            [[ -n "$labels" && "$labels" != "<no value>" ]] && stack="$labels"
+        fi
+
+        entries+=("{\"image\": \"$(_api_json_escape "$full_image")\", \"repository\": \"$(_api_json_escape "$repo")\", \"tag\": \"$(_api_json_escape "$tag")\", \"age_days\": $age_days, \"staleness\": \"$staleness\", \"containers\": \"$(_api_json_escape "$containers")\", \"stack\": \"$(_api_json_escape "$stack")\", \"size\": \"$(_api_json_escape "$size")\"}")
+    done < <(docker images --format "{{.Repository}}\t{{.Tag}}\t{{.ID}}\t{{.CreatedSince}}\t{{.Size}}" 2>/dev/null)
+
+    local json
+    json=$(printf '%s,' "${entries[@]}")
+    json="[${json%,}]"
+    [[ ${#entries[@]} -eq 0 ]] && json="[]"
+
+    local stale_count=0 aging_count=0 current_count=0
+    for e in "${entries[@]}"; do
+        case "$e" in
+            *'"staleness": "stale"'*) ((stale_count++)) ;;
+            *'"staleness": "aging"'*) ((aging_count++)) ;;
+            *) ((current_count++)) ;;
+        esac
+    done
+
+    _api_success "{\"images\": $json, \"total\": ${#entries[@]}, \"stale\": $stale_count, \"aging\": $aging_count, \"current\": $current_count}"
+}
+
+handle_images_check_updates_post() {
+    # Slow registry check: pull and compare digests
+    local -a entries=()
+    local updates_available=0
+
+    while IFS= read -r line; do
+        [[ -z "$line" || "$line" == "REPOSITORY"* ]] && continue
+        local repo tag id _rest
+        read -r repo tag id _rest <<< "$line"
+        [[ "$repo" == "<none>" || "$tag" == "<none>" ]] && continue
+
+        local full_image="${repo}:${tag}"
+        local old_id
+        old_id=$(docker images -q "$full_image" 2>/dev/null | head -1)
+
+        # Pull silently
+        local pull_output
+        pull_output=$(docker pull "$full_image" 2>&1)
+        local new_id
+        new_id=$(docker images -q "$full_image" 2>/dev/null | head -1)
+
+        local update_available=false
+        if [[ -n "$old_id" && -n "$new_id" && "$old_id" != "$new_id" ]]; then
+            update_available=true
+            ((updates_available++))
+        fi
+
+        entries+=("{\"image\": \"$(_api_json_escape "$full_image")\", \"old_id\": \"$(_api_json_escape "$old_id")\", \"new_id\": \"$(_api_json_escape "$new_id")\", \"update_available\": $update_available}")
+    done < <(docker images --format "{{.Repository}}\t{{.Tag}}\t{{.ID}}\t{{.Size}}" 2>/dev/null)
+
+    local json
+    json=$(printf '%s,' "${entries[@]}")
+    json="[${json%,}]"
+    [[ ${#entries[@]} -eq 0 ]] && json="[]"
+
+    _api_success "{\"images\": $json, \"total\": ${#entries[@]}, \"updates_available\": $updates_available, \"checked_at\": \"$(date -u '+%Y-%m-%dT%H:%M:%SZ')\"}"
+}
+
+handle_image_update() {
+    local image_name="$1"
+    # URL-decode the image name
+    image_name=$(printf '%b' "${image_name//%/\\x}")
+
+    if [[ -z "$image_name" ]]; then
+        _api_error 400 "Image name is required"
+        return
+    fi
+
+    # Pull the new image
+    local pull_output
+    pull_output=$(docker pull "$image_name" 2>&1) || {
+        _api_error 500 "Failed to pull image: $(_api_json_escape "$pull_output")"
+        return
+    }
+
+    # Find and restart containers using this image
+    local -a restarted=()
+    local containers
+    containers=$(docker ps -q --filter "ancestor=$image_name" 2>/dev/null)
+    for cid in $containers; do
+        local cname
+        cname=$(docker inspect --format '{{.Name}}' "$cid" 2>/dev/null | sed 's|^/||')
+        docker restart "$cid" >/dev/null 2>&1
+        restarted+=("\"$(_api_json_escape "$cname")\"")
+    done
+
+    local restarted_json
+    restarted_json=$(printf '%s,' "${restarted[@]}")
+    restarted_json="[${restarted_json%,}]"
+    [[ ${#restarted[@]} -eq 0 ]] && restarted_json="[]"
+
+    # Log update
+    local ts
+    ts=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+    [[ ! -f "$UPDATE_HISTORY_FILE" ]] && echo "[]" > "$UPDATE_HISTORY_FILE"
+    local history_entry="{\"image\": \"$(_api_json_escape "$image_name")\", \"timestamp\": \"$ts\", \"containers_restarted\": $restarted_json}"
+    if command -v jq >/dev/null 2>&1; then
+        jq --argjson entry "$history_entry" '. + [$entry] | .[-100:]' "$UPDATE_HISTORY_FILE" > "${UPDATE_HISTORY_FILE}.tmp" 2>/dev/null && mv "${UPDATE_HISTORY_FILE}.tmp" "$UPDATE_HISTORY_FILE"
+    fi
+
+    _api_success "{\"success\": true, \"image\": \"$(_api_json_escape "$image_name")\", \"containers_restarted\": $restarted_json, \"timestamp\": \"$ts\"}"
+}
+
+# =============================================================================
+# FEATURE: NTFY NOTIFICATION RULES
+# =============================================================================
+
+NOTIFICATIONS_FILE="$BASE_DIR/.api-auth/notifications.json"
+
+_init_notifications_file() {
+    if [[ ! -f "$NOTIFICATIONS_FILE" ]]; then
+        echo '{"rules": [], "history": []}' > "$NOTIFICATIONS_FILE"
+    fi
+}
+
+handle_notification_rules_get() {
+    _init_notifications_file
+    if command -v jq >/dev/null 2>&1; then
+        local rules
+        rules=$(jq -c '.rules // []' "$NOTIFICATIONS_FILE" 2>/dev/null || echo "[]")
+        _api_success "{\"rules\": $rules}"
+    else
+        _api_success "{\"rules\": []}"
+    fi
+}
+
+handle_notification_rules_create() {
+    local body="$1"
+    _init_notifications_file
+
+    if ! command -v jq >/dev/null 2>&1; then
+        _api_error 500 "jq is required"
+        return
+    fi
+
+    local name trigger target priority tags enabled
+    name=$(printf '%s' "$body" | jq -r '.name // empty' 2>/dev/null)
+    trigger=$(printf '%s' "$body" | jq -r '.trigger // empty' 2>/dev/null)
+    target=$(printf '%s' "$body" | jq -r '.target // "*"' 2>/dev/null)
+    priority=$(printf '%s' "$body" | jq -r '.priority // "default"' 2>/dev/null)
+    tags=$(printf '%s' "$body" | jq -c '.tags // []' 2>/dev/null)
+    enabled=$(printf '%s' "$body" | jq -r '.enabled // true' 2>/dev/null)
+
+    if [[ -z "$name" || -z "$trigger" ]]; then
+        _api_error 400 "Missing required fields: name, trigger"
+        return
+    fi
+
+    local rule_id="rule_$(date +%s)_$RANDOM"
+    local ts
+    ts=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+
+    local rule="{\"id\": \"$rule_id\", \"name\": \"$(_api_json_escape "$name")\", \"enabled\": $enabled, \"trigger\": \"$(_api_json_escape "$trigger")\", \"target\": \"$(_api_json_escape "$target")\", \"priority\": \"$(_api_json_escape "$priority")\", \"tags\": $tags, \"created_at\": \"$ts\"}"
+
+    jq --argjson rule "$rule" '.rules += [$rule]' "$NOTIFICATIONS_FILE" > "${NOTIFICATIONS_FILE}.tmp" 2>/dev/null && mv "${NOTIFICATIONS_FILE}.tmp" "$NOTIFICATIONS_FILE"
+
+    _api_success "$rule"
+}
+
+handle_notification_rules_delete() {
+    local rule_id="$1"
+    _init_notifications_file
+
+    if ! command -v jq >/dev/null 2>&1; then
+        _api_error 500 "jq is required"
+        return
+    fi
+
+    jq --arg id "$rule_id" '.rules = [.rules[] | select(.id != $id)]' "$NOTIFICATIONS_FILE" > "${NOTIFICATIONS_FILE}.tmp" 2>/dev/null && mv "${NOTIFICATIONS_FILE}.tmp" "$NOTIFICATIONS_FILE"
+
+    _api_success "{\"success\": true, \"deleted\": \"$(_api_json_escape "$rule_id")\"}"
+}
+
+handle_notification_history() {
+    _init_notifications_file
+    if command -v jq >/dev/null 2>&1; then
+        local history
+        history=$(jq -c '.history // [] | .[-100:]' "$NOTIFICATIONS_FILE" 2>/dev/null || echo "[]")
+        _api_success "{\"history\": $history}"
+    else
+        _api_success "{\"history\": []}"
+    fi
+}
+
+handle_notification_test() {
+    local body="$1"
+    local ntfy_url="${NTFY_URL:-}"
+
+    if [[ -z "$ntfy_url" ]]; then
+        _api_error 400 "NTFY is not configured. Set NTFY_URL in .env"
+        return
+    fi
+
+    local message priority title tags
+    message=$(printf '%s' "$body" | jq -r '.message // "Test notification from DCS"' 2>/dev/null)
+    priority=$(printf '%s' "$body" | jq -r '.priority // "default"' 2>/dev/null)
+    title=$(printf '%s' "$body" | jq -r '.title // "DCS Test Notification"' 2>/dev/null)
+    tags=$(printf '%s' "$body" | jq -r '.tags // "test,docker"' 2>/dev/null)
+
+    local result
+    result=$(curl -s -o /dev/null -w "%{http_code}" \
+        -H "Title: $title" \
+        -H "Priority: $priority" \
+        -H "Tags: $tags" \
+        -d "$message" \
+        "$ntfy_url" 2>&1)
+
+    local ts
+    ts=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+
+    # Log to history
+    _init_notifications_file
+    if command -v jq >/dev/null 2>&1; then
+        local entry="{\"timestamp\": \"$ts\", \"type\": \"test\", \"title\": \"$(_api_json_escape "$title")\", \"priority\": \"$priority\", \"status_code\": $result}"
+        jq --argjson entry "$entry" '.history = (.history + [$entry]) | .history = .history[-100:]' "$NOTIFICATIONS_FILE" > "${NOTIFICATIONS_FILE}.tmp" 2>/dev/null && mv "${NOTIFICATIONS_FILE}.tmp" "$NOTIFICATIONS_FILE"
+    fi
+
+    if [[ "$result" == "200" ]]; then
+        _api_success "{\"success\": true, \"message\": \"Test notification sent\", \"status_code\": $result, \"timestamp\": \"$ts\"}"
+    else
+        _api_error 502 "NTFY returned status $result"
+    fi
+}
+
+# =============================================================================
+# FEATURE: SYSTEM SNAPSHOTS
+# =============================================================================
+
+SNAPSHOTS_DIR="$BASE_DIR/.snapshots"
+
+handle_snapshots_list() {
+    [[ ! -d "$SNAPSHOTS_DIR" ]] && mkdir -p "$SNAPSHOTS_DIR"
+
+    local -a entries=()
+    for f in "$SNAPSHOTS_DIR"/*.tar.gz; do
+        [[ ! -f "$f" ]] && continue
+        local fname
+        fname=$(basename "$f")
+        local fsize
+        fsize=$(du -h "$f" 2>/dev/null | awk '{print $1}')
+        local fdate
+        fdate=$(stat -c '%Y' "$f" 2>/dev/null || echo 0)
+        local fiso
+        fiso=$(date -u -d "@$fdate" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || echo "")
+
+        # Read label from manifest if exists
+        local label=""
+        local manifest
+        manifest=$(tar -xzf "$f" manifest.json -O 2>/dev/null)
+        if [[ -n "$manifest" ]] && command -v jq >/dev/null 2>&1; then
+            label=$(printf '%s' "$manifest" | jq -r '.label // ""' 2>/dev/null)
+        fi
+
+        entries+=("{\"filename\": \"$(_api_json_escape "$fname")\", \"label\": \"$(_api_json_escape "$label")\", \"size\": \"$fsize\", \"timestamp\": \"$fiso\", \"epoch\": $fdate}")
+    done
+
+    local json
+    json=$(printf '%s,' "${entries[@]}")
+    json="[${json%,}]"
+    [[ ${#entries[@]} -eq 0 ]] && json="[]"
+
+    _api_success "{\"snapshots\": $json, \"total\": ${#entries[@]}}"
+}
+
+handle_snapshot_create() {
+    local body="$1"
+    [[ ! -d "$SNAPSHOTS_DIR" ]] && mkdir -p "$SNAPSHOTS_DIR"
+
+    local label=""
+    if command -v jq >/dev/null 2>&1; then
+        label=$(printf '%s' "$body" | jq -r '.label // ""' 2>/dev/null)
+    fi
+
+    local ts
+    ts=$(date '+%Y%m%d-%H%M%S')
+    local filename="dcs-snapshot-${ts}.tar.gz"
+    local tmpdir
+    tmpdir=$(mktemp -d /tmp/dcs-snapshot-XXXXXX)
+
+    # Create manifest
+    local hostname_val
+    hostname_val=$(hostname 2>/dev/null || echo "unknown")
+    cat > "$tmpdir/manifest.json" <<MANIFESTEOF
+{"version": "1.0", "label": "$(_api_json_escape "$label")", "created_at": "$(date -u '+%Y-%m-%dT%H:%M:%SZ')", "hostname": "$hostname_val", "dcs_version": "${SCRIPT_VERSION:-2.0.0}"}
+MANIFESTEOF
+
+    # Copy config files
+    mkdir -p "$tmpdir/config" "$tmpdir/stacks" "$tmpdir/api-auth"
+    [[ -d "$BASE_DIR/.config" ]] && cp -r "$BASE_DIR/.config/"* "$tmpdir/config/" 2>/dev/null
+    [[ -f "$BASE_DIR/.env" ]] && cp "$BASE_DIR/.env" "$tmpdir/root.env" 2>/dev/null
+
+    # Copy stack compose + env files
+    for stack_dir in "$COMPOSE_DIR"/*/; do
+        [[ ! -d "$stack_dir" ]] && continue
+        local sname
+        sname=$(basename "$stack_dir")
+        mkdir -p "$tmpdir/stacks/$sname"
+        [[ -f "$stack_dir/docker-compose.yml" ]] && cp "$stack_dir/docker-compose.yml" "$tmpdir/stacks/$sname/" 2>/dev/null
+        [[ -f "$stack_dir/.env" ]] && cp "$stack_dir/.env" "$tmpdir/stacks/$sname/" 2>/dev/null
+    done
+
+    # Copy api-auth (excluding tokens)
+    for f in "$BASE_DIR/.api-auth/"*.json; do
+        [[ ! -f "$f" ]] && continue
+        local fname
+        fname=$(basename "$f")
+        [[ "$fname" == "tokens.json" ]] && continue
+        cp "$f" "$tmpdir/api-auth/" 2>/dev/null
+    done
+
+    # Copy templates if they exist
+    [[ -d "$BASE_DIR/.templates" ]] && cp -r "$BASE_DIR/.templates" "$tmpdir/templates" 2>/dev/null
+
+    # Create archive
+    tar -czf "$SNAPSHOTS_DIR/$filename" -C "$tmpdir" . 2>/dev/null
+    rm -rf "$tmpdir"
+
+    local fsize
+    fsize=$(du -h "$SNAPSHOTS_DIR/$filename" 2>/dev/null | awk '{print $1}')
+
+    _api_success "{\"success\": true, \"filename\": \"$(_api_json_escape "$filename")\", \"label\": \"$(_api_json_escape "$label")\", \"size\": \"$fsize\", \"timestamp\": \"$(date -u '+%Y-%m-%dT%H:%M:%SZ')\"}"
+}
+
+handle_snapshot_download() {
+    local snap_id="$1"
+    local filepath="$SNAPSHOTS_DIR/$snap_id"
+
+    if [[ ! -f "$filepath" ]]; then
+        _api_error 404 "Snapshot not found: $snap_id"
+        return
+    fi
+
+    local filesize
+    filesize=$(stat -c '%s' "$filepath" 2>/dev/null || echo 0)
+
+    # Send binary response
+    printf 'HTTP/1.1 200 OK\r\n'
+    printf 'Content-Type: application/gzip\r\n'
+    printf 'Content-Disposition: attachment; filename="%s"\r\n' "$snap_id"
+    printf 'Content-Length: %s\r\n' "$filesize"
+    printf 'Connection: close\r\n'
+    printf '\r\n'
+    cat "$filepath"
+}
+
+handle_snapshot_restore() {
+    local snap_id="$1"
+    local body="$2"
+    local filepath="$SNAPSHOTS_DIR/$snap_id"
+
+    if [[ ! -f "$filepath" ]]; then
+        _api_error 404 "Snapshot not found: $snap_id"
+        return
+    fi
+
+    # Require confirmation
+    local confirm=""
+    if command -v jq >/dev/null 2>&1; then
+        confirm=$(printf '%s' "$body" | jq -r '.confirm // ""' 2>/dev/null)
+    fi
+    if [[ "$confirm" != "RESTORE" ]]; then
+        _api_error 400 "Must include {\"confirm\": \"RESTORE\"} to proceed"
+        return
+    fi
+
+    local tmpdir
+    tmpdir=$(mktemp -d /tmp/dcs-restore-XXXXXX)
+    tar -xzf "$filepath" -C "$tmpdir" 2>/dev/null || {
+        rm -rf "$tmpdir"
+        _api_error 500 "Failed to extract snapshot"
+        return
+    }
+
+    # Validate manifest
+    if [[ ! -f "$tmpdir/manifest.json" ]]; then
+        rm -rf "$tmpdir"
+        _api_error 400 "Invalid snapshot: no manifest.json"
+        return
+    fi
+
+    # Restore config
+    [[ -d "$tmpdir/config" ]] && cp -r "$tmpdir/config/"* "$BASE_DIR/.config/" 2>/dev/null
+    [[ -f "$tmpdir/root.env" ]] && cp "$tmpdir/root.env" "$BASE_DIR/.env" 2>/dev/null
+
+    # Restore stacks
+    if [[ -d "$tmpdir/stacks" ]]; then
+        for stack_dir in "$tmpdir/stacks"/*/; do
+            [[ ! -d "$stack_dir" ]] && continue
+            local sname
+            sname=$(basename "$stack_dir")
+            mkdir -p "$COMPOSE_DIR/$sname"
+            [[ -f "$stack_dir/docker-compose.yml" ]] && cp "$stack_dir/docker-compose.yml" "$COMPOSE_DIR/$sname/" 2>/dev/null
+            [[ -f "$stack_dir/.env" ]] && cp "$stack_dir/.env" "$COMPOSE_DIR/$sname/" 2>/dev/null
+        done
+    fi
+
+    # Restore api-auth configs (not tokens)
+    if [[ -d "$tmpdir/api-auth" ]]; then
+        for f in "$tmpdir/api-auth/"*.json; do
+            [[ ! -f "$f" ]] && continue
+            local fname
+            fname=$(basename "$f")
+            [[ "$fname" == "tokens.json" ]] && continue
+            cp "$f" "$BASE_DIR/.api-auth/" 2>/dev/null
+        done
+    fi
+
+    # Restore templates
+    [[ -d "$tmpdir/templates" ]] && cp -r "$tmpdir/templates/"* "$BASE_DIR/.templates/" 2>/dev/null
+
+    rm -rf "$tmpdir"
+
+    _api_success "{\"success\": true, \"message\": \"Snapshot restored successfully\", \"filename\": \"$(_api_json_escape "$snap_id")\"}"
+}
+
+handle_snapshot_delete() {
+    local snap_id="$1"
+    local filepath="$SNAPSHOTS_DIR/$snap_id"
+
+    if [[ ! -f "$filepath" ]]; then
+        _api_error 404 "Snapshot not found: $snap_id"
+        return
+    fi
+
+    rm -f "$filepath"
+    _api_success "{\"success\": true, \"deleted\": \"$(_api_json_escape "$snap_id")\"}"
+}
+
+# =============================================================================
+# FEATURE: COMPOSE VERSION HISTORY
+# =============================================================================
+
+COMPOSE_HISTORY_DIR="$BASE_DIR/.compose-history"
+
+handle_compose_history() {
+    local stack="$1"
+
+    if [[ ! -d "$COMPOSE_DIR/$stack" ]]; then
+        _api_error 404 "Stack not found: $stack"
+        return
+    fi
+
+    local history_dir="$COMPOSE_HISTORY_DIR/$stack"
+    local history_file="$history_dir/history.json"
+
+    if [[ ! -f "$history_file" ]]; then
+        _api_success "{\"stack\": \"$(_api_json_escape "$stack")\", \"versions\": [], \"count\": 0}"
+        return
+    fi
+
+    if command -v jq >/dev/null 2>&1; then
+        local versions
+        versions=$(jq -c '.' "$history_file" 2>/dev/null || echo "[]")
+        local count
+        count=$(jq 'length' "$history_file" 2>/dev/null || echo 0)
+        _api_success "{\"stack\": \"$(_api_json_escape "$stack")\", \"versions\": $versions, \"count\": $count}"
+    else
+        _api_success "{\"stack\": \"$(_api_json_escape "$stack")\", \"versions\": [], \"count\": 0}"
+    fi
+}
+
+handle_compose_rollback() {
+    local stack="$1"
+    local body="$2"
+
+    if [[ ! -d "$COMPOSE_DIR/$stack" ]]; then
+        _api_error 404 "Stack not found: $stack"
+        return
+    fi
+
+    if ! command -v jq >/dev/null 2>&1; then
+        _api_error 500 "jq is required"
+        return
+    fi
+
+    local version_id
+    version_id=$(printf '%s' "$body" | jq -r '.version_id // empty' 2>/dev/null)
+    if [[ -z "$version_id" ]]; then
+        _api_error 400 "Missing required field: version_id"
+        return
+    fi
+
+    local history_dir="$COMPOSE_HISTORY_DIR/$stack"
+    local version_file="$history_dir/${version_id}.yml"
+
+    if [[ ! -f "$version_file" ]]; then
+        _api_error 404 "Version not found: $version_id"
+        return
+    fi
+
+    local compose_file="$COMPOSE_DIR/$stack/docker-compose.yml"
+
+    # Save current as a new version before rollback
+    _save_compose_version "$stack"
+
+    # Restore the selected version
+    cp "$version_file" "$compose_file" 2>/dev/null || {
+        _api_error 500 "Failed to restore compose file"
+        return
+    }
+
+    _api_success "{\"success\": true, \"stack\": \"$(_api_json_escape "$stack")\", \"restored_version\": \"$(_api_json_escape "$version_id")\", \"message\": \"Compose file rolled back successfully\"}"
+}
+
+# Helper: save a compose version snapshot
+_save_compose_version() {
+    local stack="$1"
+    local compose_file="$COMPOSE_DIR/$stack/docker-compose.yml"
+
+    [[ ! -f "$compose_file" ]] && return
+
+    local history_dir="$COMPOSE_HISTORY_DIR/$stack"
+    mkdir -p "$history_dir"
+
+    local ts
+    ts=$(date '+%Y%m%d-%H%M%S')
+    local version_id="v_${ts}"
+
+    # Copy compose file
+    cp "$compose_file" "$history_dir/${version_id}.yml" 2>/dev/null
+
+    # Update history.json
+    local history_file="$history_dir/history.json"
+    [[ ! -f "$history_file" ]] && echo "[]" > "$history_file"
+
+    local iso_ts
+    iso_ts=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+    local size
+    size=$(stat -c '%s' "$compose_file" 2>/dev/null || echo 0)
+
+    if command -v jq >/dev/null 2>&1; then
+        local entry="{\"version_id\": \"$version_id\", \"timestamp\": \"$iso_ts\", \"size\": $size}"
+        jq --argjson entry "$entry" '. + [$entry] | .[-50:]' "$history_file" > "${history_file}.tmp" 2>/dev/null && mv "${history_file}.tmp" "$history_file"
+    fi
+}
+
+# =============================================================================
+# FEATURE: STACK TEMPLATES
+# =============================================================================
+
+TEMPLATES_DIR="$BASE_DIR/.templates"
+
+handle_templates_list() {
+    [[ ! -d "$TEMPLATES_DIR" ]] && mkdir -p "$TEMPLATES_DIR"
+
+    local -a entries=()
+    for tdir in "$TEMPLATES_DIR"/*/; do
+        [[ ! -d "$tdir" ]] && continue
+        local tname
+        tname=$(basename "$tdir")
+        local meta_file="$tdir/template.json"
+
+        if [[ -f "$meta_file" ]] && command -v jq >/dev/null 2>&1; then
+            local meta
+            meta=$(jq -c '.' "$meta_file" 2>/dev/null)
+            [[ -n "$meta" ]] && entries+=("$meta")
+        else
+            entries+=("{\"name\": \"$(_api_json_escape "$tname")\", \"description\": \"\", \"category\": \"other\", \"tags\": []}")
+        fi
+    done
+
+    local json
+    json=$(printf '%s,' "${entries[@]}")
+    json="[${json%,}]"
+    [[ ${#entries[@]} -eq 0 ]] && json="[]"
+
+    _api_success "{\"templates\": $json, \"total\": ${#entries[@]}}"
+}
+
+handle_template_detail() {
+    local name="$1"
+    local tdir="$TEMPLATES_DIR/$name"
+
+    if [[ ! -d "$tdir" ]]; then
+        _api_error 404 "Template not found: $name"
+        return
+    fi
+
+    local meta="{}"
+    if [[ -f "$tdir/template.json" ]] && command -v jq >/dev/null 2>&1; then
+        meta=$(jq -c '.' "$tdir/template.json" 2>/dev/null || echo "{}")
+    fi
+
+    local compose_content=""
+    if [[ -f "$tdir/docker-compose.yml" ]]; then
+        compose_content=$(_api_json_escape "$(cat "$tdir/docker-compose.yml")")
+    fi
+
+    local env_content=""
+    if [[ -f "$tdir/.env" ]]; then
+        env_content=$(_api_json_escape "$(cat "$tdir/.env")")
+    fi
+
+    _api_success "{\"template\": $meta, \"compose\": \"$compose_content\", \"env\": \"$env_content\"}"
+}
+
+handle_template_deploy() {
+    local name="$1"
+    local body="$2"
+    local tdir="$TEMPLATES_DIR/$name"
+
+    if [[ ! -d "$tdir" || ! -f "$tdir/docker-compose.yml" ]]; then
+        _api_error 404 "Template not found or missing compose file: $name"
+        return
+    fi
+
+    if ! command -v jq >/dev/null 2>&1; then
+        _api_error 500 "jq is required"
+        return
+    fi
+
+    local stack_name
+    stack_name=$(printf '%s' "$body" | jq -r '.stack_name // empty' 2>/dev/null)
+    if [[ -z "$stack_name" ]]; then
+        _api_error 400 "Missing required field: stack_name"
+        return
+    fi
+
+    # Sanitize stack name
+    stack_name=$(echo "$stack_name" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_-]/-/g')
+
+    local target_dir="$COMPOSE_DIR/$stack_name"
+    if [[ -d "$target_dir" ]]; then
+        _api_error 409 "Stack already exists: $stack_name"
+        return
+    fi
+
+    mkdir -p "$target_dir"
+
+    # Read compose template and substitute variables
+    local compose_content
+    compose_content=$(cat "$tdir/docker-compose.yml")
+
+    # Get variables from request body and substitute
+    local vars
+    vars=$(printf '%s' "$body" | jq -r '.variables // {} | to_entries[] | "\(.key)=\(.value)"' 2>/dev/null)
+    while IFS='=' read -r key val; do
+        [[ -z "$key" ]] && continue
+        compose_content="${compose_content//\$\{$key\}/$val}"
+        compose_content="${compose_content//\$$key/$val}"
+    done <<< "$vars"
+
+    printf '%s' "$compose_content" > "$target_dir/docker-compose.yml"
+
+    # Create .env from variables
+    local env_content=""
+    while IFS='=' read -r key val; do
+        [[ -z "$key" ]] && continue
+        env_content+="${key}=${val}\n"
+    done <<< "$vars"
+    [[ -n "$env_content" ]] && printf '%b' "$env_content" > "$target_dir/.env"
+
+    # Auto-start if requested
+    local auto_start
+    auto_start=$(printf '%s' "$body" | jq -r '.auto_start // false' 2>/dev/null)
+    local started=false
+    if [[ "$auto_start" == "true" ]]; then
+        $DOCKER_COMPOSE_CMD -f "$target_dir/docker-compose.yml" up -d 2>/dev/null && started=true
+    fi
+
+    _api_success "{\"success\": true, \"stack_name\": \"$(_api_json_escape "$stack_name")\", \"started\": $started, \"message\": \"Template deployed successfully\"}"
+}
+
+handle_template_import() {
+    local body="$1"
+
+    if ! command -v jq >/dev/null 2>&1; then
+        _api_error 500 "jq is required"
+        return
+    fi
+
+    local name
+    name=$(printf '%s' "$body" | jq -r '.name // empty' 2>/dev/null)
+    local compose
+    compose=$(printf '%s' "$body" | jq -r '.compose // empty' 2>/dev/null)
+    local metadata
+    metadata=$(printf '%s' "$body" | jq -c '.metadata // {}' 2>/dev/null)
+
+    if [[ -z "$name" || -z "$compose" ]]; then
+        _api_error 400 "Missing required fields: name, compose"
+        return
+    fi
+
+    # Security: sanitize template name — only allow lowercase alphanumeric, hyphens, underscores
+    name=$(echo "$name" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_-]/-/g' | head -c 64)
+    # Prevent path traversal
+    if [[ "$name" == *".."* || "$name" == *"/"* || -z "$name" ]]; then
+        _api_error 400 "Invalid template name"
+        return
+    fi
+
+    local tdir="$TEMPLATES_DIR/$name"
+    mkdir -p "$tdir"
+
+    printf '%s' "$compose" > "$tdir/docker-compose.yml"
+
+    # Create template.json from metadata
+    local template_meta
+    template_meta=$(printf '%s' "$metadata" | jq --arg n "$name" '. + {"name": $n}' 2>/dev/null || echo "{\"name\": \"$name\"}")
+    printf '%s' "$template_meta" > "$tdir/template.json"
+
+    # Also write .env if provided
+    local env_content
+    env_content=$(printf '%s' "$body" | jq -r '.env // empty' 2>/dev/null)
+    if [[ -n "$env_content" ]]; then
+        printf '%s' "$env_content" > "$tdir/.env"
+    fi
+
+    _api_success "{\"success\": true, \"name\": \"$(_api_json_escape "$name")\", \"message\": \"Template imported successfully\"}"
+}
+
+# POST /templates/:name/update — Update an existing template's compose, metadata, and .env
+handle_template_update() {
+    local name="$1"
+    local body="$2"
+
+    # Security: validate template name
+    if [[ "$name" == *".."* || "$name" == *"/"* || -z "$name" ]]; then
+        _api_error 400 "Invalid template name"
+        return
+    fi
+
+    local tdir="$TEMPLATES_DIR/$name"
+
+    if [[ ! -d "$tdir" ]]; then
+        _api_error 404 "Template not found: $name"
+        return
+    fi
+
+    if ! command -v jq >/dev/null 2>&1; then
+        _api_error 500 "jq is required"
+        return
+    fi
+
+    # Update compose if provided
+    local compose
+    compose=$(printf '%s' "$body" | jq -r '.compose // empty' 2>/dev/null)
+    [[ -n "$compose" ]] && printf '%s' "$compose" > "$tdir/docker-compose.yml"
+
+    # Update metadata if provided
+    local metadata
+    metadata=$(printf '%s' "$body" | jq -c '.metadata // empty' 2>/dev/null)
+    if [[ -n "$metadata" && "$metadata" != "null" && "$metadata" != "" ]]; then
+        local template_meta
+        template_meta=$(printf '%s' "$metadata" | jq --arg n "$name" '. + {"name": $n}' 2>/dev/null || echo "{\"name\": \"$name\"}")
+        printf '%s' "$template_meta" > "$tdir/template.json"
+    fi
+
+    # Update .env if provided
+    local env_content
+    env_content=$(printf '%s' "$body" | jq -r '.env // empty' 2>/dev/null)
+    [[ -n "$env_content" ]] && printf '%s' "$env_content" > "$tdir/.env"
+
+    _api_success "{\"success\": true, \"name\": \"$(_api_json_escape "$name")\", \"message\": \"Template updated successfully\"}"
+}
+
+# DELETE /templates/:name — Delete a template
+handle_template_delete() {
+    local name="$1"
+
+    # Security: validate template name
+    if [[ "$name" == *".."* || "$name" == *"/"* || -z "$name" ]]; then
+        _api_error 400 "Invalid template name"
+        return
+    fi
+
+    local tdir="$TEMPLATES_DIR/$name"
+
+    if [[ ! -d "$tdir" ]]; then
+        _api_error 404 "Template not found: $name"
+        return
+    fi
+
+    rm -rf "$tdir"
+    _api_success "{\"success\": true, \"name\": \"$(_api_json_escape "$name")\", \"message\": \"Template deleted\"}"
+}
+
+# =============================================================================
+# FEATURE: SCHEDULED AUTOMATIONS
+# =============================================================================
+
+AUTOMATIONS_FILE="$BASE_DIR/.api-auth/automations.json"
+
+_init_automations_file() {
+    if [[ ! -f "$AUTOMATIONS_FILE" ]]; then
+        echo '[]' > "$AUTOMATIONS_FILE"
+    fi
+}
+
+handle_automations_list() {
+    _init_automations_file
+    if command -v jq >/dev/null 2>&1; then
+        local rules
+        rules=$(jq -c '.' "$AUTOMATIONS_FILE" 2>/dev/null || echo "[]")
+        local count
+        count=$(jq 'length' "$AUTOMATIONS_FILE" 2>/dev/null || echo 0)
+        _api_success "{\"automations\": $rules, \"total\": $count}"
+    else
+        _api_success "{\"automations\": [], \"total\": 0}"
+    fi
+}
+
+handle_automation_create() {
+    local body="$1"
+    _init_automations_file
+
+    if ! command -v jq >/dev/null 2>&1; then
+        _api_error 500 "jq is required"
+        return
+    fi
+
+    local name trigger_type trigger_value action_type action_target enabled
+    name=$(printf '%s' "$body" | jq -r '.name // empty' 2>/dev/null)
+    trigger_type=$(printf '%s' "$body" | jq -r '.trigger_type // empty' 2>/dev/null)
+    trigger_value=$(printf '%s' "$body" | jq -r '.trigger_value // ""' 2>/dev/null)
+    action_type=$(printf '%s' "$body" | jq -r '.action_type // empty' 2>/dev/null)
+    action_target=$(printf '%s' "$body" | jq -r '.action_target // "*"' 2>/dev/null)
+    enabled=$(printf '%s' "$body" | jq -r '.enabled // true' 2>/dev/null)
+
+    if [[ -z "$name" || -z "$trigger_type" || -z "$action_type" ]]; then
+        _api_error 400 "Missing required fields: name, trigger_type, action_type"
+        return
+    fi
+
+    local auto_id="auto_$(date +%s)_$RANDOM"
+    local ts
+    ts=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+
+    local automation="{\"id\": \"$auto_id\", \"name\": \"$(_api_json_escape "$name")\", \"enabled\": $enabled, \"trigger_type\": \"$(_api_json_escape "$trigger_type")\", \"trigger_value\": \"$(_api_json_escape "$trigger_value")\", \"action_type\": \"$(_api_json_escape "$action_type")\", \"action_target\": \"$(_api_json_escape "$action_target")\", \"created_at\": \"$ts\", \"run_count\": 0, \"last_run\": null, \"history\": []}"
+
+    jq --argjson auto "$automation" '. + [$auto]' "$AUTOMATIONS_FILE" > "${AUTOMATIONS_FILE}.tmp" 2>/dev/null && mv "${AUTOMATIONS_FILE}.tmp" "$AUTOMATIONS_FILE"
+
+    # If schedule trigger, add crontab entry
+    if [[ "$trigger_type" == "schedule" && "$enabled" == "true" && -n "$trigger_value" ]]; then
+        _add_automation_cron "$auto_id" "$trigger_value" "$action_type" "$action_target"
+    fi
+
+    _api_success "$automation"
+}
+
+handle_automation_update() {
+    local auto_id="$1"
+    local body="$2"
+    _init_automations_file
+
+    if ! command -v jq >/dev/null 2>&1; then
+        _api_error 500 "jq is required"
+        return
+    fi
+
+    # Check automation exists
+    local exists
+    exists=$(jq --arg id "$auto_id" '[.[] | select(.id == $id)] | length' "$AUTOMATIONS_FILE" 2>/dev/null)
+    if [[ "$exists" == "0" ]]; then
+        _api_error 404 "Automation not found: $auto_id"
+        return
+    fi
+
+    # Merge updates
+    local updates
+    updates=$(printf '%s' "$body" | jq -c 'del(.id, .created_at, .run_count, .last_run, .history)' 2>/dev/null)
+
+    jq --arg id "$auto_id" --argjson upd "$updates" '
+        map(if .id == $id then . + $upd else . end)
+    ' "$AUTOMATIONS_FILE" > "${AUTOMATIONS_FILE}.tmp" 2>/dev/null && mv "${AUTOMATIONS_FILE}.tmp" "$AUTOMATIONS_FILE"
+
+    # Update cron
+    _remove_automation_cron "$auto_id"
+    local enabled trigger_type trigger_value action_type action_target
+    enabled=$(jq -r --arg id "$auto_id" '.[] | select(.id == $id) | .enabled' "$AUTOMATIONS_FILE" 2>/dev/null)
+    trigger_type=$(jq -r --arg id "$auto_id" '.[] | select(.id == $id) | .trigger_type' "$AUTOMATIONS_FILE" 2>/dev/null)
+    trigger_value=$(jq -r --arg id "$auto_id" '.[] | select(.id == $id) | .trigger_value' "$AUTOMATIONS_FILE" 2>/dev/null)
+    action_type=$(jq -r --arg id "$auto_id" '.[] | select(.id == $id) | .action_type' "$AUTOMATIONS_FILE" 2>/dev/null)
+    action_target=$(jq -r --arg id "$auto_id" '.[] | select(.id == $id) | .action_target' "$AUTOMATIONS_FILE" 2>/dev/null)
+
+    if [[ "$trigger_type" == "schedule" && "$enabled" == "true" && -n "$trigger_value" ]]; then
+        _add_automation_cron "$auto_id" "$trigger_value" "$action_type" "$action_target"
+    fi
+
+    local updated
+    updated=$(jq -c --arg id "$auto_id" '.[] | select(.id == $id)' "$AUTOMATIONS_FILE" 2>/dev/null)
+
+    _api_success "$updated"
+}
+
+handle_automation_delete() {
+    local auto_id="$1"
+    _init_automations_file
+
+    if ! command -v jq >/dev/null 2>&1; then
+        _api_error 500 "jq is required"
+        return
+    fi
+
+    _remove_automation_cron "$auto_id"
+    jq --arg id "$auto_id" '[.[] | select(.id != $id)]' "$AUTOMATIONS_FILE" > "${AUTOMATIONS_FILE}.tmp" 2>/dev/null && mv "${AUTOMATIONS_FILE}.tmp" "$AUTOMATIONS_FILE"
+
+    _api_success "{\"success\": true, \"deleted\": \"$(_api_json_escape "$auto_id")\"}"
+}
+
+handle_automation_history() {
+    local auto_id="$1"
+    _init_automations_file
+
+    if ! command -v jq >/dev/null 2>&1; then
+        _api_error 500 "jq is required"
+        return
+    fi
+
+    local history
+    history=$(jq -c --arg id "$auto_id" '.[] | select(.id == $id) | .history // []' "$AUTOMATIONS_FILE" 2>/dev/null || echo "[]")
+
+    _api_success "{\"automation_id\": \"$(_api_json_escape "$auto_id")\", \"history\": $history}"
+}
+
+# Cron helpers for automations
+_add_automation_cron() {
+    local auto_id="$1" cron_expr="$2" action="$3" target="$4"
+    local api_port="${API_PORT:-9876}"
+    local api_bind="${API_BIND:-127.0.0.1}"
+    local cron_line="$cron_expr curl -s -X POST http://${api_bind}:${api_port}/automations/${auto_id}/run >/dev/null 2>&1 # DCS-AUTO:${auto_id}"
+    (crontab -l 2>/dev/null; echo "$cron_line") | crontab - 2>/dev/null
+}
+
+_remove_automation_cron() {
+    local auto_id="$1"
+    crontab -l 2>/dev/null | grep -v "# DCS-AUTO:${auto_id}" | crontab - 2>/dev/null
+}
+
+# =============================================================================
+# FEATURE: NETWORK TOPOLOGY MAP
+# =============================================================================
+
+handle_topology() {
+    local -a nodes=()
+    local -a edges=()
+    local -a net_entries=()
+
+    # Build network map: network_name -> containers[]
+    declare -A network_containers
+
+    # Get all running containers with their networks
+    while IFS= read -r container_id; do
+        [[ -z "$container_id" ]] && continue
+        local cname cstate chealth cimage cports
+        cname=$(docker inspect --format '{{.Name}}' "$container_id" 2>/dev/null | sed 's|^/||')
+        cstate=$(docker inspect --format '{{.State.Status}}' "$container_id" 2>/dev/null)
+        chealth=$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$container_id" 2>/dev/null)
+        cimage=$(docker inspect --format '{{.Config.Image}}' "$container_id" 2>/dev/null)
+
+        # Get ports
+        cports=$(docker inspect --format '{{range $p, $conf := .NetworkSettings.Ports}}{{$p}}->{{range $conf}}{{.HostPort}}{{end}} {{end}}' "$container_id" 2>/dev/null | sed 's/ $//')
+
+        # Get stack label
+        local cstack
+        cstack=$(docker inspect --format '{{index .Config.Labels "com.docker.compose.project"}}' "$container_id" 2>/dev/null)
+        [[ "$cstack" == "<no value>" ]] && cstack=""
+
+        # Get networks
+        local -a container_nets=()
+        while IFS= read -r netname; do
+            [[ -z "$netname" ]] && continue
+            container_nets+=("\"$(_api_json_escape "$netname")\"")
+            network_containers["$netname"]+="$cname "
+        done < <(docker inspect --format '{{range $key, $val := .NetworkSettings.Networks}}{{$key}}{{"\n"}}{{end}}' "$container_id" 2>/dev/null)
+
+        local nets_json
+        nets_json=$(printf '%s,' "${container_nets[@]}")
+        nets_json="[${nets_json%,}]"
+        [[ ${#container_nets[@]} -eq 0 ]] && nets_json="[]"
+
+        nodes+=("{\"id\": \"$(_api_json_escape "$cname")\", \"state\": \"$cstate\", \"health\": \"$chealth\", \"image\": \"$(_api_json_escape "$cimage")\", \"stack\": \"$(_api_json_escape "$cstack")\", \"networks\": $nets_json, \"ports\": \"$(_api_json_escape "$cports")\"}")
+    done < <(docker ps -a -q 2>/dev/null)
+
+    # Build edges: containers sharing a network
+    for net in "${!network_containers[@]}"; do
+        local -a members
+        read -ra members <<< "${network_containers[$net]}"
+        for ((i=0; i<${#members[@]}; i++)); do
+            for ((j=i+1; j<${#members[@]}; j++)); do
+                edges+=("{\"source\": \"$(_api_json_escape "${members[$i]}")\", \"target\": \"$(_api_json_escape "${members[$j]}")\", \"network\": \"$(_api_json_escape "$net")\"}")
+            done
+        done
+    done
+
+    # Build network metadata
+    while IFS= read -r net_id; do
+        [[ -z "$net_id" ]] && continue
+        local nname ndriver nsubnet ncontainer_count
+        nname=$(docker network inspect --format '{{.Name}}' "$net_id" 2>/dev/null)
+        ndriver=$(docker network inspect --format '{{.Driver}}' "$net_id" 2>/dev/null)
+        nsubnet=$(docker network inspect --format '{{range .IPAM.Config}}{{.Subnet}}{{end}}' "$net_id" 2>/dev/null)
+        ncontainer_count=$(echo "${network_containers[$nname]}" | wc -w)
+
+        net_entries+=("{\"name\": \"$(_api_json_escape "$nname")\", \"driver\": \"$ndriver\", \"subnet\": \"$(_api_json_escape "$nsubnet")\", \"container_count\": $ncontainer_count}")
+    done < <(docker network ls -q 2>/dev/null)
+
+    local nodes_json edges_json nets_json
+    nodes_json=$(printf '%s,' "${nodes[@]}"); nodes_json="[${nodes_json%,}]"; [[ ${#nodes[@]} -eq 0 ]] && nodes_json="[]"
+    edges_json=$(printf '%s,' "${edges[@]}"); edges_json="[${edges_json%,}]"; [[ ${#edges[@]} -eq 0 ]] && edges_json="[]"
+    nets_json=$(printf '%s,' "${net_entries[@]}"); nets_json="[${nets_json%,}]"; [[ ${#net_entries[@]} -eq 0 ]] && nets_json="[]"
+
+    _api_success "{\"nodes\": $nodes_json, \"edges\": $edges_json, \"networks\": $nets_json}"
+}
+
+# =============================================================================
 # REQUEST ROUTER
 # =============================================================================
 
@@ -4567,7 +5755,34 @@ handle_request() {
             /alerts/config)             handle_alerts_config ;;
             /system/crontab)            handle_crontab ;;
             /system/crontab/system)     handle_crontab_system ;;
+            /metrics/trends)            handle_metrics_trends ;;
+            /images/check-updates)      handle_images_check_updates_get ;;
+            /notifications/rules)       handle_notification_rules_get ;;
+            /notifications/history)     handle_notification_history ;;
+            /snapshots)                 handle_snapshots_list ;;
+            /templates)                 handle_templates_list ;;
+            /automations)               handle_automations_list ;;
+            /topology)                  handle_topology ;;
 
+            /templates/*)
+                local tname="${path#/templates/}"
+                handle_template_detail "$tname"
+                ;;
+            /snapshots/*/download)
+                local snap="${path#/snapshots/}"
+                snap="${snap%/download}"
+                handle_snapshot_download "$snap"
+                ;;
+            /stacks/*/compose/history)
+                local stack="${path#/stacks/}"
+                stack="${stack%/compose/history}"
+                handle_compose_history "$stack"
+                ;;
+            /automations/*/history)
+                local auto_id="${path#/automations/}"
+                auto_id="${auto_id%/history}"
+                handle_automation_history "$auto_id"
+                ;;
             /containers/*/files)
                 local container="${path#/containers/}"
                 container="${container%/files}"
@@ -4796,6 +6011,57 @@ handle_request() {
                 stack="${stack%/env}"
                 handle_stack_env_save "$stack" "$request_body"
                 ;;
+            /stacks/*/compose/rollback)
+                local stack="${path#/stacks/}"
+                stack="${stack%/compose/rollback}"
+                handle_compose_rollback "$stack" "$request_body"
+                ;;
+            /metrics/snapshot)
+                handle_metrics_snapshot
+                ;;
+            /images/check-updates)
+                handle_images_check_updates_post
+                ;;
+            /images/*/update)
+                local img="${path#/images/}"
+                img="${img%/update}"
+                handle_image_update "$img"
+                ;;
+            /notifications/rules)
+                handle_notification_rules_create "$request_body"
+                ;;
+            /notifications/test)
+                handle_notification_test "$request_body"
+                ;;
+            /snapshots/create)
+                handle_snapshot_create "$request_body"
+                ;;
+            /snapshots/*/restore)
+                local snap="${path#/snapshots/}"
+                snap="${snap%/restore}"
+                handle_snapshot_restore "$snap" "$request_body"
+                ;;
+            /templates/*/deploy)
+                local tname="${path#/templates/}"
+                tname="${tname%/deploy}"
+                handle_template_deploy "$tname" "$request_body"
+                ;;
+            /templates/import)
+                handle_template_import "$request_body"
+                ;;
+            /templates/*/update)
+                local tname="${path#/templates/}"
+                tname="${tname%/update}"
+                handle_template_update "$tname" "$request_body"
+                ;;
+            /automations)
+                handle_automation_create "$request_body"
+                ;;
+            /automations/*/update)
+                local auto_id="${path#/automations/}"
+                auto_id="${auto_id%/update}"
+                handle_automation_update "$auto_id" "$request_body"
+                ;;
             /stacks/*/start)
                 local stack="${path#/stacks/}"
                 stack="${stack%/start}"
@@ -4836,6 +6102,22 @@ handle_request() {
             /auth/invite/*)
                 local code="${path#/auth/invite/}"
                 handle_auth_delete_invite "$code"
+                ;;
+            /notifications/rules/*)
+                local rule_id="${path#/notifications/rules/}"
+                handle_notification_rules_delete "$rule_id"
+                ;;
+            /snapshots/*)
+                local snap="${path#/snapshots/}"
+                handle_snapshot_delete "$snap"
+                ;;
+            /templates/*)
+                local tname="${path#/templates/}"
+                handle_template_delete "$tname"
+                ;;
+            /automations/*)
+                local auto_id="${path#/automations/}"
+                handle_automation_delete "$auto_id"
                 ;;
             *)
                 _api_error 404 "Endpoint not found: $path"
