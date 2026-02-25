@@ -1,5 +1,5 @@
 ===============================================================================
-Logger System v3.0 - Session Started: 2026-02-23 03:47:06
+Logger System v3.0 - Session Started: 2026-02-24 14:13:48
 Application: Docker Compose Updater
 Script Version: 2.0.0
 Log Level: INFO
@@ -8,59 +8,162 @@ Verbose Mode: false
 
 [SUCCESS] - Logger System v3.0 initialized successfully
 ------------------------------------------------------------
-[Feb/23/2026 — 3:47 AM] [INFO] - User .......................... howson
-[Feb/23/2026 — 3:47 AM] [INFO] - Hostname ...................... Howson-Ubuntu
-[Feb/23/2026 — 3:47 AM] [INFO] - Base Dir ...................... /home/howson/Documents/GitHub/Docker-Compose-Skeleton
-[Feb/23/2026 — 3:47 AM] [INFO] - Stacks Dir .................... /home/howson/Documents/GitHub/Docker-Compose-Skeleton/Stacks
-[Feb/23/2026 — 3:47 AM] [INFO] - App Data ...................... ./App-Data
-[Feb/23/2026 — 3:47 AM] [INFO] - Environment ................... production
-[Feb/23/2026 — 3:47 AM] [INFO] - Log Level ..................... INFO
-[Feb/23/2026 — 3:47 AM] [INFO] - Compose ....................... docker compose
-[Feb/23/2026 — 3:47 AM] [INFO] - Volumes on Stop ............... Preserve
-[Feb/23/2026 — 3:47 AM] [INFO] - Force Mode .................... Disabled (30s timeout)
-[Feb/23/2026 — 3:47 AM] [INFO] - Notifications ................. Disabled
-[Feb/23/2026 — 3:47 AM] [INFO] - Initiated at .................. 2026-02-23 03:47:06
+[Feb/24/2026 — 2:13 PM] [INFO] - User .......................... howson
+[Feb/24/2026 — 2:13 PM] [INFO] - Hostname ...................... Howson-Ubuntu
+[Feb/24/2026 — 2:13 PM] [INFO] - Base Dir ...................... /home/howson/Documents/GitHub/Docker-Compose-Skeleton
+[Feb/24/2026 — 2:13 PM] [INFO] - Stacks Dir .................... /home/howson/Documents/GitHub/Docker-Compose-Skeleton/Stacks
+[Feb/24/2026 — 2:13 PM] [INFO] - App Data ...................... ./App-Data
+[Feb/24/2026 — 2:13 PM] [INFO] - Environment ................... production
+[Feb/24/2026 — 2:13 PM] [INFO] - Log Level ..................... INFO
+[Feb/24/2026 — 2:13 PM] [INFO] - Compose ....................... docker compose
+[Feb/24/2026 — 2:13 PM] [INFO] - Healthcheck Wait .............. Disabled
+[Feb/24/2026 — 2:13 PM] [INFO] - On Failure .................... Continue
+[Feb/24/2026 — 2:13 PM] [INFO] - Volumes on Stop ............... Preserve
+[Feb/24/2026 — 2:13 PM] [INFO] - Notifications ................. Disabled
+[Feb/24/2026 — 2:13 PM] [INFO] - Started at .................... 2026-02-24 14:13:48
 ------------------------------------------------------------
-[Feb/23/2026 — 3:47 AM] [STEP 1/4] - Verifying Docker environment
-[Feb/23/2026 — 3:47 AM] [INFO] - Docker ........................ v28.2.2
-[Feb/23/2026 — 3:47 AM] [INFO] - Compose ....................... Docker Compose version 2.37.1+ds1-0ubuntu2
-[Feb/23/2026 — 3:47 AM] [SUCCESS] - Docker environment verified
-[Feb/23/2026 — 3:47 AM] [STEP 2/4] - Stopping all Docker service stacks
-[Feb/23/2026 — 3:47 AM] [ Docker Compose Updater ] - Docker Services Shutdown Initiated
-[Feb/23/2026 — 3:47 AM] [INFO] - Shutdown requested at: 2026-02-23 03:47:06
-[Feb/23/2026 — 3:47 AM] [INFO] - Volume removal: DISABLED — named volumes will be preserved
-[Feb/23/2026 — 3:47 AM] [INFO] - Full system shutdown requested for all 10 service stacks
-[Feb/23/2026 — 3:47 AM] [FOCUS] - Beginning controlled Docker services shutdown...
-[Feb/23/2026 — 3:47 AM] [INFO] - Initiating shutdown of 10 Docker service stacks...
-================ SERVICE SHUTDOWN SEQUENCE ================
-[Feb/23/2026 — 3:47 AM] [INFO] - Stopping services in miscellaneous-services stack...
- Container skeleton-misc  Stopping
- Container skeleton-misc  Stopped
- Container skeleton-misc  Removing
- Container skeleton-misc  Removed
- Network miscellaneous-services_default  Removing
- Network miscellaneous-services_default  Removed
-[Feb/23/2026 — 3:47 AM] [TIMING] - stop_miscellaneous-services completed in 31s
-[Feb/23/2026 — 3:47 AM] [SUCCESS] - miscellaneous-services stack stopped successfully
-[Feb/23/2026 — 3:47 AM] [INFO] - Stopping stacks [#####---------------------------------------------] 10%
-[Feb/23/2026 — 3:47 AM] [INFO] - Stopping services in entertainment-personal stack...
- Container skeleton-entertainment  Stopping
- Container skeleton-entertainment  Stopped
- Container skeleton-entertainment  Removing
- Container skeleton-entertainment  Removed
- Network entertainment-personal_default  Removing
- Network entertainment-personal_default  Removed
-[Feb/23/2026 — 3:48 AM] [TIMING] - stop_entertainment-personal completed in 30s
-[Feb/23/2026 — 3:48 AM] [SUCCESS] - entertainment-personal stack stopped successfully
-[Feb/23/2026 — 3:48 AM] [INFO] - Stopping stacks [##########----------------------------------------] 20%
-[Feb/23/2026 — 3:48 AM] [INFO] - Stopping services in communication-collaboration stack...
- Container skeleton-comms  Stopping
- Container skeleton-comms  Stopped
- Container skeleton-comms  Removing
- Container skeleton-comms  Removed
- Network communication-collaboration_default  Removing
- Network communication-collaboration_default  Removed
-[Feb/23/2026 — 3:48 AM] [TIMING] - stop_communication-collaboration completed in 31s
-[Feb/23/2026 — 3:48 AM] [SUCCESS] - communication-collaboration stack stopped successfully
-[Feb/23/2026 — 3:49 AM] [INFO] - Stopping stacks [###############-----------------------------------] 30%
-[Feb/23/2026 — 3:49 AM] [INFO] - Stopping services in storage-backup stack...
+[Feb/24/2026 — 2:13 PM] [STEP 1/6] - Verifying Docker environment
+[Feb/24/2026 — 2:13 PM] [INFO] - Verifying Docker environment...
+[Feb/24/2026 — 2:13 PM] [INFO] - Docker ........................ v28.2.2
+[Feb/24/2026 — 2:13 PM] [INFO] - Compose ....................... Docker Compose version 2.37.1+ds1-0ubuntu2
+[Feb/24/2026 — 2:13 PM] [SUCCESS] - Environment verification passed
+[IMPORTANT] - Environment Verification: Ensuring Compatibility...
+[SUCCESS] - Environment Verification: Successful.
+[Feb/24/2026 — 2:13 PM] [STEP 2/6] - Updating Docker Compose
+[INFO] - Using Docker Compose plugin (v2) -- managed by package manager, skipping manual update
+[Feb/24/2026 — 2:13 PM] [STEP 3/6] - Cleaning up Docker resources
+[INFO] - Base directory set to: ./App-Data
+[SUCCESS] - No volume directories found in ./App-Data. Nothing to check.
+[Feb/24/2026 — 2:13 PM] [STEP 4/6] - Starting Docker service stacks
+[Feb/24/2026 — 2:13 PM] [ Docker Compose Updater ] - Docker Services Startup Initiated
+[Feb/24/2026 — 2:13 PM] [INFO] - Startup requested at: 2026-02-24 14:13:49
+[Feb/24/2026 — 2:13 PM] [INFO] - Healthcheck wait: DISABLED (fast startup mode)
+[Feb/24/2026 — 2:13 PM] [INFO] - Full system startup requested for all 10 service stacks
+[Feb/24/2026 — 2:13 PM] [FOCUS] - Beginning controlled Docker services startup...
+[Feb/24/2026 — 2:13 PM] [INFO] - Initiating startup of 10 Docker service stacks...
+================= SERVICE STARTUP SEQUENCE =================
+[Feb/24/2026 — 2:13 PM] [INFO] - Starting services in core-infrastructure stack...
+ Container skeleton-redis  Running
+[Feb/24/2026 — 2:13 PM] [TIMING] - stack_core-infrastructure completed in 0s
+[Feb/24/2026 — 2:13 PM] [SUCCESS] - core-infrastructure stack started successfully
+[Feb/24/2026 — 2:13 PM] [INFO] - Starting stacks [#####---------------------------------------------] 10%
+[Feb/24/2026 — 2:13 PM] [INFO] - Starting services in networking-security stack...
+ Container skeleton-whoami  Running
+[Feb/24/2026 — 2:13 PM] [TIMING] - stack_networking-security completed in 0s
+[Feb/24/2026 — 2:13 PM] [SUCCESS] - networking-security stack started successfully
+[Feb/24/2026 — 2:13 PM] [INFO] - Starting stacks [##########----------------------------------------] 20%
+[Feb/24/2026 — 2:13 PM] [INFO] - Starting services in monitoring-management stack...
+ Container skeleton-monitor  Running
+[Feb/24/2026 — 2:13 PM] [TIMING] - stack_monitoring-management completed in 0s
+[Feb/24/2026 — 2:13 PM] [SUCCESS] - monitoring-management stack started successfully
+[Feb/24/2026 — 2:13 PM] [INFO] - Starting stacks [###############-----------------------------------] 30%
+[Feb/24/2026 — 2:13 PM] [INFO] - Starting services in development-tools stack...
+ Container skeleton-devtools  Running
+[Feb/24/2026 — 2:13 PM] [TIMING] - stack_development-tools completed in 0s
+[Feb/24/2026 — 2:13 PM] [SUCCESS] - development-tools stack started successfully
+[Feb/24/2026 — 2:13 PM] [INFO] - Starting stacks [####################------------------------------] 40%
+[Feb/24/2026 — 2:13 PM] [INFO] - Starting services in media-services stack...
+ Container skeleton-media  Running
+[Feb/24/2026 — 2:13 PM] [TIMING] - stack_media-services completed in 0s
+[Feb/24/2026 — 2:13 PM] [SUCCESS] - media-services stack started successfully
+[Feb/24/2026 — 2:13 PM] [INFO] - Starting stacks [#########################-------------------------] 50%
+[Feb/24/2026 — 2:13 PM] [INFO] - Starting services in web-applications stack...
+ Container skeleton-webapp  Running
+[Feb/24/2026 — 2:13 PM] [TIMING] - stack_web-applications completed in 0s
+[Feb/24/2026 — 2:13 PM] [SUCCESS] - web-applications stack started successfully
+[Feb/24/2026 — 2:14 PM] [INFO] - Starting stacks [##############################--------------------] 60%
+[Feb/24/2026 — 2:14 PM] [INFO] - Starting services in storage-backup stack...
+ Container skeleton-storage  Running
+[Feb/24/2026 — 2:14 PM] [TIMING] - stack_storage-backup completed in 0s
+[Feb/24/2026 — 2:14 PM] [SUCCESS] - storage-backup stack started successfully
+[Feb/24/2026 — 2:14 PM] [INFO] - Starting stacks [###################################---------------] 70%
+[Feb/24/2026 — 2:14 PM] [INFO] - Starting services in communication-collaboration stack...
+ Container skeleton-comms  Running
+[Feb/24/2026 — 2:14 PM] [TIMING] - stack_communication-collaboration completed in 0s
+[Feb/24/2026 — 2:14 PM] [SUCCESS] - communication-collaboration stack started successfully
+[Feb/24/2026 — 2:14 PM] [INFO] - Starting stacks [########################################----------] 80%
+[Feb/24/2026 — 2:14 PM] [INFO] - Starting services in entertainment-personal stack...
+ Container skeleton-entertainment  Running
+[Feb/24/2026 — 2:14 PM] [TIMING] - stack_entertainment-personal completed in 0s
+[Feb/24/2026 — 2:14 PM] [SUCCESS] - entertainment-personal stack started successfully
+[Feb/24/2026 — 2:14 PM] [INFO] - Starting stacks [#############################################-----] 90%
+[Feb/24/2026 — 2:14 PM] [INFO] - Starting services in miscellaneous-services stack...
+ Container skeleton-misc  Running
+[Feb/24/2026 — 2:14 PM] [TIMING] - stack_miscellaneous-services completed in 0s
+[Feb/24/2026 — 2:14 PM] [SUCCESS] - miscellaneous-services stack started successfully
+[Feb/24/2026 — 2:14 PM] [INFO] - Starting stacks [##################################################] 100%
+===================== STARTUP SUMMARY =====================
++-----------------------------+--------+----------+
+| Stack                       | Status | Duration |
++-----------------------------+--------+----------+
+| core-infrastructure         | OK     | 0s       |
+| networking-security         | OK     | 0s       |
+| monitoring-management       | OK     | 0s       |
+| development-tools           | OK     | 0s       |
+| media-services              | OK     | 0s       |
+| web-applications            | OK     | 0s       |
+| storage-backup              | OK     | 0s       |
+| communication-collaboration | OK     | 0s       |
+| entertainment-personal      | OK     | 0s       |
+| miscellaneous-services      | OK     | 0s       |
++-----------------------------+--------+----------+
+[Feb/24/2026 — 2:14 PM] [INFO] - Total: 10 | Succeeded: 10 | Failed: 0
+[Feb/24/2026 — 2:14 PM] [SUCCESS] - All 10 service stacks started successfully
+==================== OPERATION COMPLETE ====================
+[Feb/24/2026 — 2:14 PM] [INFO] - Startup operation completed at: 2026-02-24 14:14:09
+[Feb/24/2026 — 2:14 PM] [SUCCESS] - Docker services startup completed successfully
+[Feb/24/2026 — 2:14 PM] [STEP 5/6] - Pulling and applying image updates
+[Feb/24/2026 — 2:14 PM] [FOCUS] - Starting intelligent Docker stack updates
+[Feb/24/2026 — 2:14 PM] [ Docker Compose Updater ] - Phase 1: Pulling latest images for all stacks
+[Feb/24/2026 — 2:14 PM] [STATUS] - Pulling images for 11 stacks in parallel
+[Feb/24/2026 — 2:14 PM] [ERROR] - test-stack — Failed to pull images
+[Feb/24/2026 — 2:14 PM] [SUCCESS] - web-applications — Images pulled successfully
+[Feb/24/2026 — 2:14 PM] [SUCCESS] - core-infrastructure — Images pulled successfully
+[Feb/24/2026 — 2:14 PM] [SUCCESS] - entertainment-personal — Images pulled successfully
+[Feb/24/2026 — 2:14 PM] [SUCCESS] - communication-collaboration — Images pulled successfully
+[Feb/24/2026 — 2:14 PM] [SUCCESS] - development-tools — Images pulled successfully
+[Feb/24/2026 — 2:14 PM] [SUCCESS] - monitoring-management — Images pulled successfully
+[Feb/24/2026 — 2:14 PM] [SUCCESS] - networking-security — Images pulled successfully
+[Feb/24/2026 — 2:14 PM] [SUCCESS] - media-services — Images pulled successfully
+[Feb/24/2026 — 2:14 PM] [SUCCESS] - storage-backup — Images pulled successfully
+[Feb/24/2026 — 2:14 PM] [SUCCESS] - miscellaneous-services — Images pulled successfully
+[Feb/24/2026 — 2:14 PM] [CAUTION] - 1 stacks failed to pull images, continuing with available images
+[Feb/24/2026 — 2:14 PM] [ Docker Compose Updater ] - Phase 2: Analyzing image changes and applying updates
+[Feb/24/2026 — 2:14 PM] [SUCCESS] - communication-collaboration — Already running latest images (1 containers)
+[Feb/24/2026 — 2:14 PM] [SUCCESS] - core-infrastructure — Already running latest images (1 containers)
+[Feb/24/2026 — 2:14 PM] [SUCCESS] - development-tools — Already running latest images (1 containers)
+[Feb/24/2026 — 2:14 PM] [SUCCESS] - entertainment-personal — Already running latest images (1 containers)
+[Feb/24/2026 — 2:14 PM] [SUCCESS] - media-services — Already running latest images (1 containers)
+[Feb/24/2026 — 2:14 PM] [SUCCESS] - miscellaneous-services — Already running latest images (1 containers)
+[Feb/24/2026 — 2:14 PM] [SUCCESS] - monitoring-management — Already running latest images (1 containers)
+[Feb/24/2026 — 2:14 PM] [SUCCESS] - networking-security — Already running latest images (1 containers)
+[Feb/24/2026 — 2:14 PM] [SUCCESS] - storage-backup — Already running latest images (1 containers)
+[Feb/24/2026 — 2:14 PM] [INFO] - test-stack — No running containers, images ready for next startup
+[Feb/24/2026 — 2:14 PM] [SUCCESS] - web-applications — Already running latest images (1 containers)
+[Feb/24/2026 — 2:14 PM] [ Docker Compose Updater ] - Phase 3: Cleaning up unused Docker images
+[Feb/24/2026 — 2:14 PM] [STATUS] - Removing dangling images
+[Feb/24/2026 — 2:14 PM] [STATUS] - Removing unused images older than 24 hours
+[Feb/24/2026 — 2:14 PM] [INFO] - No images cleaned up
+[Feb/24/2026 — 2:14 PM] [CONFIRMATION] - Docker stack update sequence completed
+[Feb/24/2026 — 2:14 PM] [ Docker Compose Updater ] - Update Summary Report
+[Feb/24/2026 — 2:14 PM] [SUCCESS] - Stacks up-to-date: 11
+[Feb/24/2026 — 2:14 PM] [INFO] - Space freed: 0B
+[Feb/24/2026 — 2:14 PM] [STEP 6/6] - Running post-startup health check
+[Feb/24/2026 — 2:14 PM] [INFO] - Waiting 10s for services to stabilize...
+[Feb/24/2026 — 2:14 PM] [INFO] - Starting REST API server on 127.0.0.1:9876...
+[Feb/24/2026 — 2:14 PM] [SUCCESS] - REST API server started (daemon mode)
+[Feb/24/2026 — 2:14 PM] [TIMING] - full_startup completed in 38s
+
++--------------------------+-----------------+
+| Session Summary          |                 |
++--------------------------+-----------------+
+| Duration                 | 38s             |
+| Total Log Entries        | 107             |
+| Errors                   | 1               |
+| Warnings                 | 1               |
+| Status                   | ERRORS          |
++--------------------------+-----------------+
+[INFO] - Logger session ended (Duration: 38s)
+
+--- Session Ended: 2026-02-24 14:14:26 (Duration: 38s) ---
+

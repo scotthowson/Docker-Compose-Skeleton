@@ -1,0 +1,38 @@
+{
+  "name": "traefik",
+  "title": "Traefik Reverse Proxy",
+  "description": "Modern reverse proxy and load balancer with automatic SSL, Docker integration, and Cloudflare DNS support. Includes Docker Socket Proxy for secure Docker API access.",
+  "category": "web",
+  "icon": "🔀",
+  "tags": ["reverse-proxy", "ssl", "lets-encrypt", "cloudflare", "docker"],
+  "variables": [
+    {
+      "name": "TRAEFIK_PORT_HTTP",
+      "label": "HTTP Port",
+      "description": "Port exposed on the host for HTTP traffic",
+      "default": "80",
+      "required": false
+    },
+    {
+      "name": "TRAEFIK_PORT_HTTPS",
+      "label": "HTTPS Port",
+      "description": "Port exposed on the host for HTTPS traffic",
+      "default": "443",
+      "required": false
+    },
+    {
+      "name": "TRAEFIK_PORT_DASHBOARD",
+      "label": "Dashboard Port",
+      "description": "Port exposed on the host for the Traefik dashboard",
+      "default": "8080",
+      "required": false
+    },
+    {
+      "name": "CF_DNS_API_TOKEN",
+      "label": "Cloudflare DNS API Token",
+      "description": "Cloudflare DNS API token for ACME",
+      "default": "",
+      "required": false
+    }
+  ]
+}

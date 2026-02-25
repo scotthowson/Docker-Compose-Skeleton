@@ -1,0 +1,17 @@
+{
+  "name": "prometheus",
+  "title": "Prometheus",
+  "description": "Prometheus time-series metrics collection and alerting system",
+  "category": "monitoring",
+  "icon": "🔥",
+  "tags": ["monitoring", "metrics", "time-series", "alerting", "prometheus"],
+  "variables": [
+    {
+      "name": "HOST_PORT",
+      "label": "Web UI Port",
+      "description": "Port exposed on the host for the Prometheus web interface",
+      "default": "9090",
+      "required": false
+    }
+  ]
+}
