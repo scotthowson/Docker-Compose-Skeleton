@@ -3,6 +3,7 @@
   "title": "Docker Socket Proxy",
   "description": "Secure Docker socket proxy that restricts API access to read-only operations, protecting your Docker daemon from unauthorized commands.",
   "category": "web",
+  "target_stack": "core-infrastructure",
   "icon": "🔒",
   "tags": ["docker", "socket", "proxy", "security"],
   "variables": [

@@ -398,16 +398,62 @@ echo ""
 if [[ "$DRY_RUN" == "true" ]]; then
     _info "This was a DRY RUN -- no changes were made"
     _info "Remove --dry-run to apply changes"
-elif [[ "$docker_ok" == "true" ]]; then
-    _ok "Everything is configured and ready"
     echo ""
-    _info "Next steps:"
-    _info "  1. Edit ${C_BOLD}.env${C_RESET} with your server settings"
-    _info "  2. Configure your stacks in ${C_BOLD}Stacks/*/${C_RESET}"
-    _info "  3. Run ${C_BOLD}./start.sh${C_RESET} to launch all services"
-else
+    exit 0
+elif [[ "$docker_ok" != "true" ]]; then
     _fail "Setup completed with warnings (Docker issues above)"
     _info "Resolve the Docker issues above, then run ./start.sh"
+    echo ""
+    exit 1
 fi
 
+_ok "Everything is configured and ready"
 echo ""
+
+# =============================================================================
+# STEP 7: Setup Wizard — Launch API for remote configuration
+# =============================================================================
+
+SETUP_COMPLETE_MARKER="$BASE_DIR/.api-auth/.setup-complete"
+
+if [[ -f "$SETUP_COMPLETE_MARKER" ]]; then
+    _info "Setup already complete. Run ${C_BOLD}./start.sh${C_RESET} to launch all services."
+    echo ""
+    exit 0
+fi
+
+_header "Step 7/7: Setup Wizard"
+_divider
+echo ""
+
+# Detect host IP for the connection banner
+_detect_ip() {
+    local ip
+    ip=$(ip route get 1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if ($i=="src") print $(i+1)}' | head -1)
+    [[ -n "$ip" ]] && { echo "$ip"; return; }
+    ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+    [[ -n "$ip" ]] && { echo "$ip"; return; }
+    echo "localhost"
+}
+
+HOST_IP=$(_detect_ip)
+API_PORT="${API_PORT:-9876}"
+
+echo ""
+echo -e "${C_BOLD}${C_CYAN}  ╔═══════════════════════════════════════════════════════╗${C_RESET}"
+echo -e "${C_BOLD}${C_CYAN}  ║                                                       ║${C_RESET}"
+echo -e "${C_BOLD}${C_CYAN}  ║          Setup API is ready!                           ║${C_RESET}"
+echo -e "${C_BOLD}${C_CYAN}  ║                                                       ║${C_RESET}"
+echo -e "${C_BOLD}${C_CYAN}  ║   Open DCS Manager and connect to:                    ║${C_RESET}"
+echo -e "${C_BOLD}${C_GREEN}  ║   http://${HOST_IP}:${API_PORT}$(printf '%*s' $((28 - ${#HOST_IP} - ${#API_PORT})) '')║${C_RESET}"
+echo -e "${C_BOLD}${C_CYAN}  ║                                                       ║${C_RESET}"
+echo -e "${C_BOLD}${C_CYAN}  ║   Press Ctrl+C to stop the setup server               ║${C_RESET}"
+echo -e "${C_BOLD}${C_CYAN}  ║                                                       ║${C_RESET}"
+echo -e "${C_BOLD}${C_CYAN}  ╚═══════════════════════════════════════════════════════╝${C_RESET}"
+echo ""
+
+_info "Starting API server in setup mode..."
+echo ""
+
+# Launch API in foreground so Ctrl+C stops it cleanly
+exec "$BASE_DIR/.scripts/api-server.sh" --bind 0.0.0.0 --port "$API_PORT" --setup-mode

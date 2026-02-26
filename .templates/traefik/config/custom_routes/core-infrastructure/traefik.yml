@@ -1,0 +1,32 @@
+# =============================================================================
+# Traefik Dashboard Route — core-infrastructure
+# =============================================================================
+# Example route file showing the pattern for per-service routing.
+# Place one .yml file per service in the matching stack category directory.
+# Template variables are substituted at deploy time.
+#
+# Route files in custom_routes/ are auto-discovered by the Traefik file
+# provider — changes are picked up within seconds (no restart needed).
+# =============================================================================
+
+http:
+  routers:
+    traefik-router:
+      entryPoints:
+        - "websecure"
+      rule: "Host(`traefik.${TRAEFIK_DOMAIN}`)"
+      service: "traefik"
+      middlewares:
+        - "traefik-chain"
+        # Uncomment after deploying Authelia:
+        # - "authelia-middlewares"
+        # Uncomment after enabling geoblock plugin:
+        # - "my-geoblock"
+      tls:
+        certResolver: "letsencrypt"
+
+  services:
+    traefik:
+      loadBalancer:
+        servers:
+          - url: "http://Traefik:8080"

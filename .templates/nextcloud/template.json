@@ -3,6 +3,7 @@
   "title": "Nextcloud",
   "description": "Nextcloud self-hosted file storage, sync, and collaboration platform",
   "category": "storage",
+  "target_stack": "storage-backup",
   "icon": "☁️",
   "tags": ["storage", "file-sync", "collaboration", "cloud", "nextcloud"],
   "variables": [

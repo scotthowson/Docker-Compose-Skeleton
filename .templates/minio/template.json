@@ -3,6 +3,7 @@
   "title": "MinIO Object Storage",
   "description": "MinIO high-performance S3-compatible object storage server",
   "category": "storage",
+  "target_stack": "storage-backup",
   "icon": "🪣",
   "tags": ["storage", "object-storage", "s3", "compatible", "minio"],
   "variables": [

@@ -1,9 +1,10 @@
 {
   "name": "nginx-proxy-manager",
   "title": "Nginx Proxy Manager",
-  "description": "Nginx Proxy Manager with a web-based UI for managing reverse proxies, SSL certificates, and redirections",
+  "description": "Full-featured reverse proxy manager with a beautiful web UI for managing SSL certificates, proxy hosts, redirections, and access lists. Includes optional MariaDB backend for production deployments.",
   "category": "web",
-  "icon": "🌐",
+  "target_stack": "networking-security",
+  "icon": "\ud83c\udf10",
   "tags": ["web", "reverse-proxy", "ssl", "nginx", "proxy-manager"],
   "variables": [
     {
@@ -25,6 +26,13 @@
       "label": "Admin UI Port",
       "description": "Port for the Nginx Proxy Manager admin web interface",
       "default": "81",
+      "required": false
+    },
+    {
+      "name": "NPM_DB_PASSWORD",
+      "label": "Database Password",
+      "description": "Password for the MariaDB database used by NPM. Leave empty to use SQLite instead.",
+      "default": "",
       "required": false
     }
   ]

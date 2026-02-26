@@ -3,6 +3,7 @@
   "title": "Prometheus",
   "description": "Prometheus time-series metrics collection and alerting system",
   "category": "monitoring",
+  "target_stack": "monitoring-management",
   "icon": "🔥",
   "tags": ["monitoring", "metrics", "time-series", "alerting", "prometheus"],
   "variables": [
