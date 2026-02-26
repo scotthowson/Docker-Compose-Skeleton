@@ -109,6 +109,21 @@ fi
 # Example: API_IP_WHITELIST="192.168.1.0/24,10.0.0.5"
 API_IP_WHITELIST="${API_IP_WHITELIST:-}"
 
+# PBKDF2 password hashing iterations
+API_PBKDF2_ITERATIONS="${API_PBKDF2_ITERATIONS:-100000}"
+
+# CORS allowed origins (comma-separated, empty = localhost only)
+API_CORS_ORIGINS="${API_CORS_ORIGINS:-}"
+
+# Whether the API runs behind a TLS-terminating proxy (enables HSTS header)
+API_BEHIND_TLS_PROXY="${API_BEHIND_TLS_PROXY:-false}"
+
+# Single-session enforcement (revoke old tokens on new login)
+API_SINGLE_SESSION="${API_SINGLE_SESSION:-true}"
+
+# Request body size limit (bytes) — 1 MB default
+API_MAX_BODY_SIZE="${API_MAX_BODY_SIZE:-1048576}"
+
 # Global rate limiting — max requests per minute per IP (0 = disabled)
 API_RATE_LIMIT="${API_RATE_LIMIT:-120}"
 API_RATE_WINDOW="${API_RATE_WINDOW:-60}"  # window in seconds
@@ -139,6 +154,7 @@ fi
 DAEMON_MODE=false
 STOP_SERVER=false
 HANDLE_REQUEST=false
+SETUP_MODE=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -147,6 +163,7 @@ while [[ $# -gt 0 ]]; do
         --bind)    API_BIND="$2"; shift 2 ;;
         --daemon)  DAEMON_MODE=true; shift ;;
         --stop)    STOP_SERVER=true; shift ;;
+        --setup-mode) SETUP_MODE=true; shift ;;
         --help|-h)
             cat <<EOF
 Docker Compose Skeleton — REST API Server v${API_VERSION}
@@ -242,6 +259,44 @@ _api_json_escape() {
     printf '%s' "$str"
 }
 
+# Validate a request Origin against the CORS whitelist
+# Returns the origin if allowed, empty if not
+_api_cors_origin() {
+    local origin="${REQUEST_ORIGIN_HEADER:-}"
+    [[ -z "$origin" ]] && return 0  # No Origin header = same-origin, no CORS needed
+
+    # In setup mode before initialization, allow ALL origins so the Electron
+    # app can connect from any IP without pre-configuring CORS
+    if [[ "$SETUP_MODE" == "true" ]] && ! _api_is_initialized; then
+        echo "$origin"
+        return 0
+    fi
+
+    # Always allow any localhost / 127.0.0.1 origin (any port)
+    # This covers Vite dev (5173/5174+), Electron, and any local tooling
+    case "$origin" in
+        http://localhost|http://localhost:*|https://localhost|https://localhost:*|\
+        http://127.0.0.1|http://127.0.0.1:*|https://127.0.0.1|https://127.0.0.1:*|\
+        capacitor://localhost)
+            echo "$origin"
+            return 0
+            ;;
+    esac
+
+    # Check user-configured origins
+    if [[ -n "$API_CORS_ORIGINS" ]]; then
+        local IFS=','
+        local entry
+        for entry in $API_CORS_ORIGINS; do
+            entry="${entry## }"  # trim leading space
+            entry="${entry%% }"  # trim trailing space
+            [[ -n "$entry" && "$origin" == "$entry" ]] && { echo "$origin"; return 0; }
+        done
+    fi
+
+    return 0  # Return empty (no echo) — origin not allowed
+}
+
 # Build a standard JSON response envelope
 _api_response() {
     local status_code="$1"
@@ -257,6 +312,7 @@ _api_response() {
         404) status_text="Not Found" ;;
         405) status_text="Method Not Allowed" ;;
         409) status_text="Conflict" ;;
+        413) status_text="Payload Too Large" ;;
         429) status_text="Too Many Requests" ;;
         500) status_text="Internal Server Error" ;;
     esac
@@ -268,9 +324,29 @@ _api_response() {
     printf "HTTP/1.1 %s %s\r\n" "$status_code" "$status_text"
     printf "Content-Type: application/json; charset=utf-8\r\n"
     printf "Content-Length: %d\r\n" "$content_length"
-    printf "Access-Control-Allow-Origin: *\r\n"
-    printf "Access-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\n"
-    printf "Access-Control-Allow-Headers: Content-Type, Authorization\r\n"
+
+    # Dynamic CORS — only emit for whitelisted origins
+    local cors_origin
+    cors_origin=$(_api_cors_origin)
+    if [[ -n "$cors_origin" ]]; then
+        printf "Access-Control-Allow-Origin: %s\r\n" "$cors_origin"
+        printf "Access-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\n"
+        printf "Access-Control-Allow-Headers: Content-Type, Authorization\r\n"
+        printf "Access-Control-Allow-Private-Network: true\r\n"
+        printf "Vary: Origin\r\n"
+    fi
+
+    # Security headers
+    printf "X-Content-Type-Options: nosniff\r\n"
+    printf "X-Frame-Options: DENY\r\n"
+    printf "Cache-Control: no-store, no-cache, must-revalidate, private\r\n"
+    printf "Pragma: no-cache\r\n"
+    printf "Content-Security-Policy: default-src 'none'; frame-ancestors 'none'\r\n"
+    printf "Referrer-Policy: no-referrer\r\n"
+    if [[ "$API_BEHIND_TLS_PROXY" == "true" ]]; then
+        printf "Strict-Transport-Security: max-age=31536000\r\n"
+    fi
+
     printf "X-API-Version: %s\r\n" "$API_VERSION"
     printf "Connection: close\r\n"
     printf "\r\n"
@@ -308,6 +384,8 @@ _api_parse_query() {
             local key="${pair%%=*}"
             local value="${pair#*=}"
             value="${value//+/ }"
+            # URL-decode percent-encoded characters
+            value=$(printf '%b' "${value//%/\\x}")
             QUERY_PARAMS["$key"]="$value"
         done
     fi
@@ -316,6 +394,14 @@ _api_parse_query() {
 # =============================================================================
 # AUTHENTICATION HELPERS
 # =============================================================================
+
+# Auth audit log — append-only structured log for security events
+_api_audit_log() {
+    local ip="$1" event="$2" username="${3:-}" detail="${4:-}"
+    printf '%s | %-15s | %-14s | %-15s | %s\n' \
+        "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$ip" "$event" "$username" "$detail" \
+        >> "${API_AUTH_DIR}/auth-audit.log" 2>/dev/null
+}
 
 # Initialize auth data directory and files
 _api_init_auth_dir() {
@@ -329,11 +415,54 @@ _api_init_auth_dir() {
     [[ ! -f "$API_AUTH_DIR/rate_limits.json" ]] && echo '{}' > "$API_AUTH_DIR/rate_limits.json"
 }
 
-# Hash a password with a given salt using SHA-256
+# Hash a password with a given salt using SHA-256 (v1 — legacy, kept for verifying old hashes)
 _api_hash_password() {
     local salt="$1"
     local password="$2"
     echo -n "${salt}${password}" | sha256sum | cut -d' ' -f1
+}
+
+# Hash a password with PBKDF2-SHA256 (v2 — secure, requires python3)
+_api_hash_password_v2() {
+    local salt="$1" password="$2" iters="${API_PBKDF2_ITERATIONS:-100000}"
+    python3 -c "
+import hashlib, sys
+print(hashlib.pbkdf2_hmac(
+    'sha256',
+    sys.argv[1].encode(),
+    bytes.fromhex(sys.argv[2]),
+    int(sys.argv[3])
+).hex())
+" "$password" "$salt" "$iters"
+}
+
+# Verify a password against a stored hash, dispatching to v1 or v2 based on hash_version
+_api_verify_password() {
+    local password="$1" stored_hash="$2" stored_salt="$3" hash_version="${4:-1}"
+    local computed_hash
+    if [[ "$hash_version" == "2" ]]; then
+        computed_hash=$(_api_hash_password_v2 "$stored_salt" "$password")
+    else
+        computed_hash=$(_api_hash_password "$stored_salt" "$password")
+    fi
+    [[ "$computed_hash" == "$stored_hash" ]]
+}
+
+# Update a user's password hash in users.json (for transparent migration)
+_api_update_user_hash() {
+    local username="$1" new_hash="$2" new_salt="$3" new_version="$4"
+    local users
+    users=$(_api_read_auth_file "users.json")
+    if command -v jq >/dev/null 2>&1; then
+        local new_users
+        new_users=$(echo "$users" | jq \
+            --arg u "$username" \
+            --arg h "$new_hash" \
+            --arg s "$new_salt" \
+            --argjson v "$new_version" \
+            '[.[] | if .username == $u then . + {"password_hash": $h, "salt": $s, "hash_version": $v} else . end]' 2>/dev/null)
+        _api_write_auth_file "users.json" "$new_users"
+    fi
 }
 
 # Generate a random token
@@ -401,6 +530,23 @@ _api_user_exists() {
     return 1
 }
 
+# Setup wizard state
+SETUP_COMPLETE_MARKER="$API_AUTH_DIR/.setup-complete"
+
+# Check if server is fully initialized (users exist AND setup marker present)
+_api_is_initialized() {
+    [[ "$(_api_user_count)" -gt 0 ]] && [[ -f "$SETUP_COMPLETE_MARKER" ]]
+}
+
+# Gate for setup-only endpoints — returns 1 (and sends 403) if setup is already done
+_api_require_setup_mode() {
+    if _api_is_initialized; then
+        _api_error 403 "Setup already complete"
+        return 1
+    fi
+    return 0
+}
+
 # Get user count
 _api_user_count() {
     local users
@@ -421,7 +567,7 @@ _api_get_user() {
     echo "$users" | jq -r --arg u "$username" '.[] | select(.username == $u)' 2>/dev/null
 }
 
-# Add a user record
+# Add a user record (always v2 hash)
 _api_add_user() {
     local username="$1" password_hash="$2" salt="$3" role="$4"
     local created_at
@@ -436,11 +582,11 @@ _api_add_user() {
             --arg s "$salt" \
             --arg r "$role" \
             --arg c "$created_at" \
-            '. + [{"username": $u, "password_hash": $h, "salt": $s, "role": $r, "created_at": $c}]' 2>/dev/null)
+            '. + [{"username": $u, "password_hash": $h, "salt": $s, "role": $r, "created_at": $c, "hash_version": 2}]' 2>/dev/null)
         _api_write_auth_file "users.json" "$new_users"
     else
         # Fallback: manual JSON construction
-        local entry="{\"username\": \"$username\", \"password_hash\": \"$password_hash\", \"salt\": \"$salt\", \"role\": \"$role\", \"created_at\": \"$created_at\"}"
+        local entry="{\"username\": \"$username\", \"password_hash\": \"$password_hash\", \"salt\": \"$salt\", \"role\": \"$role\", \"created_at\": \"$created_at\", \"hash_version\": 2}"
         if [[ "$users" == "[]" ]]; then
             _api_write_auth_file "users.json" "[$entry]"
         else
@@ -451,9 +597,15 @@ _api_add_user() {
     fi
 }
 
-# Store a session token
+# Store a session token (enforces single-session when enabled)
 _api_store_token() {
     local token="$1" username="$2" role="$3"
+
+    # Single-session enforcement: revoke all existing tokens for this user
+    if [[ "${API_SINGLE_SESSION:-true}" == "true" ]]; then
+        _api_revoke_user_tokens "$username"
+    fi
+
     local now
     now=$(_api_now_epoch)
     local expires_at=$(( now + API_TOKEN_EXPIRY ))
@@ -659,6 +811,66 @@ _api_check_auth() {
 # Check if authenticated user is admin — call after _api_check_auth
 _api_check_admin() {
     if [[ "${AUTH_ROLE:-}" != "admin" ]]; then
+        return 1
+    fi
+    return 0
+}
+
+# Validate a stack name — rejects path traversal, shell metacharacters, etc.
+# Returns 0 if valid, 1 if invalid (and sends 400 error response)
+_api_validate_stack_name() {
+    local name="$1"
+    if [[ -z "$name" ]]; then
+        _api_error 400 "Stack name is required"
+        return 1
+    fi
+    # Reject path separators, parent traversal, leading dots
+    # Note: null byte check removed — bash strings cannot contain \0, and $'\0' in [[ ]]
+    # degrades to an empty string making the pattern ** which matches everything
+    if [[ "$name" == *"/"* ]] || [[ "$name" == *".."* ]] || [[ "$name" == "."* ]]; then
+        _api_error 400 "Invalid stack name"
+        return 1
+    fi
+    # Enforce safe pattern: alphanumeric start, then alphanumeric/underscore/hyphen
+    if [[ ! "$name" =~ ^[a-zA-Z0-9][a-zA-Z0-9_-]*$ ]]; then
+        _api_error 400 "Invalid stack name"
+        return 1
+    fi
+    # Final realpath check — resolved path must stay within COMPOSE_DIR
+    local resolved
+    resolved=$(realpath -m "$COMPOSE_DIR/$name" 2>/dev/null)
+    if [[ "$resolved" != "$COMPOSE_DIR/$name" ]] && [[ "$resolved" != "$COMPOSE_DIR/"* ]]; then
+        _api_error 400 "Invalid stack name"
+        return 1
+    fi
+    return 0
+}
+
+# Validate a resource name (container, network, volume, image, template, etc.)
+# Returns 0 if valid, 1 if invalid (and sends 400 error response)
+_api_validate_resource_name() {
+    local name="$1" resource_type="${2:-resource}"
+    if [[ -z "$name" ]]; then
+        _api_error 400 "${resource_type} name is required"
+        return 1
+    fi
+    # Reject path traversal and shell metacharacters
+    # Note: null byte check removed — bash strings cannot contain \0, and $'\0' in [[ ]]
+    # degrades to an empty string making the pattern ** which matches everything
+    if [[ "$name" == *".."* ]] || [[ "$name" == *"/"* ]]; then
+        _api_error 400 "Invalid ${resource_type} name"
+        return 1
+    fi
+    # shellcheck disable=SC1003
+    case "$name" in
+        *';'*|*'|'*|*'`'*|*'$('*|*'&'*|*'>'*|*'<'*)
+            _api_error 400 "Invalid ${resource_type} name"
+            return 1
+            ;;
+    esac
+    # Enforce safe pattern: alphanumeric start, then alphanumeric/dot/underscore/hyphen/colon
+    if [[ ! "$name" =~ ^[a-zA-Z0-9][a-zA-Z0-9._:/-]*$ ]]; then
+        _api_error 400 "Invalid ${resource_type} name"
         return 1
     fi
     return 0
@@ -908,7 +1120,7 @@ _api_container_json() {
     fi
 
     local ports
-    ports=$(_api_json_escape "$(docker inspect --format='{{range $p, $conf := .NetworkSettings.Ports}}{{$p}}->{{range $conf}}{{.HostPort}}{{end}} {{end}}' "$container_id" 2>/dev/null)")
+    ports=$(_api_json_escape "$(docker inspect --format='{{range $p, $conf := .NetworkSettings.Ports}}{{if $conf}}{{range $i, $b := $conf}}{{if $i}}, {{end}}{{if $b.HostIp}}{{$b.HostIp}}{{else}}0.0.0.0{{end}}:{{$b.HostPort}}->{{$p}}{{end}}{{end}}{{end}}' "$container_id" 2>/dev/null)")
 
     local restart_count
     restart_count=$(docker inspect --format='{{.RestartCount}}' "$container_id" 2>/dev/null)
@@ -948,7 +1160,7 @@ handle_root() {
     {"method": "POST", "path": "/stacks/:name/restart",      "description": "Restart a stack"},
     {"method": "POST", "path": "/stacks/:name/update",       "description": "Pull, detect, recreate"},
     {"method": "GET",  "path": "/images",                    "description": "All images with metadata"},
-    {"method": "GET",  "path": "/images/stale",              "description": "Only stale images (>30d)"},
+    {"method": "GET",  "path": "/images/stale",              "description": "Only stale images older than 30 days"},
     {"method": "GET",  "path": "/containers",                "description": "All containers with status"},
     {"method": "GET",  "path": "/containers/:name",          "description": "Detailed container info"},
     {"method": "GET",  "path": "/containers/:name/stats",    "description": "Live resource stats"},
@@ -960,6 +1172,12 @@ handle_root() {
     {"method": "GET",  "path": "/logs",                      "description": "Framework log tail"},
     {"method": "GET",  "path": "/events",                    "description": "Recent Docker events"},
     {"method": "GET",  "path": "/version",                   "description": "Version information"},
+    {"method": "GET",    "path": "/setup/status",             "description": "Check if server needs first-run setup", "auth": false},
+    {"method": "GET",    "path": "/setup/defaults",           "description": "Get setup defaults and system info", "auth": false},
+    {"method": "POST",   "path": "/setup/configure",          "description": "Apply setup configuration", "auth": true},
+    {"method": "POST",   "path": "/setup/complete",            "description": "Finalize first-run setup", "auth": true},
+    {"method": "POST",   "path": "/stacks/rename",             "description": "Rename a stack directory", "auth": "admin"},
+    {"method": "POST",   "path": "/stacks/reorder",            "description": "Set stack startup order", "auth": "admin"},
     {"method": "POST",   "path": "/auth/setup",              "description": "Create first admin account", "auth": false},
     {"method": "POST",   "path": "/auth/login",              "description": "Authenticate and get token", "auth": false},
     {"method": "POST",   "path": "/auth/register",           "description": "Register with invite code", "auth": false},
@@ -1313,6 +1531,8 @@ handle_stack_compose_save() {
     local body="$2"
     local compose_file="$COMPOSE_DIR/$stack/docker-compose.yml"
 
+    if ! _api_check_admin; then _api_error 403 "Admin access required"; return; fi
+
     if [[ ! -d "$COMPOSE_DIR/$stack" ]]; then
         _api_error 404 "Stack not found: $stack"
         return
@@ -1422,6 +1642,8 @@ handle_stack_env_save() {
     local stack="$1"
     local body="$2"
     local env_file="$COMPOSE_DIR/$stack/.env"
+
+    if ! _api_check_admin; then _api_error 403 "Admin access required"; return; fi
 
     if [[ ! -d "$COMPOSE_DIR/$stack" ]]; then
         _api_error 404 "Stack not found: $stack"
@@ -1595,16 +1817,28 @@ handle_container_detail() {
     local full_json
     full_json=$(_api_container_json "$cid")
 
-    # Add extra detail: environment, mounts, networks
-    local env_json mounts_json networks_json
-    env_json=$(_api_json_escape "$(docker inspect --format='{{range .Config.Env}}{{.}} {{end}}' "$name" 2>/dev/null)")
-    mounts_json=$(_api_json_escape "$(docker inspect --format='{{range .Mounts}}{{.Source}}:{{.Destination}} {{end}}' "$name" 2>/dev/null)")
-    networks_json=$(_api_json_escape "$(docker inspect --format='{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}' "$name" 2>/dev/null)")
+    # Add extra detail: environment, mounts, networks, IP addresses
+    local env_json mounts_json networks_json ip_json
+    env_json=$(_api_json_escape "$(docker inspect --format='{{range .Config.Env}}{{.}}
+{{end}}' "$name" 2>/dev/null)")
+    mounts_json=$(_api_json_escape "$(docker inspect --format='{{range .Mounts}}{{.Source}}:{{.Destination}}{{if .Mode}}:{{.Mode}}{{end}}
+{{end}}' "$name" 2>/dev/null)")
+    networks_json=$(_api_json_escape "$(docker inspect --format='{{range $k, $v := .NetworkSettings.Networks}}{{$k}}
+{{end}}' "$name" 2>/dev/null)")
+    ip_json=$(_api_json_escape "$(docker inspect --format='{{range $k, $v := .NetworkSettings.Networks}}{{$k}}={{$v.IPAddress}}
+{{end}}' "$name" 2>/dev/null)")
+
+    # Platform, restart policy, hostname, working dir
+    local platform hostname workdir restart_policy
+    platform=$(docker inspect --format='{{.Platform}}' "$name" 2>/dev/null)
+    hostname=$(docker inspect --format='{{.Config.Hostname}}' "$name" 2>/dev/null)
+    workdir=$(docker inspect --format='{{.Config.WorkingDir}}' "$name" 2>/dev/null)
+    restart_policy=$(docker inspect --format='{{.HostConfig.RestartPolicy.Name}}' "$name" 2>/dev/null)
 
     # Reconstruct with extra fields
     # Remove closing brace and append
     full_json="${full_json%\}}"
-    full_json+=", \"environment\": \"$env_json\", \"mounts\": \"$mounts_json\", \"networks\": \"$networks_json\"}"
+    full_json+=", \"environment\": \"$env_json\", \"mounts\": \"$mounts_json\", \"networks\": \"$networks_json\", \"ip_addresses\": \"$(_api_json_escape "$ip_json")\", \"platform\": \"$(_api_json_escape "${platform:-linux}")\", \"hostname\": \"$(_api_json_escape "$hostname")\", \"working_dir\": \"$(_api_json_escape "$workdir")\", \"restart_policy\": \"$(_api_json_escape "$restart_policy")\"}"
 
     _api_success "$full_json"
 }
@@ -1871,6 +2105,8 @@ handle_create_network() {
 handle_delete_network() {
     local name="$1"
 
+    if ! _api_check_admin; then _api_error 403 "Admin access required"; return; fi
+
     if [[ -z "$name" ]]; then
         _api_error 400 "Network name is required"
         return
@@ -1988,6 +2224,8 @@ handle_network_detail() {
 
 handle_delete_volume() {
     local name="$1"
+
+    if ! _api_check_admin; then _api_error 403 "Admin access required"; return; fi
 
     if [[ -z "$name" ]]; then
         _api_error 400 "Volume name is required"
@@ -2175,9 +2413,12 @@ handle_auth_setup() {
     local salt
     salt=$(_api_generate_salt)
     local password_hash
-    password_hash=$(_api_hash_password "$salt" "$password")
+    password_hash=$(_api_hash_password_v2 "$salt" "$password")
 
     _api_add_user "$username" "$password_hash" "$salt" "admin"
+
+    local client_ip="${SOCAT_PEERADDR:-unknown}"
+    _api_audit_log "$client_ip" "SETUP" "$username" "Admin account created"
 
     local token
     token=$(_api_generate_token)
@@ -2195,6 +2436,7 @@ handle_auth_login() {
     # Rate limit check (use SOCAT_PEERADDR if available, fallback to "unknown")
     local client_ip="${SOCAT_PEERADDR:-unknown}"
     if ! _api_check_rate_limit "$client_ip"; then
+        _api_audit_log "$client_ip" "LOCKOUT" "" "Rate limit lockout triggered"
         _api_error 429 "Too many failed login attempts. Please try again later."
         return
     fi
@@ -2228,23 +2470,23 @@ handle_auth_login() {
         return
     fi
 
-    local stored_hash stored_salt role
+    local stored_hash stored_salt role hash_version
     if command -v jq >/dev/null 2>&1; then
         stored_hash=$(echo "$user_record" | jq -r '.password_hash' 2>/dev/null)
         stored_salt=$(echo "$user_record" | jq -r '.salt' 2>/dev/null)
         role=$(echo "$user_record" | jq -r '.role' 2>/dev/null)
+        hash_version=$(echo "$user_record" | jq -r '.hash_version // 1' 2>/dev/null)
     else
         stored_hash=$(echo "$user_record" | sed -n 's/.*"password_hash" *: *"\([^"]*\)".*/\1/p')
         stored_salt=$(echo "$user_record" | sed -n 's/.*"salt" *: *"\([^"]*\)".*/\1/p')
         role=$(echo "$user_record" | sed -n 's/.*"role" *: *"\([^"]*\)".*/\1/p')
+        hash_version="1"
     fi
 
-    # Verify password
-    local computed_hash
-    computed_hash=$(_api_hash_password "$stored_salt" "$password")
-
-    if [[ "$computed_hash" != "$stored_hash" ]]; then
+    # Verify password (dispatches to v1 or v2 based on hash_version)
+    if ! _api_verify_password "$password" "$stored_hash" "$stored_salt" "$hash_version"; then
         _api_record_failed_login "$client_ip"
+        _api_audit_log "$client_ip" "LOGIN_FAIL" "$username" "Invalid password"
         _api_error 401 "Invalid username or password"
         return
     fi
@@ -2252,8 +2494,18 @@ handle_auth_login() {
     # Success — reset rate limit and create token
     _api_reset_rate_limit "$client_ip"
 
+    # Transparent migration: upgrade v1 hashes to v2 (PBKDF2)
+    if [[ "$hash_version" != "2" ]]; then
+        local new_salt new_hash
+        new_salt=$(_api_generate_salt)
+        new_hash=$(_api_hash_password_v2 "$new_salt" "$password")
+        _api_update_user_hash "$username" "$new_hash" "$new_salt" 2
+    fi
+
     # Clean up expired tokens periodically
     _api_cleanup_expired_tokens
+
+    _api_audit_log "$client_ip" "LOGIN_OK" "$username" "Login successful"
 
     local token
     token=$(_api_generate_token)
@@ -2290,9 +2542,12 @@ handle_auth_invite() {
     local code
     code=$(_api_generate_token)
     # Use a shorter invite code (first 16 chars)
-    code="${code:0:16}"
+    code="${code:0:32}"
 
     _api_store_invite "$code" "$role" "${AUTH_USERNAME:-unknown}"
+
+    local client_ip="${SOCAT_PEERADDR:-unknown}"
+    _api_audit_log "$client_ip" "INVITE_CREATE" "${AUTH_USERNAME:-unknown}" "Role: $role"
 
     local now
     now=$(_api_now_epoch)
@@ -2355,16 +2610,19 @@ handle_auth_register() {
         return
     fi
 
-    # Create user
+    # Create user (v2 PBKDF2 hash)
     local salt
     salt=$(_api_generate_salt)
     local password_hash
-    password_hash=$(_api_hash_password "$salt" "$password")
+    password_hash=$(_api_hash_password_v2 "$salt" "$password")
 
     _api_add_user "$username" "$password_hash" "$salt" "$role"
 
     # Consume the invite code
     _api_consume_invite "$invite_code" "$username"
+
+    local client_ip="${SOCAT_PEERADDR:-unknown}"
+    _api_audit_log "$client_ip" "REGISTER" "$username" "Registered with invite code"
 
     # Generate session token
     local token
@@ -2415,8 +2673,10 @@ handle_auth_users() {
         safe_users=$(echo "$users" | jq '[.[] | {username: .username, role: .role, created_at: .created_at}]' 2>/dev/null)
         _api_success "{\"users\": $safe_users}"
     else
-        # Fallback: return raw but note it may contain hashes
-        _api_success "{\"users\": $users}"
+        # Fallback without jq: manually strip sensitive fields via sed
+        local safe_users
+        safe_users=$(echo "$users" | sed 's/"password_hash" *: *"[^"]*" *,//g; s/"salt" *: *"[^"]*" *,//g; s/"hash_version" *: *[0-9]* *,//g')
+        _api_success "{\"users\": $safe_users}"
     fi
 }
 
@@ -2465,6 +2725,9 @@ handle_auth_revoke() {
         new_users=$(echo "$users" | jq --arg u "$target_username" '[.[] | select(.username != $u)]' 2>/dev/null)
         _api_write_auth_file "users.json" "$new_users"
     fi
+
+    local client_ip="${SOCAT_PEERADDR:-unknown}"
+    _api_audit_log "$client_ip" "REVOKE" "$target_username" "Revoked by ${AUTH_USERNAME:-unknown}"
 
     _api_success "{\"success\": true, \"username\": \"$(_api_json_escape "$target_username")\", \"message\": \"User access revoked and all sessions invalidated\"}"
 }
@@ -2525,6 +2788,111 @@ handle_auth_invites() {
     fi
 }
 
+# POST /auth/logout — Invalidate the current session token
+handle_auth_logout() {
+    _api_init_auth_dir
+
+    # Extract and remove the current token
+    local token=""
+    if [[ -n "${REQUEST_AUTH_HEADER:-}" ]]; then
+        token="${REQUEST_AUTH_HEADER#Bearer }"
+        token="${token#bearer }"
+    fi
+
+    if [[ -z "$token" ]]; then
+        _api_error 400 "No token provided"
+        return
+    fi
+
+    # Remove this specific token from tokens.json
+    local tokens
+    tokens=$(_api_read_auth_file "tokens.json")
+    if command -v jq >/dev/null 2>&1; then
+        local new_tokens
+        new_tokens=$(echo "$tokens" | jq --arg t "$token" '[.[] | select(.token != $t)]' 2>/dev/null)
+        _api_write_auth_file "tokens.json" "$new_tokens"
+    fi
+
+    local client_ip="${SOCAT_PEERADDR:-unknown}"
+    _api_audit_log "$client_ip" "LOGOUT" "${AUTH_USERNAME:-unknown}" "Token invalidated"
+
+    _api_success '{"success": true, "message": "Logged out successfully"}'
+}
+
+# POST /auth/logout-all — Invalidate all sessions for a user (admin only)
+handle_auth_logout_all() {
+    local body="$1"
+
+    _api_init_auth_dir
+
+    if ! _api_check_admin; then
+        _api_error 403 "Admin access required"
+        return
+    fi
+
+    local target_username
+    if command -v jq >/dev/null 2>&1; then
+        target_username=$(echo "$body" | jq -r '.username // empty' 2>/dev/null)
+    else
+        target_username=$(echo "$body" | sed -n 's/.*"username" *: *"\([^"]*\)".*/\1/p')
+    fi
+
+    if [[ -z "$target_username" ]]; then
+        _api_error 400 "Missing required field: username"
+        return
+    fi
+
+    _api_revoke_user_tokens "$target_username"
+
+    local client_ip="${SOCAT_PEERADDR:-unknown}"
+    _api_audit_log "$client_ip" "LOGOUT_ALL" "$target_username" "All sessions revoked by ${AUTH_USERNAME:-unknown}"
+
+    _api_success "{\"success\": true, \"username\": \"$(_api_json_escape "$target_username")\", \"message\": \"All sessions invalidated\"}"
+}
+
+# POST /auth/refresh — Refresh the current session token
+handle_auth_refresh() {
+    _api_init_auth_dir
+
+    # Extract the current token
+    local old_token=""
+    if [[ -n "${REQUEST_AUTH_HEADER:-}" ]]; then
+        old_token="${REQUEST_AUTH_HEADER#Bearer }"
+        old_token="${old_token#bearer }"
+    fi
+
+    if [[ -z "$old_token" ]]; then
+        _api_error 400 "No token provided"
+        return
+    fi
+
+    local username="${AUTH_USERNAME:-}"
+    local role="${AUTH_ROLE:-}"
+    if [[ -z "$username" ]]; then
+        _api_error 401 "Invalid token"
+        return
+    fi
+
+    # Remove the old token
+    local tokens
+    tokens=$(_api_read_auth_file "tokens.json")
+    if command -v jq >/dev/null 2>&1; then
+        local new_tokens
+        new_tokens=$(echo "$tokens" | jq --arg t "$old_token" '[.[] | select(.token != $t)]' 2>/dev/null)
+        _api_write_auth_file "tokens.json" "$new_tokens"
+    fi
+
+    # Generate and store a new token
+    local new_token
+    new_token=$(_api_generate_token)
+    _api_store_token "$new_token" "$username" "$role"
+
+    local client_ip="${SOCAT_PEERADDR:-unknown}"
+    _api_audit_log "$client_ip" "TOKEN_REFRESH" "$username" "Token refreshed"
+
+    _api_success "{\"success\": true, \"token\": \"$new_token\", \"username\": \"$(_api_json_escape "$username")\", \"role\": \"$(_api_json_escape "$role")\"}"
+}
+
 # =============================================================================
 # CONTAINER ACTION HANDLERS
 # =============================================================================
@@ -2532,6 +2900,8 @@ handle_auth_invites() {
 handle_container_action() {
     local name="$1"
     local action="$2"
+
+    if ! _api_check_admin; then _api_error 403 "Admin access required"; return; fi
 
     if ! docker inspect "$name" >/dev/null 2>&1; then
         _api_error 404 "Container not found: $name"
@@ -2545,6 +2915,7 @@ handle_container_action() {
         start)   output=$(docker start "$name" 2>&1) || success=false ;;
         stop)    output=$(docker stop "$name" 2>&1) || success=false ;;
         restart) output=$(docker restart "$name" 2>&1) || success=false ;;
+        remove)  output=$(docker rm -f "$name" 2>&1) || success=false ;;
         *)       _api_error 400 "Unknown action: $action"; return ;;
     esac
 
@@ -2557,6 +2928,8 @@ handle_container_action() {
 handle_container_exec() {
     local name="$1"
     local body="$2"
+
+    if ! _api_check_admin; then _api_error 403 "Admin access required"; return; fi
 
     if ! docker inspect "$name" >/dev/null 2>&1; then
         _api_error 404 "Container not found: $name"
@@ -2621,6 +2994,8 @@ handle_container_logs() {
 # =============================================================================
 
 handle_maintenance_prune() {
+    if ! _api_check_admin; then _api_error 403 "Admin access required"; return; fi
+
     local output=""
     local success=true
 
@@ -2632,6 +3007,8 @@ handle_maintenance_prune() {
 }
 
 handle_maintenance_image_prune() {
+    if ! _api_check_admin; then _api_error 403 "Admin access required"; return; fi
+
     local output=""
     local success=true
 
@@ -2770,6 +3147,8 @@ handle_maintenance_disk() {
 
 handle_maintenance_deep_prune() {
     local body="$1"
+
+    if ! _api_check_admin; then _api_error 403 "Admin access required"; return; fi
 
     if ! command -v jq >/dev/null 2>&1; then
         _api_error 500 "jq is required for deep prune"
@@ -3033,6 +3412,8 @@ handle_root_env_update() {
     local body="$1"
     local env_file="$BASE_DIR/.env"
 
+    if ! _api_check_admin; then _api_error 403 "Admin access required"; return; fi
+
     if ! command -v jq >/dev/null 2>&1; then
         _api_error 500 "jq is required for env update"
         return
@@ -3237,6 +3618,8 @@ handle_backup_restore() {
     local body="$1"
     local backup_dir="${BACKUP_DEST_DIR:-}"
 
+    if ! _api_check_admin; then _api_error 403 "Admin access required"; return; fi
+
     if ! command -v jq >/dev/null 2>&1; then
         _api_error 500 "jq is required for restore"
         return
@@ -3251,12 +3634,30 @@ handle_backup_restore() {
         return
     fi
 
+    # Security: validate filename — reject path traversal and directory separators
+    if [[ "$filename" == *"/"* ]] || [[ "$filename" == *".."* ]] || [[ "$filename" == "."* ]]; then
+        _api_error 400 "Invalid backup filename"
+        return
+    fi
+    # Enforce safe filename pattern (alphanumeric, dots, hyphens, underscores)
+    if [[ ! "$filename" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]*$ ]]; then
+        _api_error 400 "Invalid backup filename"
+        return
+    fi
+
     if [[ "$confirm" != "RESTORE" ]]; then
         _api_error 400 "Restore requires {\"confirm\": \"RESTORE\"} in request body"
         return
     fi
 
     local archive_path="$backup_dir/$filename"
+    # Security: verify resolved path stays within backup directory
+    local resolved_path
+    resolved_path=$(realpath -m "$archive_path" 2>/dev/null)
+    if [[ "$resolved_path" != "$backup_dir/"* ]]; then
+        _api_error 400 "Invalid backup filename"
+        return
+    fi
     if [[ ! -f "$archive_path" ]]; then
         _api_error 404 "Backup file not found: $filename"
         return
@@ -3362,6 +3763,8 @@ ENV_EOF
 handle_delete_stack() {
     local name="$1"
 
+    if ! _api_check_admin; then _api_error 403 "Admin access required"; return; fi
+
     if [[ -z "$name" ]]; then
         _api_error 400 "Missing stack name"
         return
@@ -3403,6 +3806,8 @@ handle_delete_stack() {
 handle_config_update() {
     local body="$1"
     local env_file="$BASE_DIR/.env"
+
+    if ! _api_check_admin; then _api_error 403 "Admin access required"; return; fi
 
     if [[ ! -f "$env_file" ]]; then
         _api_error 500 "Configuration file not found: $env_file"
@@ -3452,12 +3857,20 @@ handle_config_update() {
     # Apply updates to .env file
     for key in "${!updates[@]}"; do
         local value="${updates[$key]}"
+        # Security: reject values containing newlines (could inject additional env entries)
+        if [[ "$value" == *$'\n'* ]] || [[ "$value" == *$'\r'* ]]; then
+            _api_error 400 "Value for $key contains invalid characters"
+            return
+        fi
+        # Use grep+temp file approach instead of sed to avoid sed injection
         if grep -q "^${key}=" "$env_file" 2>/dev/null; then
-            # Update existing key
-            sed -i "s|^${key}=.*|${key}=${value}|" "$env_file"
+            # Remove existing key line and rewrite (avoids sed metacharacter issues)
+            grep -v "^${key}=" "$env_file" > "${env_file}.tmp" 2>/dev/null
+            printf '%s=%s\n' "$key" "$value" >> "${env_file}.tmp"
+            mv "${env_file}.tmp" "$env_file"
         else
             # Append new key
-            echo "${key}=${value}" >> "$env_file"
+            printf '%s=%s\n' "$key" "$value" >> "$env_file"
         fi
         changed=$(( changed + 1 ))
     done
@@ -4978,6 +5391,8 @@ handle_snapshot_restore() {
     local body="$2"
     local filepath="$SNAPSHOTS_DIR/$snap_id"
 
+    if ! _api_check_admin; then _api_error 403 "Admin access required"; return; fi
+
     if [[ ! -f "$filepath" ]]; then
         _api_error 404 "Snapshot not found: $snap_id"
         return
@@ -5046,6 +5461,8 @@ handle_snapshot_restore() {
 handle_snapshot_delete() {
     local snap_id="$1"
     local filepath="$SNAPSHOTS_DIR/$snap_id"
+
+    if ! _api_check_admin; then _api_error 403 "Admin access required"; return; fi
 
     if [[ ! -f "$filepath" ]]; then
         _api_error 404 "Snapshot not found: $snap_id"
@@ -5169,6 +5586,59 @@ _save_compose_version() {
 # =============================================================================
 
 TEMPLATES_DIR="$BASE_DIR/.templates"
+DEPLOY_HISTORY_FILE="$BASE_DIR/.api-auth/deploy-history.json"
+
+_init_deploy_history() {
+    [[ ! -f "$DEPLOY_HISTORY_FILE" ]] && echo '[]' > "$DEPLOY_HISTORY_FILE"
+}
+
+# Record a deploy/undeploy event in the audit log
+# Usage: _record_deploy_event <action> <template_name> <target_stack> <services_json> [backup_file]
+_record_deploy_event() {
+    local action="$1" template_name="$2" target_stack="$3" services_json="$4" backup_file="${5:-}"
+    _init_deploy_history
+
+    if ! command -v jq >/dev/null 2>&1; then
+        return
+    fi
+
+    local id timestamp epoch
+    id="evt-$(date +%s)-$$-$RANDOM"
+    timestamp=$(date -Iseconds 2>/dev/null || date '+%Y-%m-%dT%H:%M:%S%z')
+    epoch=$(date +%s)
+
+    local entry
+    entry=$(jq -nc \
+        --arg id "$id" \
+        --arg action "$action" \
+        --arg template "$template_name" \
+        --arg target "$target_stack" \
+        --argjson services "$services_json" \
+        --arg backup "$backup_file" \
+        --arg ts "$timestamp" \
+        --argjson epoch "$epoch" \
+        '{id:$id, action:$action, template:$template, target_stack:$target, services:$services, backup_file:$backup, timestamp:$ts, epoch:$epoch}')
+
+    # Prepend to array and cap at 200 entries
+    local updated
+    updated=$(jq --argjson new "$entry" '[$new] + .[:199]' "$DEPLOY_HISTORY_FILE" 2>/dev/null)
+    if [[ -n "$updated" ]]; then
+        printf '%s\n' "$updated" > "$DEPLOY_HISTORY_FILE"
+    fi
+}
+
+handle_deploy_history() {
+    _init_deploy_history
+    if command -v jq >/dev/null 2>&1; then
+        local history
+        history=$(jq -c '.' "$DEPLOY_HISTORY_FILE" 2>/dev/null || echo "[]")
+        local total
+        total=$(jq 'length' "$DEPLOY_HISTORY_FILE" 2>/dev/null || echo 0)
+        _api_success "{\"history\": $history, \"total\": $total}"
+    else
+        _api_success "{\"history\": [], \"total\": 0}"
+    fi
+}
 
 handle_templates_list() {
     [[ ! -d "$TEMPLATES_DIR" ]] && mkdir -p "$TEMPLATES_DIR"
@@ -5227,6 +5697,13 @@ handle_template_detail() {
 handle_template_deploy() {
     local name="$1"
     local body="$2"
+
+    # B4: Admin-only access
+    if ! _api_check_admin; then
+        _api_error 403 "Admin access required"
+        return
+    fi
+
     local tdir="$TEMPLATES_DIR/$name"
 
     if [[ ! -d "$tdir" || ! -f "$tdir/docker-compose.yml" ]]; then
@@ -5239,48 +5716,263 @@ handle_template_deploy() {
         return
     fi
 
-    local stack_name
-    stack_name=$(printf '%s' "$body" | jq -r '.stack_name // empty' 2>/dev/null)
-    if [[ -z "$stack_name" ]]; then
-        _api_error 400 "Missing required field: stack_name"
+    # Accept target_stack from request body (required)
+    local target_stack
+    target_stack=$(printf '%s' "$body" | jq -r '.target_stack // empty' 2>/dev/null)
+    if [[ -z "$target_stack" ]]; then
+        _api_error 400 "Missing required field: target_stack"
         return
     fi
 
-    # Sanitize stack name
-    stack_name=$(echo "$stack_name" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_-]/-/g')
+    # Sanitize target stack name
+    target_stack=$(echo "$target_stack" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_-]/-/g')
 
-    local target_dir="$COMPOSE_DIR/$stack_name"
-    if [[ -d "$target_dir" ]]; then
-        _api_error 409 "Stack already exists: $stack_name"
+    # B4: Path traversal guard
+    if [[ "$target_stack" == *".."* || "$target_stack" == *"/"* || -z "$target_stack" ]]; then
+        _api_error 400 "Invalid target stack name"
         return
     fi
 
-    mkdir -p "$target_dir"
+    local target_dir="$COMPOSE_DIR/$target_stack"
+    if [[ ! -d "$target_dir" || ! -f "$target_dir/docker-compose.yml" ]]; then
+        local available_stacks=""
+        if [[ -n "${DOCKER_STACKS:-}" ]]; then
+            available_stacks=" Available stacks: ${DOCKER_STACKS}"
+        fi
+        _api_error 404 "Target stack not found or missing compose file: $target_stack.${available_stacks}"
+        return
+    fi
 
-    # Read compose template and substitute variables
-    local compose_content
-    compose_content=$(cat "$tdir/docker-compose.yml")
+    # Read template compose and substitute variables
+    local template_compose
+    template_compose=$(cat "$tdir/docker-compose.yml")
 
-    # Get variables from request body and substitute
     local vars
     vars=$(printf '%s' "$body" | jq -r '.variables // {} | to_entries[] | "\(.key)=\(.value)"' 2>/dev/null)
     while IFS='=' read -r key val; do
         [[ -z "$key" ]] && continue
-        compose_content="${compose_content//\$\{$key\}/$val}"
-        compose_content="${compose_content//\$$key/$val}"
+        # B1: Validate key is a legal env var name
+        if [[ ! "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+            _api_error 400 "Invalid variable name: $key"
+            return
+        fi
+        # B1: Reject values containing newlines (YAML injection vector)
+        if [[ "$val" == *$'\n'* || "$val" == *$'\r'* ]]; then
+            _api_error 400 "Variable value for $key contains invalid characters"
+            return
+        fi
+        template_compose="${template_compose//\$\{$key\}/$val}"
+        template_compose="${template_compose//\$$key/$val}"
     done <<< "$vars"
 
-    printf '%s' "$compose_content" > "$target_dir/docker-compose.yml"
+    # Extract service names from template compose (top-level keys under services:)
+    local template_services
+    template_services=$(printf '%s' "$template_compose" | sed -n '/^services:/,/^[^ ]/{ /^  [a-zA-Z_-][a-zA-Z0-9_-]*:/{ s/^  \([a-zA-Z_-][a-zA-Z0-9_-]*\):.*/\1/; p; } }')
+    if [[ -z "$template_services" ]]; then
+        _api_error 400 "No services found in template compose file"
+        return
+    fi
 
-    # Create .env from variables
-    local env_content=""
-    while IFS='=' read -r key val; do
-        [[ -z "$key" ]] && continue
-        env_content+="${key}=${val}\n"
-    done <<< "$vars"
-    [[ -n "$env_content" ]] && printf '%b' "$env_content" > "$target_dir/.env"
+    # Check for service name conflicts against existing compose
+    local existing_compose
+    existing_compose=$(cat "$target_dir/docker-compose.yml")
+    local conflicts=""
+    while IFS= read -r svc; do
+        [[ -z "$svc" ]] && continue
+        if printf '%s' "$existing_compose" | grep -q "^  ${svc}:"; then
+            conflicts="${conflicts}${conflicts:+, }${svc}"
+        fi
+    done <<< "$template_services"
 
-    # Auto-start if requested
+    if [[ -n "$conflicts" ]]; then
+        _api_error 409 "Service name conflict in target stack: $conflicts"
+        return
+    fi
+
+    # -----------------------------------------------------------------------
+    # Port conflict detection — template ports vs target stack + running system
+    # -----------------------------------------------------------------------
+    local tpl_ports target_ports
+    tpl_ports=$(printf '%s\n' "$template_compose" | awk '
+        /[[:space:]]+ports:[[:space:]]*$/ { p=1; next }
+        p && /^[[:space:]]+-/ {
+            l=$0; gsub(/^[[:space:]]*-[[:space:]]*/, "", l); gsub(/"/, "", l)
+            n=split(l, a, ":"); if (n >= 2) { gsub(/[[:space:]]/, "", a[1])
+            if (a[1] ~ /^[0-9]+$/) print a[1] }; next
+        }
+        p && !/^[[:space:]]*$/ && !/^[[:space:]]+-/ { p=0 }
+    ')
+    target_ports=$(awk '
+        /[[:space:]]+ports:[[:space:]]*$/ { p=1; next }
+        p && /^[[:space:]]+-/ {
+            l=$0; gsub(/^[[:space:]]*-[[:space:]]*/, "", l); gsub(/"/, "", l)
+            n=split(l, a, ":"); if (n >= 2) { gsub(/[[:space:]]/, "", a[1])
+            if (a[1] ~ /^[0-9]+$/) print a[1] }; next
+        }
+        p && !/^[[:space:]]*$/ && !/^[[:space:]]+-/ { p=0 }
+    ' "$target_dir/docker-compose.yml")
+
+    if [[ -n "$tpl_ports" ]]; then
+        # Check against target stack compose file
+        if [[ -n "$target_ports" ]]; then
+            local port_conflicts=""
+            while IFS= read -r port; do
+                [[ -z "$port" ]] && continue
+                if printf '%s\n' "$target_ports" | grep -qxF "$port"; then
+                    port_conflicts="${port_conflicts}${port_conflicts:+, }${port}"
+                fi
+            done <<< "$tpl_ports"
+            if [[ -n "$port_conflicts" ]]; then
+                _api_error 409 "Host port conflict with existing services in ${target_stack}: ${port_conflicts}"
+                return
+            fi
+        fi
+
+        # Check against all running Docker containers (system-wide)
+        if command -v docker >/dev/null 2>&1; then
+            local running_ports
+            running_ports=$(docker ps --format '{{.Ports}}' 2>/dev/null | grep -oE '(0\.0\.0\.0:|:::)[0-9]+' | grep -oE '[0-9]+$' | sort -u)
+            if [[ -n "$running_ports" ]]; then
+                local system_conflicts=""
+                while IFS= read -r port; do
+                    [[ -z "$port" ]] && continue
+                    if printf '%s\n' "$running_ports" | grep -qxF "$port"; then
+                        system_conflicts="${system_conflicts}${system_conflicts:+, }${port}"
+                    fi
+                done <<< "$tpl_ports"
+                if [[ -n "$system_conflicts" ]]; then
+                    _api_error 409 "Host port(s) already in use by running containers: ${system_conflicts}"
+                    return
+                fi
+            fi
+        fi
+    fi
+
+    # Back up existing compose file
+    local timestamp
+    timestamp=$(date +%Y%m%d%H%M%S)
+    cp "$target_dir/docker-compose.yml" "$target_dir/docker-compose.yml.bak.${timestamp}"
+
+    # B3: Rotate backups — keep only the 5 most recent
+    local -a old_backups=()
+    while IFS= read -r f; do
+        old_backups+=("$f")
+    done < <(ls -1t "$target_dir"/docker-compose.yml.bak.* 2>/dev/null | tail -n +6)
+    for f in "${old_backups[@]}"; do
+        rm -f "$f"
+    done
+
+    # -----------------------------------------------------------------------
+    # Section-aware merge: insert services, volumes, networks into correct
+    # positions in the target compose file (never blindly append to EOF)
+    # -----------------------------------------------------------------------
+
+    # Extract each top-level section's content from the template
+    local tpl_svc_block tpl_vol_block tpl_net_block
+    tpl_svc_block=$(printf '%s\n' "$template_compose" | awk '
+        /^services:/ { f=1; next } f && /^[^ \t]/ { exit } f { print }')
+    tpl_vol_block=$(printf '%s\n' "$template_compose" | awk '
+        /^volumes:/ { f=1; next } f && /^[^ \t]/ { exit } f { print }')
+    tpl_net_block=$(printf '%s\n' "$template_compose" | awk '
+        /^networks:/ { f=1; next } f && /^[^ \t]/ { exit } f { print }')
+
+    # Merge template sections into target compose at the correct positions:
+    #   - services content  → end of services: section (before next top-level key)
+    #   - volumes content   → end of volumes: section (or create new section)
+    #   - networks content  → end of networks: section (or create new section)
+    local merged_compose
+    merged_compose=$(
+        _TPL_SVCS="$tpl_svc_block" \
+        _TPL_VOLS="$tpl_vol_block" \
+        _TPL_NETS="$tpl_net_block" \
+        awk '
+        BEGIN {
+            svcs = ENVIRON["_TPL_SVCS"]; vols = ENVIRON["_TPL_VOLS"]; nets = ENVIRON["_TPL_NETS"]
+            cur = ""; has_vol = 0; has_net = 0
+            svcs_done = 0; vols_done = 0; nets_done = 0
+        }
+        /^[a-zA-Z]/ {
+            # Entering a new top-level section — close the previous one first
+            if (cur == "services" && !svcs_done && svcs != "") { printf "\n%s\n", svcs; svcs_done = 1 }
+            if (cur == "volumes"  && !vols_done && vols != "") { printf "%s\n",  vols; vols_done = 1 }
+            if (cur == "networks" && !nets_done && nets != "") { printf "%s\n",  nets; nets_done = 1 }
+            if ($0 ~ /^services:/)  cur = "services"
+            else if ($0 ~ /^volumes:/)  { cur = "volumes";  has_vol = 1 }
+            else if ($0 ~ /^networks:/) { cur = "networks"; has_net = 1 }
+            else cur = "other"
+        }
+        { print }
+        END {
+            # Close the last section (file ended while still in a section)
+            if (cur == "services" && !svcs_done && svcs != "") printf "\n%s\n", svcs
+            if (cur == "volumes"  && !vols_done && vols != "") printf "%s\n",  vols
+            if (cur == "networks" && !nets_done && nets != "") printf "%s\n",  nets
+            # Create new top-level sections if they did not exist in target
+            if (!has_vol && vols != "") printf "\nvolumes:\n%s\n", vols
+            if (!has_net && nets != "") printf "\nnetworks:\n%s\n", nets
+        }
+        ' "$target_dir/docker-compose.yml"
+    )
+
+    # Write merged result (atomic overwrite, not blind append)
+    printf '%s\n' "$merged_compose" > "$target_dir/docker-compose.yml"
+
+    # B2: Validate merged compose file — rollback on failure
+    local env_args=()
+    [[ -f "$target_dir/.env" ]] && env_args=(--env-file "$target_dir/.env")
+    local validate_output
+    validate_output=$($DOCKER_COMPOSE_CMD -f "$target_dir/docker-compose.yml" "${env_args[@]}" config 2>&1)
+    if [[ $? -ne 0 ]]; then
+        # Rollback: restore backup
+        cp "$target_dir/docker-compose.yml.bak.${timestamp}" "$target_dir/docker-compose.yml"
+        _api_error 422 "Merge produced invalid compose file. Rolled back. Validation error: $(echo "$validate_output" | head -3)"
+        return
+    fi
+
+    # Append-only merge new variables into .env with template section header
+    if [[ -n "$vars" ]]; then
+        local env_file="$target_dir/.env"
+        [[ ! -f "$env_file" ]] && touch "$env_file"
+
+        # Collect only new variables (anchored ^KEY= match prevents partial hits)
+        local -a new_env_entries=()
+        local added_vars=""
+        while IFS='=' read -r key val; do
+            [[ -z "$key" ]] && continue
+            if ! grep -q "^${key}=" "$env_file" 2>/dev/null; then
+                new_env_entries+=("${key}=${val}")
+                added_vars="${added_vars}${added_vars:+, }${key}"
+            fi
+        done <<< "$vars"
+
+        # Write new variables under a descriptive template section header
+        if [[ ${#new_env_entries[@]} -gt 0 ]]; then
+            {
+                printf '\n# =============================================================================\n'
+                printf '# Template: %s (deployed %s)\n' "$name" "$(date '+%Y-%m-%d %H:%M:%S')"
+                printf '# =============================================================================\n'
+                for entry in "${new_env_entries[@]}"; do
+                    printf '%s\n' "$entry"
+                done
+            } >> "$env_file"
+        fi
+    fi
+
+    # Build JSON array of added service names
+    local services_json="["
+    local first=true
+    while IFS= read -r svc; do
+        [[ -z "$svc" ]] && continue
+        if $first; then
+            services_json+="\"$(_api_json_escape "$svc")\""
+            first=false
+        else
+            services_json+=",\"$(_api_json_escape "$svc")\""
+        fi
+    done <<< "$template_services"
+    services_json+="]"
+
+    # Auto-start if requested (restart the target stack)
     local auto_start
     auto_start=$(printf '%s' "$body" | jq -r '.auto_start // false' 2>/dev/null)
     local started=false
@@ -5288,7 +5980,456 @@ handle_template_deploy() {
         $DOCKER_COMPOSE_CMD -f "$target_dir/docker-compose.yml" up -d 2>/dev/null && started=true
     fi
 
-    _api_success "{\"success\": true, \"stack_name\": \"$(_api_json_escape "$stack_name")\", \"started\": $started, \"message\": \"Template deployed successfully\"}"
+    # Deploy config files if template includes a config/ directory
+    if [[ -d "$tdir/config" ]]; then
+        local config_target_name
+        config_target_name=$(printf '%s' "$meta" | jq -r '.config_path // empty' 2>/dev/null)
+        if [[ -n "$config_target_name" ]]; then
+            local app_data="${APP_DATA_DIR:-$BASE_DIR/App-Data}"
+            local config_target="$app_data/$config_target_name"
+            mkdir -p "$config_target"
+            # Copy config files without overwriting existing ones (-n)
+            cp -rn "$tdir/config/"* "$config_target/" 2>/dev/null || true
+
+            # Create custom_routes subdirectories from DOCKER_STACKS if present
+            if [[ -d "$config_target/custom_routes" && -n "${DOCKER_STACKS:-}" ]]; then
+                local stack_name
+                for stack_name in $DOCKER_STACKS; do
+                    mkdir -p "$config_target/custom_routes/$stack_name"
+                done
+            fi
+
+            # Apply variable substitution to all .yml/.yaml config files
+            if [[ -n "$vars" ]]; then
+                local cfg_file
+                while IFS= read -r cfg_file; do
+                    [[ -z "$cfg_file" ]] && continue
+                    local cfg_content
+                    cfg_content=$(cat "$cfg_file" 2>/dev/null) || continue
+                    local orig_content="$cfg_content"
+                    while IFS='=' read -r ckey cval; do
+                        [[ -z "$ckey" ]] && continue
+                        cfg_content="${cfg_content//\$\{$ckey\}/$cval}"
+                    done <<< "$vars"
+                    # Only write back if content actually changed
+                    if [[ "$cfg_content" != "$orig_content" ]]; then
+                        printf '%s\n' "$cfg_content" > "$cfg_file"
+                    fi
+                done < <(find "$config_target" -type f \( -name '*.yml' -o -name '*.yaml' \) 2>/dev/null)
+            fi
+
+            # Ensure acme.json has secure permissions (required by Traefik)
+            if [[ -f "$config_target/acme.json" ]]; then
+                chmod 600 "$config_target/acme.json"
+            fi
+        fi
+    fi
+
+    # Record deploy event in audit log
+    _record_deploy_event "deploy" "$name" "$target_stack" "$services_json" "docker-compose.yml.bak.${timestamp}"
+
+    _api_success "{\"success\": true, \"target_stack\": \"$(_api_json_escape "$target_stack")\", \"services_added\": $services_json, \"started\": $started, \"backup_file\": \"docker-compose.yml.bak.${timestamp}\", \"message\": \"Template services merged into $target_stack successfully\"}"
+}
+
+handle_template_dry_run() {
+    local name="$1"
+    local body="$2"
+
+    local tdir="$TEMPLATES_DIR/$name"
+    if [[ ! -d "$tdir" || ! -f "$tdir/docker-compose.yml" ]]; then
+        _api_error 404 "Template not found or missing compose file: $name"
+        return
+    fi
+
+    if ! command -v jq >/dev/null 2>&1; then
+        _api_error 500 "jq is required"
+        return
+    fi
+
+    local target_stack
+    target_stack=$(printf '%s' "$body" | jq -r '.target_stack // empty' 2>/dev/null)
+    if [[ -z "$target_stack" ]]; then
+        _api_error 400 "Missing required field: target_stack"
+        return
+    fi
+
+    target_stack=$(echo "$target_stack" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_-]/-/g')
+    if [[ "$target_stack" == *".."* || "$target_stack" == *"/"* || -z "$target_stack" ]]; then
+        _api_error 400 "Invalid target stack name"
+        return
+    fi
+
+    local target_dir="$COMPOSE_DIR/$target_stack"
+    if [[ ! -d "$target_dir" || ! -f "$target_dir/docker-compose.yml" ]]; then
+        local available_stacks=""
+        if [[ -n "${DOCKER_STACKS:-}" ]]; then
+            available_stacks=" Available stacks: ${DOCKER_STACKS}"
+        fi
+        _api_error 404 "Target stack not found: $target_stack.${available_stacks}"
+        return
+    fi
+
+    # Read and substitute variables
+    local template_compose
+    template_compose=$(cat "$tdir/docker-compose.yml")
+
+    local vars
+    vars=$(printf '%s' "$body" | jq -r '.variables // {} | to_entries[] | "\(.key)=\(.value)"' 2>/dev/null)
+    while IFS='=' read -r key val; do
+        [[ -z "$key" ]] && continue
+        if [[ ! "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then continue; fi
+        template_compose="${template_compose//\$\{$key\}/$val}"
+        template_compose="${template_compose//\$$key/$val}"
+    done <<< "$vars"
+
+    # Extract services
+    local template_services
+    template_services=$(printf '%s' "$template_compose" | sed -n '/^services:/,/^[^ ]/{ /^  [a-zA-Z_-][a-zA-Z0-9_-]*:/{ s/^  \([a-zA-Z_-][a-zA-Z0-9_-]*\):.*/\1/; p; } }')
+    if [[ -z "$template_services" ]]; then
+        _api_error 400 "No services found in template compose file"
+        return
+    fi
+
+    # Service conflicts
+    local existing_compose
+    existing_compose=$(cat "$target_dir/docker-compose.yml")
+    local service_conflicts=""
+    while IFS= read -r svc; do
+        [[ -z "$svc" ]] && continue
+        if printf '%s' "$existing_compose" | grep -q "^  ${svc}:"; then
+            service_conflicts="${service_conflicts}${service_conflicts:+, }${svc}"
+        fi
+    done <<< "$template_services"
+
+    # Port conflicts — thorough check across ALL stacks + running containers
+    local tpl_ports port_conflicts=""
+    tpl_ports=$(printf '%s\n' "$template_compose" | awk '
+        /[[:space:]]+ports:[[:space:]]*$/ { p=1; next }
+        p && /^[[:space:]]+-/ {
+            l=$0; gsub(/^[[:space:]]*-[[:space:]]*/, "", l); gsub(/"/, "", l)
+            n=split(l, a, ":"); if (n >= 2) { gsub(/[[:space:]]/, "", a[1])
+            if (a[1] ~ /^[0-9]+$/) print a[1] }; next
+        }
+        p && !/^[[:space:]]*$/ && !/^[[:space:]]+-/ { p=0 }
+    ')
+
+    # Build a detailed port_conflicts JSON array for thorough reporting
+    local -a port_conflict_entries=()
+
+    if [[ -n "$tpl_ports" ]]; then
+        # 1) Check against ALL stacks' compose files (not just target)
+        for stack_dir in "$COMPOSE_DIR"/*/; do
+            [[ ! -f "$stack_dir/docker-compose.yml" ]] && continue
+            local stack_name
+            stack_name=$(basename "$stack_dir")
+            local stack_ports
+            stack_ports=$(awk '
+                /[[:space:]]+ports:[[:space:]]*$/ { p=1; next }
+                p && /^[[:space:]]+-/ {
+                    l=$0; gsub(/^[[:space:]]*-[[:space:]]*/, "", l); gsub(/"/, "", l)
+                    n=split(l, a, ":"); if (n >= 2) { gsub(/[[:space:]]/, "", a[1])
+                    if (a[1] ~ /^[0-9]+$/) print a[1] }; next
+                }
+                p && !/^[[:space:]]*$/ && !/^[[:space:]]+-/ { p=0 }
+            ' "$stack_dir/docker-compose.yml" 2>/dev/null)
+            if [[ -n "$stack_ports" ]]; then
+                while IFS= read -r port; do
+                    [[ -z "$port" ]] && continue
+                    if printf '%s\n' "$stack_ports" | grep -qxF "$port"; then
+                        port_conflict_entries+=("{\"port\": $port, \"owner\": \"$(_api_json_escape "$stack_name")\", \"type\": \"stack\"}")
+                        port_conflicts="${port_conflicts}${port_conflicts:+, }${port} (stack: ${stack_name})"
+                    fi
+                done <<< "$tpl_ports"
+            fi
+        done
+
+        # 2) Check against running Docker containers system-wide
+        if command -v docker >/dev/null 2>&1; then
+            local running_port_map
+            running_port_map=$(docker ps --format '{{.Names}}\t{{.Ports}}' 2>/dev/null)
+            if [[ -n "$running_port_map" ]]; then
+                while IFS= read -r port; do
+                    [[ -z "$port" ]] && continue
+                    # Check if port is already in conflicts from stack check
+                    local already_found=false
+                    for entry in "${port_conflict_entries[@]}"; do
+                        if [[ "$entry" == *"\"port\": $port,"* ]]; then
+                            already_found=true
+                            break
+                        fi
+                    done
+                    if ! $already_found; then
+                        local container_owner
+                        container_owner=$(printf '%s\n' "$running_port_map" | while IFS=$'\t' read -r cname cports; do
+                            if printf '%s' "$cports" | grep -qE "(^|,| )(0\.0\.0\.0:|:::)${port}->"; then
+                                printf '%s' "$cname"
+                                break
+                            fi
+                        done)
+                        if [[ -n "$container_owner" ]]; then
+                            port_conflict_entries+=("{\"port\": $port, \"owner\": \"$(_api_json_escape "$container_owner")\", \"type\": \"container\"}")
+                            port_conflicts="${port_conflicts}${port_conflicts:+, }${port} (container: ${container_owner})"
+                        fi
+                    fi
+                done <<< "$tpl_ports"
+            fi
+        fi
+    fi
+
+    # Build port_conflicts_detail JSON array
+    local port_conflicts_detail="[]"
+    if [[ ${#port_conflict_entries[@]} -gt 0 ]]; then
+        local joined
+        joined=$(printf '%s,' "${port_conflict_entries[@]}")
+        port_conflicts_detail="[${joined%,}]"
+    fi
+
+    # Env additions — check existing env vars across target stack
+    local env_additions="[]"
+    local env_existing="[]"
+    if [[ -n "$vars" ]]; then
+        local env_file="$target_dir/.env"
+        local -a env_adds=()
+        local -a env_exist=()
+        while IFS='=' read -r key val; do
+            [[ -z "$key" ]] && continue
+            if [[ -f "$env_file" ]] && grep -q "^${key}=" "$env_file" 2>/dev/null; then
+                local existing_val
+                existing_val=$(grep "^${key}=" "$env_file" 2>/dev/null | head -1 | cut -d'=' -f2-)
+                env_exist+=("{\"key\": \"$(_api_json_escape "$key")\", \"current_value\": \"$(_api_json_escape "$existing_val")\", \"new_value\": \"$(_api_json_escape "$val")\"}")
+            else
+                env_adds+=("{\"key\": \"$(_api_json_escape "$key")\", \"value\": \"$(_api_json_escape "$val")\"}")
+            fi
+        done <<< "$vars"
+        if [[ ${#env_adds[@]} -gt 0 ]]; then
+            local joined
+            joined=$(printf '%s,' "${env_adds[@]}")
+            env_additions="[${joined%,}]"
+        fi
+        if [[ ${#env_exist[@]} -gt 0 ]]; then
+            local joined
+            joined=$(printf '%s,' "${env_exist[@]}")
+            env_existing="[${joined%,}]"
+        fi
+    fi
+
+    # Build services JSON array
+    local services_json="["
+    local first=true
+    while IFS= read -r svc; do
+        [[ -z "$svc" ]] && continue
+        if $first; then
+            services_json+="\"$(_api_json_escape "$svc")\""
+            first=false
+        else
+            services_json+=",\"$(_api_json_escape "$svc")\""
+        fi
+    done <<< "$template_services"
+    services_json+="]"
+
+    # Extract services block for preview
+    local tpl_svc_block
+    tpl_svc_block=$(printf '%s\n' "$template_compose" | awk '
+        /^services:/ { f=1; next } f && /^[^ \t]/ { exit } f { print }')
+    local lines_added
+    lines_added=$(printf '%s' "$tpl_svc_block" | wc -l)
+
+    local has_svc_conflict="false"
+    [[ -n "$service_conflicts" ]] && has_svc_conflict="true"
+    local has_port_conflict="false"
+    [[ -n "$port_conflicts" ]] && has_port_conflict="true"
+
+    _api_success "{\"success\": true, \"template\": \"$(_api_json_escape "$name")\", \"target_stack\": \"$(_api_json_escape "$target_stack")\", \"services\": $services_json, \"service_conflicts\": \"$(_api_json_escape "$service_conflicts")\", \"has_service_conflicts\": $has_svc_conflict, \"port_conflicts\": \"$(_api_json_escape "$port_conflicts")\", \"has_port_conflicts\": $has_port_conflict, \"port_conflicts_detail\": $port_conflicts_detail, \"env_additions\": $env_additions, \"env_existing\": $env_existing, \"lines_added\": ${lines_added:-0}, \"compose_preview\": \"$(_api_json_escape "$tpl_svc_block")\"}"
+}
+
+handle_template_undeploy() {
+    local name="$1"
+    local body="$2"
+
+    # Admin-only access
+    if ! _api_check_admin; then
+        _api_error 403 "Admin access required"
+        return
+    fi
+
+    if ! command -v jq >/dev/null 2>&1; then
+        _api_error 500 "jq is required"
+        return
+    fi
+
+    local target_stack
+    target_stack=$(printf '%s' "$body" | jq -r '.target_stack // empty' 2>/dev/null)
+    if [[ -z "$target_stack" ]]; then
+        _api_error 400 "Missing required field: target_stack"
+        return
+    fi
+
+    # Sanitize
+    target_stack=$(echo "$target_stack" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_-]/-/g')
+    if [[ "$target_stack" == *".."* || "$target_stack" == *"/"* || -z "$target_stack" ]]; then
+        _api_error 400 "Invalid target stack name"
+        return
+    fi
+
+    local target_dir="$COMPOSE_DIR/$target_stack"
+    if [[ ! -d "$target_dir" || ! -f "$target_dir/docker-compose.yml" ]]; then
+        local available_stacks=""
+        if [[ -n "${DOCKER_STACKS:-}" ]]; then
+            available_stacks=" Available stacks: ${DOCKER_STACKS}"
+        fi
+        _api_error 404 "Target stack not found: $target_stack.${available_stacks}"
+        return
+    fi
+
+    # Parse services to remove
+    local -a services_to_remove=()
+    local svc_json
+    svc_json=$(printf '%s' "$body" | jq -c '.services // []' 2>/dev/null)
+    if [[ "$svc_json" == "[]" || -z "$svc_json" ]]; then
+        _api_error 400 "Missing required field: services (array of service names)"
+        return
+    fi
+    while IFS= read -r svc; do
+        [[ -n "$svc" ]] && services_to_remove+=("$svc")
+    done < <(printf '%s' "$svc_json" | jq -r '.[]' 2>/dev/null)
+
+    if [[ ${#services_to_remove[@]} -eq 0 ]]; then
+        _api_error 400 "No valid services specified"
+        return
+    fi
+
+    local remove_containers
+    remove_containers=$(printf '%s' "$body" | jq -r '.remove_containers // false' 2>/dev/null)
+
+    # Backup compose file
+    local timestamp
+    timestamp=$(date +%Y%m%d%H%M%S)
+    cp "$target_dir/docker-compose.yml" "$target_dir/docker-compose.yml.bak.${timestamp}"
+
+    # Rotate backups — keep only the 5 most recent
+    local -a old_backups=()
+    while IFS= read -r f; do
+        old_backups+=("$f")
+    done < <(ls -1t "$target_dir"/docker-compose.yml.bak.* 2>/dev/null | tail -n +6)
+    for f in "${old_backups[@]}"; do
+        rm -f "$f"
+    done
+
+    # Remove each service block from the compose file using awk
+    local compose_content
+    compose_content=$(cat "$target_dir/docker-compose.yml")
+
+    for svc in "${services_to_remove[@]}"; do
+        compose_content=$(printf '%s\n' "$compose_content" | awk -v svc="$svc" '
+            BEGIN { skip=0 }
+            /^  [a-zA-Z_-]/ {
+                if ($0 ~ "^  " svc ":") { skip=1; next }
+                else { skip=0 }
+            }
+            skip && /^    / { next }
+            skip && /^  [^ ]/ { skip=0 }
+            skip && /^[^ ]/ { skip=0 }
+            !skip { print }
+        ')
+    done
+
+    # Write updated compose
+    printf '%s\n' "$compose_content" > "$target_dir/docker-compose.yml"
+
+    # Validate merged compose file — rollback on failure
+    local env_args=()
+    [[ -f "$target_dir/.env" ]] && env_args=(--env-file "$target_dir/.env")
+    local validate_output
+    validate_output=$($DOCKER_COMPOSE_CMD -f "$target_dir/docker-compose.yml" "${env_args[@]}" config 2>&1)
+    if [[ $? -ne 0 ]]; then
+        cp "$target_dir/docker-compose.yml.bak.${timestamp}" "$target_dir/docker-compose.yml"
+        _api_error 422 "Undeploy produced invalid compose file. Rolled back. Error: $(echo "$validate_output" | head -3)"
+        return
+    fi
+
+    # Clean up .env: remove template section header AND the KEY=VALUE lines below it
+    if [[ -f "$target_dir/.env" ]]; then
+        local env_before
+        env_before=$(cat "$target_dir/.env")
+        local env_after
+        env_after=$(printf '%s\n' "$env_before" | awk -v tpl="$name" '
+            BEGIN { skip=0 }
+            # Match section separator line
+            /^# =+$/ {
+                # Peek: if we are starting a skip block, this is the trailing separator
+                if (skip == 2) { skip=3; next }
+                # Save potential header start
+                hold=$0; skip=1; next
+            }
+            skip == 1 {
+                # Check if this is the template header line
+                if ($0 ~ "^# Template: " tpl) { skip=2; next }
+                # Not our template — print the held separator and this line
+                print hold; print; skip=0; next
+            }
+            skip == 2 {
+                # Still in header — skip the closing separator
+                if ($0 ~ /^# =+$/) { skip=3; next }
+                # Unexpected line in header position — print held content
+                print hold; print; skip=0; next
+            }
+            skip == 3 {
+                # Skip KEY=VALUE lines belonging to this template section
+                # Stop when we hit a blank line, a comment block, or end of file
+                if ($0 ~ /^$/) { skip=0; next }
+                if ($0 ~ /^# =+$/) { skip=0 }
+                if (skip == 3) next
+            }
+            { print }
+        ')
+        printf '%s\n' "$env_after" > "$target_dir/.env"
+    fi
+
+    # Remove containers if requested
+    local -a containers_removed=()
+    if [[ "$remove_containers" == "true" ]]; then
+        for svc in "${services_to_remove[@]}"; do
+            # Try common container naming patterns
+            local cid
+            for pattern in "${target_stack}-${svc}-1" "${target_stack}_${svc}_1" "${svc}"; do
+                cid=$(docker ps -aq --filter "name=^/${pattern}$" 2>/dev/null)
+                if [[ -n "$cid" ]]; then
+                    docker rm -f "$cid" 2>/dev/null && containers_removed+=("$pattern")
+                    break
+                fi
+            done
+        done
+    fi
+
+    # Build JSON arrays
+    local svc_removed_json="["
+    local first=true
+    for svc in "${services_to_remove[@]}"; do
+        if $first; then
+            svc_removed_json+="\"$(_api_json_escape "$svc")\""
+            first=false
+        else
+            svc_removed_json+=",\"$(_api_json_escape "$svc")\""
+        fi
+    done
+    svc_removed_json+="]"
+
+    local ctr_removed_json="["
+    first=true
+    for ctr in "${containers_removed[@]}"; do
+        if $first; then
+            ctr_removed_json+="\"$(_api_json_escape "$ctr")\""
+            first=false
+        else
+            ctr_removed_json+=",\"$(_api_json_escape "$ctr")\""
+        fi
+    done
+    ctr_removed_json+="]"
+
+    # Record undeploy event
+    _record_deploy_event "undeploy" "$name" "$target_stack" "$svc_removed_json" "docker-compose.yml.bak.${timestamp}"
+
+    _api_success "{\"success\": true, \"template\": \"$(_api_json_escape "$name")\", \"target_stack\": \"$(_api_json_escape "$target_stack")\", \"services_removed\": $svc_removed_json, \"containers_removed\": $ctr_removed_json, \"backup_file\": \"docker-compose.yml.bak.${timestamp}\", \"message\": \"Services removed from $target_stack successfully\"}"
 }
 
 handle_template_import() {
@@ -5388,6 +6529,8 @@ handle_template_update() {
 handle_template_delete() {
     local name="$1"
 
+    if ! _api_check_admin; then _api_error 403 "Admin access required"; return; fi
+
     # Security: validate template name
     if [[ "$name" == *".."* || "$name" == *"/"* || -z "$name" ]]; then
         _api_error 400 "Invalid template name"
@@ -5460,8 +6603,12 @@ handle_automation_create() {
 
     jq --argjson auto "$automation" '. + [$auto]' "$AUTOMATIONS_FILE" > "${AUTOMATIONS_FILE}.tmp" 2>/dev/null && mv "${AUTOMATIONS_FILE}.tmp" "$AUTOMATIONS_FILE"
 
-    # If schedule trigger, add crontab entry
+    # If schedule trigger, validate and add crontab entry
     if [[ "$trigger_type" == "schedule" && "$enabled" == "true" && -n "$trigger_value" ]]; then
+        if ! _validate_cron_expression "$trigger_value"; then
+            _api_error 400 "Invalid cron expression: $(_api_json_escape "$trigger_value")"
+            return
+        fi
         _add_automation_cron "$auto_id" "$trigger_value" "$action_type" "$action_target"
     fi
 
@@ -5517,6 +6664,8 @@ handle_automation_delete() {
     local auto_id="$1"
     _init_automations_file
 
+    if ! _api_check_admin; then _api_error 403 "Admin access required"; return; fi
+
     if ! command -v jq >/dev/null 2>&1; then
         _api_error 500 "jq is required"
         return
@@ -5544,8 +6693,31 @@ handle_automation_history() {
 }
 
 # Cron helpers for automations
+_validate_cron_expression() {
+    local expr="$1"
+    # Reject empty or dangerous characters (shell metacharacters, newlines)
+    [[ -z "$expr" ]] && return 1
+    case "$expr" in
+        *';'*|*'|'*|*'`'*|*'$('*|*'&'*|*'>'*|*'<'*|*$'\n'*|*$'\r'*) return 1 ;;
+    esac
+    # Validate standard 5-field cron format: min hour dom mon dow
+    # Each field: number, range (1-5), list (1,3,5), step (*/5), or wildcard (*)
+    local cron_field='(\*|[0-9]{1,2}(-[0-9]{1,2})?(,[0-9]{1,2}(-[0-9]{1,2})?)*)(\/[0-9]{1,2})?'
+    local cron_pattern="^${cron_field}[[:space:]]+${cron_field}[[:space:]]+${cron_field}[[:space:]]+${cron_field}[[:space:]]+${cron_field}$"
+    [[ "$expr" =~ $cron_pattern ]] && return 0
+    # Also allow @reboot, @hourly, @daily, @weekly, @monthly, @yearly, @annually
+    case "$expr" in
+        @reboot|@hourly|@daily|@weekly|@monthly|@yearly|@annually) return 0 ;;
+    esac
+    return 1
+}
+
 _add_automation_cron() {
     local auto_id="$1" cron_expr="$2" action="$3" target="$4"
+    # Security: validate cron expression to prevent injection
+    if ! _validate_cron_expression "$cron_expr"; then
+        return 1
+    fi
     local api_port="${API_PORT:-9876}"
     local api_bind="${API_BIND:-127.0.0.1}"
     local cron_line="$cron_expr curl -s -X POST http://${api_bind}:${api_port}/automations/${auto_id}/run >/dev/null 2>&1 # DCS-AUTO:${auto_id}"
@@ -5634,6 +6806,360 @@ handle_topology() {
 }
 
 # =============================================================================
+# SETUP WIZARD ENDPOINTS
+# =============================================================================
+
+# GET /setup/status — Always available, no auth. Reports whether server needs setup.
+handle_setup_status() {
+    _api_init_auth_dir
+    if _api_is_initialized; then
+        _api_success '{"initialized": true}'
+    else
+        local needs_admin="true" needs_config="true"
+        [[ "$(_api_user_count)" -gt 0 ]] && needs_admin="false"
+        [[ -f "$BASE_DIR/.env" ]] && needs_config="false"
+        _api_success "{\"initialized\": false, \"needs_admin\": $needs_admin, \"needs_config\": $needs_config}"
+    fi
+}
+
+# GET /setup/defaults — No auth, only when not initialized.
+# Returns .env.example parsed as defaults + auto-detected system values + stack list.
+handle_setup_defaults() {
+    _api_require_setup_mode || return
+
+    # Parse defaults from .env.example
+    local defaults_json="{"
+    local first=true
+    if [[ -f "$BASE_DIR/.env.example" ]]; then
+        while IFS= read -r line; do
+            # Skip comments and blank lines
+            [[ "$line" =~ ^[[:space:]]*# ]] && continue
+            [[ -z "${line// /}" ]] && continue
+            # Extract KEY=VALUE
+            if [[ "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*) ]]; then
+                local key="${BASH_REMATCH[1]}"
+                local val="${BASH_REMATCH[2]}"
+                # Strip surrounding quotes
+                val="${val#\"}" ; val="${val%\"}"
+                val="${val#\'}" ; val="${val%\'}"
+                [[ "$first" == "true" ]] && first=false || defaults_json+=","
+                defaults_json+="\"$key\": \"$(_api_json_escape "$val")\""
+            fi
+        done < "$BASE_DIR/.env.example"
+    fi
+    defaults_json+="}"
+
+    # Build stacks array from DOCKER_STACKS or defaults
+    local stacks_json="["
+    local stack_list
+    if [[ -n "${DOCKER_STACKS:-}" ]]; then
+        read -ra stack_list <<< "$DOCKER_STACKS"
+    else
+        stack_list=(
+            "core-infrastructure" "networking-security" "monitoring-management"
+            "development-tools" "media-services" "web-applications"
+            "storage-backup" "communication-collaboration"
+            "entertainment-personal" "miscellaneous-services"
+        )
+    fi
+    local sfirst=true
+    for s in "${stack_list[@]}"; do
+        [[ "$sfirst" == "true" ]] && sfirst=false || stacks_json+=","
+        stacks_json+="\"$(_api_json_escape "$s")\""
+    done
+    stacks_json+="]"
+
+    # Auto-detect system values
+    local sys_hostname sys_tz sys_puid sys_pgid sys_docker sys_compose
+    sys_hostname="$(hostname 2>/dev/null || echo 'unknown')"
+    sys_tz="$(timedatectl show -p Timezone --value 2>/dev/null || echo 'UTC')"
+    sys_puid="$(id -u 2>/dev/null || echo '1000')"
+    sys_pgid="$(id -g 2>/dev/null || echo '1000')"
+    sys_docker="$(docker version --format '{{.Server.Version}}' 2>/dev/null || echo 'unknown')"
+    sys_compose="$($DOCKER_COMPOSE_CMD version --short 2>/dev/null || echo 'unknown')"
+
+    _api_success "{\"defaults\": $defaults_json, \"stacks\": $stacks_json, \"system\": {\"hostname\": \"$(_api_json_escape "$sys_hostname")\", \"timezone\": \"$(_api_json_escape "$sys_tz")\", \"puid\": $sys_puid, \"pgid\": $sys_pgid, \"docker_version\": \"$(_api_json_escape "$sys_docker")\", \"compose_version\": \"$(_api_json_escape "$sys_compose")\"}}"
+}
+
+# POST /setup/configure — Requires auth token, only when not initialized.
+# Accepts env_vars + stacks array. Writes .env, syncs stack directories.
+handle_setup_configure() {
+    local body="$1"
+    _api_require_setup_mode || return
+
+    if ! command -v jq >/dev/null 2>&1; then
+        _api_error 500 "jq is required for setup configuration"
+        return
+    fi
+
+    # Parse env_vars object and stacks array
+    local env_vars stacks_array
+    env_vars=$(echo "$body" | jq -r '.env_vars // empty' 2>/dev/null)
+    stacks_array=$(echo "$body" | jq -r '.stacks // empty' 2>/dev/null)
+
+    if [[ -z "$env_vars" ]] || [[ "$env_vars" == "null" ]]; then
+        _api_error 400 "Missing required field: env_vars"
+        return
+    fi
+    if [[ -z "$stacks_array" ]] || [[ "$stacks_array" == "null" ]]; then
+        _api_error 400 "Missing required field: stacks"
+        return
+    fi
+
+    # Build DOCKER_STACKS string from array
+    local docker_stacks_str
+    docker_stacks_str=$(echo "$stacks_array" | jq -r '.[]' 2>/dev/null | tr '\n' ' ')
+    docker_stacks_str="${docker_stacks_str% }"  # trim trailing space
+
+    # Validate all stack names
+    local sname
+    for sname in $docker_stacks_str; do
+        if [[ ! "$sname" =~ ^[a-zA-Z0-9][a-zA-Z0-9_-]*$ ]]; then
+            _api_error 400 "Invalid stack name: $sname"
+            return
+        fi
+    done
+
+    # Backup existing .env
+    if [[ -f "$BASE_DIR/.env" ]]; then
+        cp "$BASE_DIR/.env" "$BASE_DIR/.env.bak" 2>/dev/null
+    fi
+
+    # Start from .env.example as template, or existing .env
+    local env_file="$BASE_DIR/.env"
+    if [[ ! -f "$env_file" ]] && [[ -f "$BASE_DIR/.env.example" ]]; then
+        cp "$BASE_DIR/.env.example" "$env_file"
+    elif [[ ! -f "$env_file" ]]; then
+        touch "$env_file"
+    fi
+
+    # Read env content
+    local env_content
+    env_content=$(cat "$env_file")
+
+    # Apply each env_var from the request
+    local env_updated=0
+    local keys
+    keys=$(echo "$env_vars" | jq -r 'keys[]' 2>/dev/null)
+    local key val
+    for key in $keys; do
+        val=$(echo "$env_vars" | jq -r --arg k "$key" '.[$k] // empty' 2>/dev/null)
+        # Replace existing KEY=... line or append
+        if echo "$env_content" | grep -q "^${key}="; then
+            env_content=$(echo "$env_content" | sed "s|^${key}=.*|${key}=\"${val}\"|")
+            ((env_updated++))
+        else
+            env_content+=$'\n'"${key}=\"${val}\""
+            ((env_updated++))
+        fi
+    done
+
+    # Always set DOCKER_STACKS
+    if echo "$env_content" | grep -q "^DOCKER_STACKS="; then
+        env_content=$(echo "$env_content" | sed "s|^DOCKER_STACKS=.*|DOCKER_STACKS=\"${docker_stacks_str}\"|")
+    else
+        env_content+=$'\n'"DOCKER_STACKS=\"${docker_stacks_str}\""
+    fi
+
+    # Write .env
+    echo "$env_content" > "$env_file"
+
+    # Sync stack directories
+    local stacks_created="[]" stacks_removed="[]" stacks_warned="[]"
+    local created_list="" removed_list="" warned_list=""
+
+    # Create directories for stacks that don't exist
+    for sname in $docker_stacks_str; do
+        local sdir="$COMPOSE_DIR/$sname"
+        if [[ ! -d "$sdir" ]]; then
+            mkdir -p "$sdir/App-Data"
+            # Create placeholder compose
+            cat > "$sdir/docker-compose.yml" <<'COMPOSE_EOF'
+services:
+  # Add your services here
+  # Example:
+  # my-service:
+  #   container_name: my-service
+  #   image: alpine:latest
+  #   restart: unless-stopped
+  #   environment:
+  #     - TZ=${TZ:-UTC}
+  #   volumes:
+  #     - ${APP_DATA_DIR:-./App-Data}/my-service:/data
+COMPOSE_EOF
+            cat > "$sdir/.env" <<ENV_EOF
+# =============================================================================
+# $sname — Stack Environment Variables
+# =============================================================================
+
+# Inherit from root .env:
+# PUID, PGID, TZ, APP_DATA_DIR, PROXY_DOMAIN
+ENV_EOF
+            [[ -n "$created_list" ]] && created_list+=","
+            created_list+="\"$(_api_json_escape "$sname")\""
+        fi
+    done
+
+    # Check for directories that exist but are NOT in the new stacks list
+    if [[ -d "$COMPOSE_DIR" ]]; then
+        local existing_dir
+        for existing_dir in "$COMPOSE_DIR"/*/; do
+            [[ -d "$existing_dir" ]] || continue
+            local dname
+            dname=$(basename "$existing_dir")
+            # Check if this directory is in the new stacks list
+            local found=false
+            for sname in $docker_stacks_str; do
+                [[ "$sname" == "$dname" ]] && { found=true; break; }
+            done
+            if [[ "$found" == "false" ]]; then
+                # Check if it's a placeholder (only has template compose)
+                local service_count
+                service_count=$(grep -c "container_name:" "$existing_dir/docker-compose.yml" 2>/dev/null || echo "0")
+                if [[ "$service_count" -eq 0 ]]; then
+                    rm -rf "$existing_dir"
+                    [[ -n "$removed_list" ]] && removed_list+=","
+                    removed_list+="\"$(_api_json_escape "$dname")\""
+                else
+                    [[ -n "$warned_list" ]] && warned_list+=","
+                    warned_list+="\"$(_api_json_escape "$dname")\""
+                fi
+            fi
+        done
+    fi
+
+    _api_success "{\"success\": true, \"stacks_created\": [$created_list], \"stacks_removed\": [$removed_list], \"stacks_warned\": [$warned_list], \"env_updated\": $env_updated}"
+}
+
+# POST /setup/complete — Requires auth, only when not initialized.
+# Creates the setup-complete marker file.
+handle_setup_complete() {
+    _api_require_setup_mode || return
+    _api_init_auth_dir
+    touch "$SETUP_COMPLETE_MARKER"
+    _api_success '{"initialized": true, "message": "Setup complete"}'
+}
+
+# =============================================================================
+# STACK MANAGEMENT ENDPOINTS (admin-only, work post-setup too)
+# =============================================================================
+
+# POST /stacks/rename — Rename a stack directory
+handle_stack_rename() {
+    local body="$1"
+
+    if ! _api_check_admin; then
+        _api_error 403 "Admin access required"
+        return
+    fi
+
+    local old_name new_name
+    if command -v jq >/dev/null 2>&1; then
+        old_name=$(echo "$body" | jq -r '.old_name // empty' 2>/dev/null)
+        new_name=$(echo "$body" | jq -r '.new_name // empty' 2>/dev/null)
+    else
+        old_name=$(echo "$body" | sed -n 's/.*"old_name" *: *"\([^"]*\)".*/\1/p')
+        new_name=$(echo "$body" | sed -n 's/.*"new_name" *: *"\([^"]*\)".*/\1/p')
+    fi
+
+    if [[ -z "$old_name" ]] || [[ -z "$new_name" ]]; then
+        _api_error 400 "Missing required fields: old_name and new_name"
+        return
+    fi
+
+    _api_validate_stack_name "$old_name" || return
+    _api_validate_stack_name "$new_name" || return
+
+    local old_dir="$COMPOSE_DIR/$old_name"
+    local new_dir="$COMPOSE_DIR/$new_name"
+
+    if [[ ! -d "$old_dir" ]]; then
+        _api_error 404 "Stack not found: $old_name"
+        return
+    fi
+    if [[ -d "$new_dir" ]]; then
+        _api_error 409 "Stack already exists: $new_name"
+        return
+    fi
+
+    # Check no running containers
+    local running
+    running=$($DOCKER_COMPOSE_CMD -f "$old_dir/docker-compose.yml" ps -q 2>/dev/null | wc -l)
+    if [[ "$running" -gt 0 ]]; then
+        _api_error 409 "Cannot rename stack with running containers. Stop the stack first."
+        return
+    fi
+
+    mv "$old_dir" "$new_dir"
+
+    # Update DOCKER_STACKS in .env
+    if [[ -f "$BASE_DIR/.env" ]]; then
+        sed -i "s|$old_name|$new_name|g" "$BASE_DIR/.env"
+    fi
+
+    _api_success "{\"success\": true, \"old_name\": \"$(_api_json_escape "$old_name")\", \"new_name\": \"$(_api_json_escape "$new_name")\"}"
+}
+
+# POST /stacks/reorder — Set stack startup order
+handle_stack_reorder() {
+    local body="$1"
+
+    if ! _api_check_admin; then
+        _api_error 403 "Admin access required"
+        return
+    fi
+
+    if ! command -v jq >/dev/null 2>&1; then
+        _api_error 500 "jq is required for this operation"
+        return
+    fi
+
+    local stacks_str
+    stacks_str=$(echo "$body" | jq -r '.stacks // empty' 2>/dev/null)
+    if [[ -z "$stacks_str" ]] || [[ "$stacks_str" == "null" ]]; then
+        _api_error 400 "Missing required field: stacks"
+        return
+    fi
+
+    # Validate all names and verify directories exist
+    local ordered_str=""
+    local sname
+    while IFS= read -r sname; do
+        [[ -z "$sname" ]] && continue
+        if [[ ! "$sname" =~ ^[a-zA-Z0-9][a-zA-Z0-9_-]*$ ]]; then
+            _api_error 400 "Invalid stack name: $sname"
+            return
+        fi
+        if [[ ! -d "$COMPOSE_DIR/$sname" ]]; then
+            _api_error 404 "Stack directory not found: $sname"
+            return
+        fi
+        [[ -n "$ordered_str" ]] && ordered_str+=" "
+        ordered_str+="$sname"
+    done < <(echo "$stacks_str" | jq -r '.[]' 2>/dev/null)
+
+    # Write DOCKER_STACKS to .env
+    if [[ -f "$BASE_DIR/.env" ]]; then
+        if grep -q "^DOCKER_STACKS=" "$BASE_DIR/.env"; then
+            sed -i "s|^DOCKER_STACKS=.*|DOCKER_STACKS=\"${ordered_str}\"|" "$BASE_DIR/.env"
+        else
+            echo "DOCKER_STACKS=\"${ordered_str}\"" >> "$BASE_DIR/.env"
+        fi
+    fi
+
+    # Build response array
+    local order_json="["
+    local ofirst=true
+    for sname in $ordered_str; do
+        [[ "$ofirst" == "true" ]] && ofirst=false || order_json+=","
+        order_json+="\"$(_api_json_escape "$sname")\""
+    done
+    order_json+="]"
+
+    _api_success "{\"success\": true, \"order\": $order_json}"
+}
+
+# =============================================================================
 # REQUEST ROUTER
 # =============================================================================
 
@@ -5648,9 +7174,10 @@ handle_request() {
     method=$(echo "$request_line" | awk '{print $1}')
     path=$(echo "$request_line" | awk '{print $2}')
 
-    # Consume remaining headers and capture Content-Length and Authorization
+    # Consume remaining headers and capture Content-Length, Authorization, Origin
     local header="" content_length=0
     REQUEST_AUTH_HEADER=""
+    REQUEST_ORIGIN_HEADER=""
     while IFS= read -r header; do
         header="${header%%$'\r'}"
         [[ -z "$header" ]] && break
@@ -5666,11 +7193,20 @@ handle_request() {
             # Re-extract preserving the space after "Bearer "
             REQUEST_AUTH_HEADER="${header#*: }"
         fi
+        # Capture origin header for CORS validation
+        if [[ "${header,,}" == origin:* ]]; then
+            REQUEST_ORIGIN_HEADER="${header#*: }"
+            REQUEST_ORIGIN_HEADER="${REQUEST_ORIGIN_HEADER## }"
+        fi
     done
 
-    # Read request body if present
+    # Read request body if present (enforce size limit)
     local request_body=""
     if [[ "$content_length" -gt 0 ]] 2>/dev/null; then
+        if [[ "$content_length" -gt "$API_MAX_BODY_SIZE" ]]; then
+            _api_error 413 "Request body too large. Maximum: ${API_MAX_BODY_SIZE} bytes"
+            return
+        fi
         request_body=$(dd bs=1 count="$content_length" 2>/dev/null)
     fi
 
@@ -5707,10 +7243,12 @@ handle_request() {
     # ── Route: GET endpoints ──────────────────────────────────────────
     if [[ "$method" == "GET" ]]; then
 
-        # Auth endpoints that do NOT require authentication
+        # Auth/setup endpoints that do NOT require authentication
         case "$path" in
-            /)              handle_root; return ;;
-            /auth/verify)   handle_auth_verify; return ;;
+            /)                handle_root; return ;;
+            /auth/verify)     handle_auth_verify; return ;;
+            /setup/status)    handle_setup_status; return ;;
+            /setup/defaults)  handle_setup_defaults; return ;;
         esac
 
         # All other GET endpoints require authentication
@@ -5761,41 +7299,49 @@ handle_request() {
             /notifications/history)     handle_notification_history ;;
             /snapshots)                 handle_snapshots_list ;;
             /templates)                 handle_templates_list ;;
+            /templates/deploy-history)  handle_deploy_history ;;
             /automations)               handle_automations_list ;;
             /topology)                  handle_topology ;;
 
             /templates/*)
                 local tname="${path#/templates/}"
+                _api_validate_resource_name "$tname" "template" || return
                 handle_template_detail "$tname"
                 ;;
             /snapshots/*/download)
                 local snap="${path#/snapshots/}"
                 snap="${snap%/download}"
+                _api_validate_resource_name "$snap" "snapshot" || return
                 handle_snapshot_download "$snap"
                 ;;
             /stacks/*/compose/history)
                 local stack="${path#/stacks/}"
                 stack="${stack%/compose/history}"
+                _api_validate_stack_name "$stack" || return
                 handle_compose_history "$stack"
                 ;;
             /automations/*/history)
                 local auto_id="${path#/automations/}"
                 auto_id="${auto_id%/history}"
+                _api_validate_resource_name "$auto_id" "automation" || return
                 handle_automation_history "$auto_id"
                 ;;
             /containers/*/files)
                 local container="${path#/containers/}"
                 container="${container%/files}"
+                _api_validate_resource_name "$container" "container" || return
                 handle_container_files "$container" "${QUERY_PARAMS[path]:-/}"
                 ;;
             /containers/*/files/content)
                 local container="${path#/containers/}"
                 container="${container%/files/content}"
+                _api_validate_resource_name "$container" "container" || return
                 handle_container_file_content "$container" "${QUERY_PARAMS[path]:-}"
                 ;;
             /containers/*/logs/live)
                 local container="${path#/containers/}"
                 container="${container%/logs/live}"
+                _api_validate_resource_name "$container" "container" || return
                 handle_container_logs_live "$container" "${QUERY_PARAMS[lines]:-100}" "${QUERY_PARAMS[since]:-}"
                 ;;
             /logs/live)
@@ -5804,53 +7350,64 @@ handle_request() {
             /stacks/*/services)
                 local stack="${path#/stacks/}"
                 stack="${stack%/services}"
+                _api_validate_stack_name "$stack" || return
                 handle_stack_services "$stack"
                 ;;
             /stacks/*/containers)
                 local stack="${path#/stacks/}"
                 stack="${stack%/containers}"
+                _api_validate_stack_name "$stack" || return
                 handle_stack_containers "$stack"
                 ;;
             /stacks/*/logs)
                 local stack="${path#/stacks/}"
                 stack="${stack%/logs}"
+                _api_validate_stack_name "$stack" || return
                 handle_stack_logs "$stack"
                 ;;
             /stacks/*/compose)
                 local stack="${path#/stacks/}"
                 stack="${stack%/compose}"
+                _api_validate_stack_name "$stack" || return
                 handle_stack_compose "$stack"
                 ;;
             /stacks/*/env)
                 local stack="${path#/stacks/}"
                 stack="${stack%/env}"
+                _api_validate_stack_name "$stack" || return
                 handle_stack_env "$stack"
                 ;;
             /stacks/*)
                 local stack="${path#/stacks/}"
+                _api_validate_stack_name "$stack" || return
                 handle_stack_detail "$stack"
                 ;;
             /containers/*/stats)
                 local container="${path#/containers/}"
                 container="${container%/stats}"
+                _api_validate_resource_name "$container" "container" || return
                 handle_container_stats "$container"
                 ;;
             /containers/*/logs)
                 local container="${path#/containers/}"
                 container="${container%/logs}"
+                _api_validate_resource_name "$container" "container" || return
                 handle_container_logs "$container"
                 ;;
             /containers/*/processes)
                 local container="${path#/containers/}"
                 container="${container%/processes}"
+                _api_validate_resource_name "$container" "container" || return
                 handle_container_processes "$container"
                 ;;
             /networks/*)
                 local network="${path#/networks/}"
+                _api_validate_resource_name "$network" "network" || return
                 handle_network_detail "$network"
                 ;;
             /containers/*)
                 local container="${path#/containers/}"
+                _api_validate_resource_name "$container" "container" || return
                 handle_container_detail "$container"
                 ;;
             *)
@@ -5876,10 +7433,29 @@ handle_request() {
             return
         fi
 
+        # Setup wizard endpoints (require auth + setup not complete)
+        case "$path" in
+            /setup/configure) handle_setup_configure "$request_body"; return ;;
+            /setup/complete)  handle_setup_complete; return ;;
+        esac
+
+        # Auth session management endpoints (any authenticated user)
+        case "$path" in
+            /auth/logout)   handle_auth_logout; return ;;
+            /auth/refresh)  handle_auth_refresh; return ;;
+        esac
+
         # Auth endpoints that require admin
         case "$path" in
-            /auth/invite)   handle_auth_invite "$request_body"; return ;;
-            /auth/revoke)   handle_auth_revoke "$request_body"; return ;;
+            /auth/invite)      handle_auth_invite "$request_body"; return ;;
+            /auth/revoke)      handle_auth_revoke "$request_body"; return ;;
+            /auth/logout-all)  handle_auth_logout_all "$request_body"; return ;;
+        esac
+
+        # Stack management endpoints (admin-only)
+        case "$path" in
+            /stacks/rename)   handle_stack_rename "$request_body"; return ;;
+            /stacks/reorder)  handle_stack_reorder "$request_body"; return ;;
         esac
 
         # Standard authenticated POST endpoints
@@ -5908,6 +7484,7 @@ handle_request() {
             /stacks/*/delete)
                 local stack="${path#/stacks/}"
                 stack="${stack%/delete}"
+                _api_validate_stack_name "$stack" || return
                 handle_delete_stack "$stack"
                 ;;
             /config)
@@ -5916,26 +7493,37 @@ handle_request() {
             /containers/*/start)
                 local container="${path#/containers/}"
                 container="${container%/start}"
+                _api_validate_resource_name "$container" "container" || return
                 handle_container_action "$container" "start"
                 ;;
             /containers/*/stop)
                 local container="${path#/containers/}"
                 container="${container%/stop}"
+                _api_validate_resource_name "$container" "container" || return
                 handle_container_action "$container" "stop"
                 ;;
             /containers/*/restart)
                 local container="${path#/containers/}"
                 container="${container%/restart}"
+                _api_validate_resource_name "$container" "container" || return
                 handle_container_action "$container" "restart"
+                ;;
+            /containers/*/remove)
+                local container="${path#/containers/}"
+                container="${container%/remove}"
+                _api_validate_resource_name "$container" "container" || return
+                handle_container_action "$container" "remove"
                 ;;
             /containers/*/exec)
                 local container="${path#/containers/}"
                 container="${container%/exec}"
+                _api_validate_resource_name "$container" "container" || return
                 handle_container_exec "$container" "$request_body"
                 ;;
             /containers/*/rename)
                 local container="${path#/containers/}"
                 container="${container%/rename}"
+                _api_validate_resource_name "$container" "container" || return
                 handle_container_rename "$container" "$request_body"
                 ;;
             /networks)
@@ -5944,26 +7532,31 @@ handle_request() {
             /networks/*/delete)
                 local network="${path#/networks/}"
                 network="${network%/delete}"
+                _api_validate_resource_name "$network" "network" || return
                 handle_delete_network "$network"
                 ;;
             /networks/*/connect)
                 local network="${path#/networks/}"
                 network="${network%/connect}"
+                _api_validate_resource_name "$network" "network" || return
                 handle_network_connect "$network" "$request_body"
                 ;;
             /networks/*/disconnect)
                 local network="${path#/networks/}"
                 network="${network%/disconnect}"
+                _api_validate_resource_name "$network" "network" || return
                 handle_network_disconnect "$network" "$request_body"
                 ;;
             /images/*/delete)
                 local image="${path#/images/}"
                 image="${image%/delete}"
+                _api_validate_resource_name "$image" "image" || return
                 handle_image_delete "$image"
                 ;;
             /volumes/*/delete)
                 local volume="${path#/volumes/}"
                 volume="${volume%/delete}"
+                _api_validate_resource_name "$volume" "volume" || return
                 handle_delete_volume "$volume"
                 ;;
             /maintenance/prune)
@@ -5999,21 +7592,25 @@ handle_request() {
             /stacks/*/compose/validate)
                 local stack="${path#/stacks/}"
                 stack="${stack%/compose/validate}"
+                _api_validate_stack_name "$stack" || return
                 handle_stack_compose_validate "$stack" "$request_body"
                 ;;
             /stacks/*/compose)
                 local stack="${path#/stacks/}"
                 stack="${stack%/compose}"
+                _api_validate_stack_name "$stack" || return
                 handle_stack_compose_save "$stack" "$request_body"
                 ;;
             /stacks/*/env)
                 local stack="${path#/stacks/}"
                 stack="${stack%/env}"
+                _api_validate_stack_name "$stack" || return
                 handle_stack_env_save "$stack" "$request_body"
                 ;;
             /stacks/*/compose/rollback)
                 local stack="${path#/stacks/}"
                 stack="${stack%/compose/rollback}"
+                _api_validate_stack_name "$stack" || return
                 handle_compose_rollback "$stack" "$request_body"
                 ;;
             /metrics/snapshot)
@@ -6025,6 +7622,7 @@ handle_request() {
             /images/*/update)
                 local img="${path#/images/}"
                 img="${img%/update}"
+                _api_validate_resource_name "$img" "image" || return
                 handle_image_update "$img"
                 ;;
             /notifications/rules)
@@ -6039,12 +7637,26 @@ handle_request() {
             /snapshots/*/restore)
                 local snap="${path#/snapshots/}"
                 snap="${snap%/restore}"
+                _api_validate_resource_name "$snap" "snapshot" || return
                 handle_snapshot_restore "$snap" "$request_body"
                 ;;
             /templates/*/deploy)
                 local tname="${path#/templates/}"
                 tname="${tname%/deploy}"
+                _api_validate_resource_name "$tname" "template" || return
                 handle_template_deploy "$tname" "$request_body"
+                ;;
+            /templates/*/undeploy)
+                local tname="${path#/templates/}"
+                tname="${tname%/undeploy}"
+                _api_validate_resource_name "$tname" "template" || return
+                handle_template_undeploy "$tname" "$request_body"
+                ;;
+            /templates/*/dry-run)
+                local tname="${path#/templates/}"
+                tname="${tname%/dry-run}"
+                _api_validate_resource_name "$tname" "template" || return
+                handle_template_dry_run "$tname" "$request_body"
                 ;;
             /templates/import)
                 handle_template_import "$request_body"
@@ -6052,6 +7664,7 @@ handle_request() {
             /templates/*/update)
                 local tname="${path#/templates/}"
                 tname="${tname%/update}"
+                _api_validate_resource_name "$tname" "template" || return
                 handle_template_update "$tname" "$request_body"
                 ;;
             /automations)
@@ -6060,26 +7673,31 @@ handle_request() {
             /automations/*/update)
                 local auto_id="${path#/automations/}"
                 auto_id="${auto_id%/update}"
+                _api_validate_resource_name "$auto_id" "automation" || return
                 handle_automation_update "$auto_id" "$request_body"
                 ;;
             /stacks/*/start)
                 local stack="${path#/stacks/}"
                 stack="${stack%/start}"
+                _api_validate_stack_name "$stack" || return
                 handle_stack_action "$stack" "start"
                 ;;
             /stacks/*/stop)
                 local stack="${path#/stacks/}"
                 stack="${stack%/stop}"
+                _api_validate_stack_name "$stack" || return
                 handle_stack_action "$stack" "stop"
                 ;;
             /stacks/*/restart)
                 local stack="${path#/stacks/}"
                 stack="${stack%/restart}"
+                _api_validate_stack_name "$stack" || return
                 handle_stack_action "$stack" "restart"
                 ;;
             /stacks/*/update)
                 local stack="${path#/stacks/}"
                 stack="${stack%/update}"
+                _api_validate_stack_name "$stack" || return
                 handle_stack_action "$stack" "update"
                 ;;
             *)
@@ -6105,18 +7723,22 @@ handle_request() {
                 ;;
             /notifications/rules/*)
                 local rule_id="${path#/notifications/rules/}"
+                _api_validate_resource_name "$rule_id" "notification rule" || return
                 handle_notification_rules_delete "$rule_id"
                 ;;
             /snapshots/*)
                 local snap="${path#/snapshots/}"
+                _api_validate_resource_name "$snap" "snapshot" || return
                 handle_snapshot_delete "$snap"
                 ;;
             /templates/*)
                 local tname="${path#/templates/}"
+                _api_validate_resource_name "$tname" "template" || return
                 handle_template_delete "$tname"
                 ;;
             /automations/*)
                 local auto_id="${path#/automations/}"
+                _api_validate_resource_name "$auto_id" "automation" || return
                 handle_automation_delete "$auto_id"
                 ;;
             *)

@@ -3,6 +3,7 @@
   "title": "Caddy Web Server",
   "description": "Caddy modern web server with automatic HTTPS and reverse proxy capabilities",
   "category": "web",
+  "target_stack": "networking-security",
   "icon": "🔒",
   "tags": ["web", "reverse-proxy", "ssl", "https", "caddy"],
   "variables": [

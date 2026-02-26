@@ -3,6 +3,7 @@
   "title": "Grafana",
   "description": "Grafana open-source analytics and monitoring dashboards",
   "category": "monitoring",
+  "target_stack": "monitoring-management",
   "icon": "📊",
   "tags": ["monitoring", "dashboards", "analytics", "visualization", "grafana"],
   "variables": [

@@ -3,6 +3,7 @@
   "title": "MySQL",
   "description": "Popular open-source relational database with comprehensive SQL support, replication, and robust data integrity.",
   "category": "databases",
+  "target_stack": "development-tools",
   "icon": "🐬",
   "tags": ["sql", "relational", "database", "mysql"],
   "variables": [

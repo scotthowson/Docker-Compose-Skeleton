@@ -3,6 +3,7 @@
   "title": "Uptime Kuma",
   "description": "Uptime Kuma self-hosted uptime monitoring tool with status pages and notifications",
   "category": "monitoring",
+  "target_stack": "monitoring-management",
   "icon": "📡",
   "tags": ["monitoring", "uptime", "status-page", "alerts", "health-check"],
   "variables": [
