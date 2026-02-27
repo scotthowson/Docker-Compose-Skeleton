@@ -1187,6 +1187,7 @@ handle_root() {
     {"method": "POST",   "path": "/auth/revoke",             "description": "Revoke user access", "auth": "admin"},
     {"method": "GET",    "path": "/auth/invites",            "description": "List active invites", "auth": "admin"},
     {"method": "DELETE",  "path": "/auth/invite/:code",      "description": "Delete invite code", "auth": "admin"},
+    {"method": "POST",   "path": "/auth/factory-reset",     "description": "Wipe auth state and return to setup wizard", "auth": "admin"},
     {"method": "POST",   "path": "/metrics/snapshot",        "description": "Capture system metrics snapshot"},
     {"method": "GET",    "path": "/metrics/trends",           "description": "Query metrics history (range: 1h|6h|24h|7d)"},
     {"method": "GET",    "path": "/images/check-updates",     "description": "Quick local image staleness check"},
@@ -2891,6 +2892,76 @@ handle_auth_refresh() {
     _api_audit_log "$client_ip" "TOKEN_REFRESH" "$username" "Token refreshed"
 
     _api_success "{\"success\": true, \"token\": \"$new_token\", \"username\": \"$(_api_json_escape "$username")\", \"role\": \"$(_api_json_escape "$role")\"}"
+}
+
+# POST /auth/factory-reset — Wipe auth state and return server to first-run mode
+handle_auth_factory_reset() {
+    local body="$1"
+
+    # Require admin role
+    if ! _api_check_admin; then
+        _api_error 403 "Admin role required for factory reset"
+        return
+    fi
+
+    # Parse request body
+    local confirm="" reset_compose="false"
+    if command -v jq >/dev/null 2>&1; then
+        confirm=$(echo "$body" | jq -r '.confirm // ""' 2>/dev/null)
+        reset_compose=$(echo "$body" | jq -r '.reset_compose // false' 2>/dev/null)
+    else
+        confirm=$(echo "$body" | sed -n 's/.*"confirm"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+        reset_compose=$(echo "$body" | sed -n 's/.*"reset_compose"[[:space:]]*:[[:space:]]*\(true\|false\).*/\1/p')
+    fi
+
+    # Validate confirmation string
+    if [[ "$confirm" != "FACTORY_RESET" ]]; then
+        _api_error 400 "Missing or incorrect confirmation. Send {\"confirm\": \"FACTORY_RESET\"}"
+        return
+    fi
+
+    _api_init_auth_dir
+    local auth_dir="$BASE_DIR/.api-auth"
+    local removed_json="["
+    local rfirst=true
+
+    # Files to remove (auth state + setup flag)
+    local reset_files=(
+        ".setup-complete"
+        "users.json"
+        "tokens.json"
+        "deploy-history.json"
+        "invites.json"
+        "terminal-sessions.json"
+        "terminal-auth-rate.json"
+        "auth-audit.log"
+        "terminal-auth-audit.log"
+        "terminal-rate.log"
+        "rate_limits.json"
+    )
+
+    for f in "${reset_files[@]}"; do
+        if [[ -f "$auth_dir/$f" ]]; then
+            rm -f "$auth_dir/$f"
+            [[ "$rfirst" == "true" ]] && rfirst=false || removed_json+=","
+            removed_json+="\"$f\""
+        fi
+    done
+    removed_json+="]"
+
+    # Optionally reset compose files to git defaults
+    local compose_reset="false"
+    if [[ "$reset_compose" == "true" ]]; then
+        if command -v git >/dev/null 2>&1 && [[ -d "$BASE_DIR/.git" ]]; then
+            cd "$BASE_DIR" && git checkout -- Stacks/*/docker-compose.yml 2>/dev/null
+            compose_reset="true"
+        fi
+    fi
+
+    local client_ip="${SOCAT_PEERADDR:-unknown}"
+    _api_audit_log "$client_ip" "FACTORY_RESET" "${AUTH_USERNAME:-unknown}" "Factory reset performed. compose_reset=$compose_reset"
+
+    _api_success "{\"success\": true, \"files_removed\": $removed_json, \"compose_reset\": $compose_reset}"
 }
 
 # =============================================================================
@@ -6878,7 +6949,11 @@ handle_setup_defaults() {
     sys_docker="$(docker version --format '{{.Server.Version}}' 2>/dev/null || echo 'unknown')"
     sys_compose="$($DOCKER_COMPOSE_CMD version --short 2>/dev/null || echo 'unknown')"
 
-    _api_success "{\"defaults\": $defaults_json, \"stacks\": $stacks_json, \"system\": {\"hostname\": \"$(_api_json_escape "$sys_hostname")\", \"timezone\": \"$(_api_json_escape "$sys_tz")\", \"puid\": $sys_puid, \"pgid\": $sys_pgid, \"docker_version\": \"$(_api_json_escape "$sys_docker")\", \"compose_version\": \"$(_api_json_escape "$sys_compose")\"}}"
+    # Check Docker availability
+    local docker_ok="false"
+    if docker info >/dev/null 2>&1; then docker_ok="true"; fi
+
+    _api_success "{\"defaults\": $defaults_json, \"stacks\": $stacks_json, \"system\": {\"hostname\": \"$(_api_json_escape "$sys_hostname")\", \"timezone\": \"$(_api_json_escape "$sys_tz")\", \"puid\": $sys_puid, \"pgid\": $sys_pgid, \"docker_version\": \"$(_api_json_escape "$sys_docker")\", \"compose_version\": \"$(_api_json_escape "$sys_compose")\", \"docker_available\": $docker_ok}}"
 }
 
 # POST /setup/configure — Requires auth token, only when not initialized.
@@ -7447,9 +7522,10 @@ handle_request() {
 
         # Auth endpoints that require admin
         case "$path" in
-            /auth/invite)      handle_auth_invite "$request_body"; return ;;
-            /auth/revoke)      handle_auth_revoke "$request_body"; return ;;
-            /auth/logout-all)  handle_auth_logout_all "$request_body"; return ;;
+            /auth/invite)         handle_auth_invite "$request_body"; return ;;
+            /auth/revoke)         handle_auth_revoke "$request_body"; return ;;
+            /auth/logout-all)     handle_auth_logout_all "$request_body"; return ;;
+            /auth/factory-reset)  handle_auth_factory_reset "$request_body"; return ;;
         esac
 
         # Stack management endpoints (admin-only)
