@@ -2990,6 +2990,12 @@ handle_auth_factory_reset() {
         fi
     fi
 
+    # Remove DOCKER_STACKS from .env so setup wizard shows default 10 stacks
+    if [[ -f "$BASE_DIR/.env" ]]; then
+        sed -i '/^DOCKER_STACKS=/d' "$BASE_DIR/.env"
+        unset DOCKER_STACKS
+    fi
+
     local client_ip="${SOCAT_PEERADDR:-unknown}"
     _api_audit_log "$client_ip" "FACTORY_RESET" "${AUTH_USERNAME:-unknown}" "Factory reset performed. compose_reset=$compose_reset"
 
