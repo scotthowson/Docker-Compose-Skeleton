@@ -2949,11 +2949,43 @@ handle_auth_factory_reset() {
     done
     removed_json+="]"
 
-    # Optionally reset compose files to git defaults
+    # Optionally reset compose files to git defaults and remove user-created stacks
     local compose_reset="false"
+    local stacks_removed_json="[]"
     if [[ "$reset_compose" == "true" ]]; then
         if command -v git >/dev/null 2>&1 && [[ -d "$BASE_DIR/.git" ]]; then
-            cd "$BASE_DIR" && git checkout -- Stacks/*/docker-compose.yml 2>/dev/null
+            cd "$BASE_DIR"
+            # Reset tracked compose files to git defaults
+            git checkout -- Stacks/*/docker-compose.yml 2>/dev/null
+            # Remove user-created (untracked) stack directories
+            local -a removed_stacks=()
+            local stacks_dir="$BASE_DIR/Stacks"
+            if [[ -d "$stacks_dir" ]]; then
+                for d in "$stacks_dir"/*/; do
+                    [[ -d "$d" ]] || continue
+                    local dname
+                    dname=$(basename "$d")
+                    # Check if this stack has any git-tracked files
+                    if ! git -C "$BASE_DIR" ls-files --error-unmatch "Stacks/$dname/docker-compose.yml" >/dev/null 2>&1; then
+                        # Stop containers first, then remove directory
+                        if [[ -f "$d/docker-compose.yml" ]]; then
+                            $DOCKER_COMPOSE_CMD -f "$d/docker-compose.yml" down --remove-orphans 2>/dev/null || true
+                        fi
+                        rm -rf "$d"
+                        removed_stacks+=("$dname")
+                    fi
+                done
+            fi
+            # Build JSON array of removed stacks
+            if [[ ${#removed_stacks[@]} -gt 0 ]]; then
+                stacks_removed_json="["
+                local sfirst=true
+                for s in "${removed_stacks[@]}"; do
+                    [[ "$sfirst" == "true" ]] && sfirst=false || stacks_removed_json+=","
+                    stacks_removed_json+="\"$s\""
+                done
+                stacks_removed_json+="]"
+            fi
             compose_reset="true"
         fi
     fi
@@ -2961,7 +2993,7 @@ handle_auth_factory_reset() {
     local client_ip="${SOCAT_PEERADDR:-unknown}"
     _api_audit_log "$client_ip" "FACTORY_RESET" "${AUTH_USERNAME:-unknown}" "Factory reset performed. compose_reset=$compose_reset"
 
-    _api_success "{\"success\": true, \"files_removed\": $removed_json, \"compose_reset\": $compose_reset}"
+    _api_success "{\"success\": true, \"files_removed\": $removed_json, \"compose_reset\": $compose_reset, \"stacks_removed\": $stacks_removed_json}"
 }
 
 # =============================================================================
@@ -6393,7 +6425,7 @@ handle_template_undeploy() {
     for svc in "${services_to_remove[@]}"; do
         compose_content=$(printf '%s\n' "$compose_content" | awk -v svc="$svc" '
             BEGIN { skip=0 }
-            /^  [a-zA-Z_-]/ {
+            /^  [a-zA-Z0-9_-]/ {
                 if ($0 ~ "^  " svc ":") { skip=1; next }
                 else { skip=0 }
             }
@@ -6404,59 +6436,11 @@ handle_template_undeploy() {
         ')
     done
 
-    # Write updated compose
-    printf '%s\n' "$compose_content" > "$target_dir/docker-compose.yml"
+    # Check if any services remain after removal
+    local remaining_services
+    remaining_services=$(printf '%s\n' "$compose_content" | grep -cE '^  [a-zA-Z0-9_-]+:' 2>/dev/null || echo "0")
 
-    # Validate merged compose file — rollback on failure
-    local env_args=()
-    [[ -f "$target_dir/.env" ]] && env_args=(--env-file "$target_dir/.env")
-    local validate_output
-    validate_output=$($DOCKER_COMPOSE_CMD -f "$target_dir/docker-compose.yml" "${env_args[@]}" config 2>&1)
-    if [[ $? -ne 0 ]]; then
-        cp "$target_dir/docker-compose.yml.bak.${timestamp}" "$target_dir/docker-compose.yml"
-        _api_error 422 "Undeploy produced invalid compose file. Rolled back. Error: $(echo "$validate_output" | head -3)"
-        return
-    fi
-
-    # Clean up .env: remove template section header AND the KEY=VALUE lines below it
-    if [[ -f "$target_dir/.env" ]]; then
-        local env_before
-        env_before=$(cat "$target_dir/.env")
-        local env_after
-        env_after=$(printf '%s\n' "$env_before" | awk -v tpl="$name" '
-            BEGIN { skip=0 }
-            # Match section separator line
-            /^# =+$/ {
-                # Peek: if we are starting a skip block, this is the trailing separator
-                if (skip == 2) { skip=3; next }
-                # Save potential header start
-                hold=$0; skip=1; next
-            }
-            skip == 1 {
-                # Check if this is the template header line
-                if ($0 ~ "^# Template: " tpl) { skip=2; next }
-                # Not our template — print the held separator and this line
-                print hold; print; skip=0; next
-            }
-            skip == 2 {
-                # Still in header — skip the closing separator
-                if ($0 ~ /^# =+$/) { skip=3; next }
-                # Unexpected line in header position — print held content
-                print hold; print; skip=0; next
-            }
-            skip == 3 {
-                # Skip KEY=VALUE lines belonging to this template section
-                # Stop when we hit a blank line, a comment block, or end of file
-                if ($0 ~ /^$/) { skip=0; next }
-                if ($0 ~ /^# =+$/) { skip=0 }
-                if (skip == 3) next
-            }
-            { print }
-        ')
-        printf '%s\n' "$env_after" > "$target_dir/.env"
-    fi
-
-    # Remove containers if requested
+    # Remove containers if requested (do this before potential directory deletion)
     local -a containers_removed=()
     if [[ "$remove_containers" == "true" ]]; then
         for svc in "${services_to_remove[@]}"; do
@@ -6470,6 +6454,67 @@ handle_template_undeploy() {
                 fi
             done
         done
+    fi
+
+    # If no services remain, delete the entire stack directory
+    local stack_deleted="false"
+    if [[ "$remaining_services" -eq 0 ]]; then
+        # Stop any lingering containers
+        $DOCKER_COMPOSE_CMD -f "$target_dir/docker-compose.yml" down --remove-orphans 2>/dev/null || true
+        rm -rf "$target_dir"
+        stack_deleted="true"
+    else
+        # Write updated compose
+        printf '%s\n' "$compose_content" > "$target_dir/docker-compose.yml"
+
+        # Validate merged compose file — rollback on failure
+        local env_args=()
+        [[ -f "$target_dir/.env" ]] && env_args=(--env-file "$target_dir/.env")
+        local validate_output
+        validate_output=$($DOCKER_COMPOSE_CMD -f "$target_dir/docker-compose.yml" "${env_args[@]}" config 2>&1)
+        if [[ $? -ne 0 ]]; then
+            cp "$target_dir/docker-compose.yml.bak.${timestamp}" "$target_dir/docker-compose.yml"
+            _api_error 422 "Undeploy produced invalid compose file. Rolled back. Error: $(echo "$validate_output" | head -3)"
+            return
+        fi
+
+        # Clean up .env: remove template section header AND the KEY=VALUE lines below it
+        if [[ -f "$target_dir/.env" ]]; then
+            local env_before
+            env_before=$(cat "$target_dir/.env")
+            local env_after
+            env_after=$(printf '%s\n' "$env_before" | awk -v tpl="$name" '
+                BEGIN { skip=0 }
+                # Match section separator line
+                /^# =+$/ {
+                    # Peek: if we are starting a skip block, this is the trailing separator
+                    if (skip == 2) { skip=3; next }
+                    # Save potential header start
+                    hold=$0; skip=1; next
+                }
+                skip == 1 {
+                    # Check if this is the template header line
+                    if ($0 ~ "^# Template: " tpl) { skip=2; next }
+                    # Not our template — print the held separator and this line
+                    print hold; print; skip=0; next
+                }
+                skip == 2 {
+                    # Still in header — skip the closing separator
+                    if ($0 ~ /^# =+$/) { skip=3; next }
+                    # Unexpected line in header position — print held content
+                    print hold; print; skip=0; next
+                }
+                skip == 3 {
+                    # Skip KEY=VALUE lines belonging to this template section
+                    # Stop when we hit a blank line, a comment block, or end of file
+                    if ($0 ~ /^$/) { skip=0; next }
+                    if ($0 ~ /^# =+$/) { skip=0 }
+                    if (skip == 3) next
+                }
+                { print }
+            ')
+            printf '%s\n' "$env_after" > "$target_dir/.env"
+        fi
     fi
 
     # Build JSON arrays
@@ -6500,7 +6545,10 @@ handle_template_undeploy() {
     # Record undeploy event
     _record_deploy_event "undeploy" "$name" "$target_stack" "$svc_removed_json" "docker-compose.yml.bak.${timestamp}"
 
-    _api_success "{\"success\": true, \"template\": \"$(_api_json_escape "$name")\", \"target_stack\": \"$(_api_json_escape "$target_stack")\", \"services_removed\": $svc_removed_json, \"containers_removed\": $ctr_removed_json, \"backup_file\": \"docker-compose.yml.bak.${timestamp}\", \"message\": \"Services removed from $target_stack successfully\"}"
+    local msg="Services removed from $target_stack successfully"
+    [[ "$stack_deleted" == "true" ]] && msg="Stack $target_stack fully removed (no services remaining)"
+
+    _api_success "{\"success\": true, \"template\": \"$(_api_json_escape "$name")\", \"target_stack\": \"$(_api_json_escape "$target_stack")\", \"services_removed\": $svc_removed_json, \"containers_removed\": $ctr_removed_json, \"backup_file\": \"docker-compose.yml.bak.${timestamp}\", \"stack_deleted\": $stack_deleted, \"message\": \"$msg\"}"
 }
 
 handle_template_import() {
