@@ -4810,7 +4810,8 @@ handle_container_logs_live() {
     done <<< "$log_output"
     json_entries+="]"
 
-    _api_success "{\"container\": \"$(_api_json_escape "$container")\", \"entries\": $json_entries, \"count\": $(echo "$log_output" | grep -c . || echo 0)}"
+    local _lc; _lc=$(echo "$log_output" | grep -c . 2>/dev/null) || _lc=0
+    _api_success "{\"container\": \"$(_api_json_escape "$container")\", \"entries\": $json_entries, \"count\": $_lc}"
 }
 
 # GET /logs/live?lines=100&since=<timestamp> — Stream DCS application log
@@ -4862,7 +4863,8 @@ handle_app_logs_live() {
     done <<< "$log_output"
     json_entries+="]"
 
-    _api_success "{\"entries\": $json_entries, \"count\": $(echo "$log_output" | grep -c . || echo 0)}"
+    local _lc; _lc=$(echo "$log_output" | grep -c . 2>/dev/null) || _lc=0
+    _api_success "{\"entries\": $json_entries, \"count\": $_lc}"
 }
 
 # =============================================================================
@@ -6443,8 +6445,11 @@ handle_template_undeploy() {
     done
 
     # Check if any services remain after removal
+    # NOTE: grep -c exits 1 when count is 0; using || echo inside $() would
+    # capture BOTH grep's "0" and the fallback "0", producing "0\n0" which
+    # breaks the integer comparison.  Assign separately to avoid this.
     local remaining_services
-    remaining_services=$(printf '%s\n' "$compose_content" | grep -cE '^  [a-zA-Z0-9_-]+:' 2>/dev/null || echo "0")
+    remaining_services=$(printf '%s\n' "$compose_content" | grep -cE '^  [a-zA-Z0-9_-]+:' 2>/dev/null) || remaining_services=0
 
     # Remove containers if requested (do this before potential directory deletion)
     local -a containers_removed=()
@@ -6462,12 +6467,13 @@ handle_template_undeploy() {
         done
     fi
 
-    # If no services remain, delete the entire stack directory
+    # If no services remain, write a valid empty compose (preserves stack dir + App-Data)
     local stack_deleted="false"
     if [[ "$remaining_services" -eq 0 ]]; then
-        # Stop any lingering containers
+        # Stop any lingering containers from the original compose
         $DOCKER_COMPOSE_CMD -f "$target_dir/docker-compose.yml" down --remove-orphans 2>/dev/null || true
-        rm -rf "$target_dir"
+        # Write a valid minimal compose so the stack remains usable
+        printf 'services: {}\n' > "$target_dir/docker-compose.yml"
         stack_deleted="true"
     else
         # Write updated compose
@@ -6484,43 +6490,44 @@ handle_template_undeploy() {
             return
         fi
 
-        # Clean up .env: remove template section header AND the KEY=VALUE lines below it
-        if [[ -f "$target_dir/.env" ]]; then
-            local env_before
-            env_before=$(cat "$target_dir/.env")
-            local env_after
-            env_after=$(printf '%s\n' "$env_before" | awk -v tpl="$name" '
-                BEGIN { skip=0 }
-                # Match section separator line
-                /^# =+$/ {
-                    # Peek: if we are starting a skip block, this is the trailing separator
-                    if (skip == 2) { skip=3; next }
-                    # Save potential header start
-                    hold=$0; skip=1; next
-                }
-                skip == 1 {
-                    # Check if this is the template header line
-                    if ($0 ~ "^# Template: " tpl) { skip=2; next }
-                    # Not our template — print the held separator and this line
-                    print hold; print; skip=0; next
-                }
-                skip == 2 {
-                    # Still in header — skip the closing separator
-                    if ($0 ~ /^# =+$/) { skip=3; next }
-                    # Unexpected line in header position — print held content
-                    print hold; print; skip=0; next
-                }
-                skip == 3 {
-                    # Skip KEY=VALUE lines belonging to this template section
-                    # Stop when we hit a blank line, a comment block, or end of file
-                    if ($0 ~ /^$/) { skip=0; next }
-                    if ($0 ~ /^# =+$/) { skip=0 }
-                    if (skip == 3) next
-                }
-                { print }
-            ')
-            printf '%s\n' "$env_after" > "$target_dir/.env"
-        fi
+    fi
+
+    # Clean up .env: remove template section header AND the KEY=VALUE lines below it
+    if [[ -f "$target_dir/.env" ]]; then
+        local env_before
+        env_before=$(cat "$target_dir/.env")
+        local env_after
+        env_after=$(printf '%s\n' "$env_before" | awk -v tpl="$name" '
+            BEGIN { skip=0 }
+            # Match section separator line
+            /^# =+$/ {
+                # Peek: if we are starting a skip block, this is the trailing separator
+                if (skip == 2) { skip=3; next }
+                # Save potential header start
+                hold=$0; skip=1; next
+            }
+            skip == 1 {
+                # Check if this is the template header line
+                if ($0 ~ "^# Template: " tpl) { skip=2; next }
+                # Not our template — print the held separator and this line
+                print hold; print; skip=0; next
+            }
+            skip == 2 {
+                # Still in header — skip the closing separator
+                if ($0 ~ /^# =+$/) { skip=3; next }
+                # Unexpected line in header position — print held content
+                print hold; print; skip=0; next
+            }
+            skip == 3 {
+                # Skip KEY=VALUE lines belonging to this template section
+                # Stop when we hit a blank line, a comment block, or end of file
+                if ($0 ~ /^$/) { skip=0; next }
+                if ($0 ~ /^# =+$/) { skip=0 }
+                if (skip == 3) next
+            }
+            { print }
+        ')
+        printf '%s\n' "$env_after" > "$target_dir/.env"
     fi
 
     # Build JSON arrays
@@ -6865,6 +6872,7 @@ handle_topology() {
 
     # Build network map: network_name -> containers[]
     declare -A network_containers
+    declare -A container_ips   # container_ips["cname|netname"] = "ip"
 
     # Get all running containers with their networks
     while IFS= read -r container_id; do
@@ -6875,28 +6883,44 @@ handle_topology() {
         chealth=$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$container_id" 2>/dev/null)
         cimage=$(docker inspect --format '{{.Config.Image}}' "$container_id" 2>/dev/null)
 
-        # Get ports
-        cports=$(docker inspect --format '{{range $p, $conf := .NetworkSettings.Ports}}{{$p}}->{{range $conf}}{{.HostPort}}{{end}} {{end}}' "$container_id" 2>/dev/null | sed 's/ $//')
+        # Get ports (standard Docker notation: host:port->container/proto)
+        cports=$(docker inspect --format '{{range $p, $conf := .NetworkSettings.Ports}}{{range $conf}}{{if .HostIp}}{{.HostIp}}{{else}}0.0.0.0{{end}}:{{.HostPort}}->{{end}}{{$p}} {{end}}' "$container_id" 2>/dev/null | sed 's/ $//')
 
         # Get stack label
         local cstack
         cstack=$(docker inspect --format '{{index .Config.Labels "com.docker.compose.project"}}' "$container_id" 2>/dev/null)
         [[ "$cstack" == "<no value>" ]] && cstack=""
 
-        # Get networks
+        # Get networks + IPs
         local -a container_nets=()
-        while IFS= read -r netname; do
+        while IFS='|' read -r netname netip; do
             [[ -z "$netname" ]] && continue
             container_nets+=("\"$(_api_json_escape "$netname")\"")
             network_containers["$netname"]+="$cname "
-        done < <(docker inspect --format '{{range $key, $val := .NetworkSettings.Networks}}{{$key}}{{"\n"}}{{end}}' "$container_id" 2>/dev/null)
+            [[ -n "$netip" ]] && container_ips["$cname|$netname"]="$netip"
+        done < <(docker inspect --format '{{range $key, $val := .NetworkSettings.Networks}}{{$key}}|{{$val.IPAddress}}{{"\n"}}{{end}}' "$container_id" 2>/dev/null)
 
-        local nets_json
-        nets_json=$(printf '%s,' "${container_nets[@]}")
-        nets_json="[${nets_json%,}]"
-        [[ ${#container_nets[@]} -eq 0 ]] && nets_json="[]"
+        local container_nets_json
+        container_nets_json=$(printf '%s,' "${container_nets[@]}")
+        container_nets_json="[${container_nets_json%,}]"
+        [[ ${#container_nets[@]} -eq 0 ]] && container_nets_json="[]"
 
-        nodes+=("{\"id\": \"$(_api_json_escape "$cname")\", \"state\": \"$cstate\", \"health\": \"$chealth\", \"image\": \"$(_api_json_escape "$cimage")\", \"stack\": \"$(_api_json_escape "$cstack")\", \"networks\": $nets_json, \"ports\": \"$(_api_json_escape "$cports")\"}")
+        # Build ip_addresses JSON array
+        local -a ip_entries=()
+        for net_entry in "${container_nets[@]}"; do
+            local net_clean="${net_entry//\"/}"
+            local ip_val="${container_ips[$cname|$net_clean]:-}"
+            [[ -n "$ip_val" ]] && ip_entries+=("{\"network\": \"$(_api_json_escape "$net_clean")\", \"ip\": \"$ip_val\"}")
+        done
+        local ips_json
+        if [[ ${#ip_entries[@]} -gt 0 ]]; then
+            ips_json=$(printf '%s,' "${ip_entries[@]}")
+            ips_json="[${ips_json%,}]"
+        else
+            ips_json="[]"
+        fi
+
+        nodes+=("{\"id\": \"$(_api_json_escape "$cname")\", \"state\": \"$cstate\", \"health\": \"$chealth\", \"image\": \"$(_api_json_escape "$cimage")\", \"stack\": \"$(_api_json_escape "$cstack")\", \"networks\": $container_nets_json, \"ports\": \"$(_api_json_escape "$cports")\", \"ip_addresses\": $ips_json}")
     done < <(docker ps -a -q 2>/dev/null)
 
     # Build edges: containers sharing a network
@@ -6917,7 +6941,7 @@ handle_topology() {
         nname=$(docker network inspect --format '{{.Name}}' "$net_id" 2>/dev/null)
         ndriver=$(docker network inspect --format '{{.Driver}}' "$net_id" 2>/dev/null)
         nsubnet=$(docker network inspect --format '{{range .IPAM.Config}}{{.Subnet}}{{end}}' "$net_id" 2>/dev/null)
-        ncontainer_count=$(echo "${network_containers[$nname]}" | wc -w)
+        ncontainer_count=$(echo "${network_containers[$nname]:-}" | wc -w)
 
         net_entries+=("{\"name\": \"$(_api_json_escape "$nname")\", \"driver\": \"$ndriver\", \"subnet\": \"$(_api_json_escape "$nsubnet")\", \"container_count\": $ncontainer_count}")
     done < <(docker network ls -q 2>/dev/null)
@@ -7144,7 +7168,7 @@ ENV_EOF
             if [[ "$found" == "false" ]]; then
                 # Check if it's a placeholder (only has template compose)
                 local service_count
-                service_count=$(grep -c "container_name:" "$existing_dir/docker-compose.yml" 2>/dev/null || echo "0")
+                service_count=$(grep -c "container_name:" "$existing_dir/docker-compose.yml" 2>/dev/null) || service_count=0
                 if [[ "$service_count" -eq 0 ]]; then
                     rm -rf "$existing_dir"
                     [[ -n "$removed_list" ]] && removed_list+=","
