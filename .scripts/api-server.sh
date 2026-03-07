@@ -415,6 +415,31 @@ _api_init_auth_dir() {
     [[ ! -f "$API_AUTH_DIR/rate_limits.json" ]] && echo '{}' > "$API_AUTH_DIR/rate_limits.json"
 }
 
+# Force-remove a directory, using Docker as fallback for root-owned files.
+# Docker containers create files owned by root; the API server (running as the
+# host user) can't delete those with plain rm. This tries rm first, then falls
+# back to a throwaway Alpine container that mounts the directory and deletes it.
+_force_remove_dir() {
+    local dir="$1"
+    [[ -d "$dir" ]] || return 0
+
+    # Attempt 1: regular rm
+    rm -rf "$dir" 2>/dev/null
+    [[ -d "$dir" ]] || return 0
+
+    # Attempt 2: Docker-based privileged removal
+    if command -v docker >/dev/null 2>&1; then
+        local abs_dir
+        abs_dir=$(cd "$dir" 2>/dev/null && pwd || realpath "$dir" 2>/dev/null || echo "$dir")
+        docker run --rm -v "$abs_dir:/___target" alpine rm -rf /___target 2>/dev/null
+        # Docker removes the contents but the mount-point directory persists —
+        # now the host user can remove the empty directory
+        rm -rf "$dir" 2>/dev/null
+    fi
+
+    [[ -d "$dir" ]] && return 1 || return 0
+}
+
 # Hash a password with a given salt using SHA-256 (v1 — legacy, kept for verifying old hashes)
 _api_hash_password() {
     local salt="$1"
@@ -2971,7 +2996,7 @@ handle_auth_factory_reset() {
                         if [[ -f "$d/docker-compose.yml" ]]; then
                             $DOCKER_COMPOSE_CMD -f "$d/docker-compose.yml" down --remove-orphans 2>/dev/null || true
                         fi
-                        rm -rf "$d"
+                        _force_remove_dir "$d"
                         removed_stacks+=("$dname")
                     fi
                 done
@@ -3897,11 +3922,11 @@ handle_delete_stack() {
         return
     fi
 
-    # Remove the stack directory
-    rm -rf "$stack_dir" 2>/dev/null
+    # Remove the stack directory (falls back to Docker for root-owned files)
+    _force_remove_dir "$stack_dir"
 
     if [[ -d "$stack_dir" ]]; then
-        _api_error 500 "Failed to delete stack directory"
+        _api_error 500 "Failed to delete stack directory — some files may be owned by root. Try stopping all containers first."
         return
     fi
 
@@ -5827,6 +5852,12 @@ handle_template_deploy() {
         return
     fi
 
+    # Load template metadata (needed for config_path, etc.)
+    local meta="{}"
+    if [[ -f "$tdir/template.json" ]]; then
+        meta=$(jq -c '.' "$tdir/template.json" 2>/dev/null || echo "{}")
+    fi
+
     # Accept target_stack from request body (required)
     local target_stack
     target_stack=$(printf '%s' "$body" | jq -r '.target_stack // empty' 2>/dev/null)
@@ -6096,7 +6127,12 @@ handle_template_deploy() {
         local config_target_name
         config_target_name=$(printf '%s' "$meta" | jq -r '.config_path // empty' 2>/dev/null)
         if [[ -n "$config_target_name" ]]; then
-            local app_data="${APP_DATA_DIR:-$BASE_DIR/App-Data}"
+            # Config goes into the TARGET STACK's App-Data, not the repo root
+            local app_data="${APP_DATA_DIR:-$target_dir/App-Data}"
+            # If APP_DATA_DIR is a relative path (e.g. ./App-Data), resolve it relative to target stack
+            if [[ "$app_data" == ./* ]]; then
+                app_data="$target_dir/${app_data#./}"
+            fi
             local config_target="$app_data/$config_target_name"
             mkdir -p "$config_target"
             # Copy config files without overwriting existing ones (-n)
@@ -6411,6 +6447,15 @@ handle_template_undeploy() {
 
     local remove_containers
     remove_containers=$(printf '%s' "$body" | jq -r '.remove_containers // false' 2>/dev/null)
+    local remove_data
+    remove_data=$(printf '%s' "$body" | jq -r '.remove_data // false' 2>/dev/null)
+
+    # Load template metadata for config_path (needed for data cleanup)
+    local tdir="$TEMPLATES_DIR/$name"
+    local meta="{}"
+    if [[ -f "$tdir/template.json" ]]; then
+        meta=$(jq -c '.' "$tdir/template.json" 2>/dev/null || echo "{}")
+    fi
 
     # Backup compose file
     local timestamp
@@ -6530,6 +6575,24 @@ handle_template_undeploy() {
         printf '%s\n' "$env_after" > "$target_dir/.env"
     fi
 
+    # Remove deployed config data from App-Data if requested
+    local data_removed="false"
+    if [[ "$remove_data" == "true" ]]; then
+        local config_target_name
+        config_target_name=$(printf '%s' "$meta" | jq -r '.config_path // empty' 2>/dev/null)
+        if [[ -n "$config_target_name" ]]; then
+            local app_data="${APP_DATA_DIR:-$target_dir/App-Data}"
+            if [[ "$app_data" == ./* ]]; then
+                app_data="$target_dir/${app_data#./}"
+            fi
+            local config_dir="$app_data/$config_target_name"
+            if [[ -d "$config_dir" ]]; then
+                _force_remove_dir "$config_dir"
+                data_removed="true"
+            fi
+        fi
+    fi
+
     # Build JSON arrays
     local svc_removed_json="["
     local first=true
@@ -6561,7 +6624,9 @@ handle_template_undeploy() {
     local msg="Services removed from $target_stack successfully"
     [[ "$stack_deleted" == "true" ]] && msg="Stack $target_stack fully removed (no services remaining)"
 
-    _api_success "{\"success\": true, \"template\": \"$(_api_json_escape "$name")\", \"target_stack\": \"$(_api_json_escape "$target_stack")\", \"services_removed\": $svc_removed_json, \"containers_removed\": $ctr_removed_json, \"backup_file\": \"docker-compose.yml.bak.${timestamp}\", \"stack_deleted\": $stack_deleted, \"message\": \"$msg\"}"
+    [[ "$data_removed" == "true" ]] && msg="$msg (configuration data removed)"
+
+    _api_success "{\"success\": true, \"template\": \"$(_api_json_escape "$name")\", \"target_stack\": \"$(_api_json_escape "$target_stack")\", \"services_removed\": $svc_removed_json, \"containers_removed\": $ctr_removed_json, \"backup_file\": \"docker-compose.yml.bak.${timestamp}\", \"stack_deleted\": $stack_deleted, \"data_removed\": $data_removed, \"message\": \"$msg\"}"
 }
 
 handle_template_import() {
