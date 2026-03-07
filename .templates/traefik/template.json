@@ -7,6 +7,14 @@
   "icon": "\ud83d\udd00",
   "tags": ["reverse-proxy", "ssl", "lets-encrypt", "cloudflare", "docker", "traefik"],
   "config_path": "Traefik",
+  "optional_services": [
+    {
+      "service": "docker-socket-proxy",
+      "label": "Include Docker Socket Proxy",
+      "description": "Uncheck if Docker Socket Proxy is already deployed in another stack",
+      "default_enabled": true
+    }
+  ],
   "variables": [
     {
       "name": "TRAEFIK_PORT_HTTP",
