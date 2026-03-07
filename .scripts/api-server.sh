@@ -7176,6 +7176,8 @@ handle_setup_configure() {
     if echo "$env_content" | grep -q "^DOCKER_STACKS="; then
         env_content=$(echo "$env_content" | sed "s|^DOCKER_STACKS=.*|DOCKER_STACKS=\"${docker_stacks_str}\"|")
     else
+        # Append with a proper section header so .env stays organized
+        env_content+=$'\n\n'"# ─── Stack Configuration ─────────────────────────────────────────────────────"
         env_content+=$'\n'"DOCKER_STACKS=\"${docker_stacks_str}\""
     fi
 
@@ -7361,7 +7363,7 @@ handle_stack_reorder() {
         if grep -q "^DOCKER_STACKS=" "$BASE_DIR/.env"; then
             sed -i "s|^DOCKER_STACKS=.*|DOCKER_STACKS=\"${ordered_str}\"|" "$BASE_DIR/.env"
         else
-            echo "DOCKER_STACKS=\"${ordered_str}\"" >> "$BASE_DIR/.env"
+            printf '\n\n# ─── Stack Configuration ─────────────────────────────────────────────────────\nDOCKER_STACKS="%s"\n' "${ordered_str}" >> "$BASE_DIR/.env"
         fi
     fi
 
