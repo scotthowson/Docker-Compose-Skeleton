@@ -259,6 +259,15 @@ _api_json_escape() {
     printf '%s' "$str"
 }
 
+# Escape a value for use as sed replacement text (handles / \ &)
+_sed_escape_val() {
+    local v="$1"
+    v="${v//\\/\\\\}"   # escape backslashes first
+    v="${v//\//\\/}"     # escape forward slashes
+    v="${v//&/\\&}"      # escape ampersands
+    printf '%s' "$v"
+}
+
 # Validate a request Origin against the CORS whitelist
 # Returns the origin if allowed, empty if not
 _api_cors_origin() {
@@ -321,6 +330,7 @@ _api_response() {
     local content_length
     content_length=$(printf '%s' "$body" | wc -c)
 
+    {
     printf "HTTP/1.1 %s %s\r\n" "$status_code" "$status_text"
     printf "Content-Type: application/json; charset=utf-8\r\n"
     printf "Content-Length: %d\r\n" "$content_length"
@@ -351,6 +361,7 @@ _api_response() {
     printf "Connection: close\r\n"
     printf "\r\n"
     printf "%s" "$body"
+    } 2>/dev/null
 }
 
 _api_error() {
@@ -2977,26 +2988,46 @@ handle_auth_factory_reset() {
     # Optionally reset compose files to git defaults and remove user-created stacks
     local compose_reset="false"
     local stacks_removed_json="[]"
+    local containers_stopped=0
+    local images_removed=0
     if [[ "$reset_compose" == "true" ]]; then
+        # Kill ALL running containers instantly (no graceful shutdown needed for reset)
+        local stacks_dir="$BASE_DIR/Stacks"
+        if command -v docker >/dev/null 2>&1; then
+            containers_stopped=$(docker ps -q 2>/dev/null | wc -l) || containers_stopped=0
+            # Kill all containers at once (instant SIGKILL)
+            docker kill $(docker ps -q 2>/dev/null) >/dev/null 2>&1 || true
+            # Remove stopped containers + prune images in background (can be slow)
+            images_removed=$(docker images -q 2>/dev/null | wc -l) || images_removed=0
+            ( docker container prune -f >/dev/null 2>&1; docker image prune -af >/dev/null 2>&1 ) &
+            disown
+        fi
+
+        # Remove App-Data directories in background (can be slow for root-owned files)
+        (
+            if [[ -d "$stacks_dir" ]]; then
+                for d in "$stacks_dir"/*/; do
+                    [[ -d "$d" && -d "$d/App-Data" ]] && rm -rf "$d/App-Data" 2>/dev/null
+                done
+            fi
+        ) &
+        disown
+
         if command -v git >/dev/null 2>&1 && [[ -d "$BASE_DIR/.git" ]]; then
             cd "$BASE_DIR"
             # Reset tracked compose files to git defaults
             git checkout -- Stacks/*/docker-compose.yml 2>/dev/null
+            # Also reset tracked .env files if any
+            git checkout -- Stacks/*/.env 2>/dev/null || true
             # Remove user-created (untracked) stack directories
             local -a removed_stacks=()
-            local stacks_dir="$BASE_DIR/Stacks"
             if [[ -d "$stacks_dir" ]]; then
                 for d in "$stacks_dir"/*/; do
                     [[ -d "$d" ]] || continue
                     local dname
                     dname=$(basename "$d")
-                    # Check if this stack has any git-tracked files
                     if ! git -C "$BASE_DIR" ls-files --error-unmatch "Stacks/$dname/docker-compose.yml" >/dev/null 2>&1; then
-                        # Stop containers first, then remove directory
-                        if [[ -f "$d/docker-compose.yml" ]]; then
-                            $DOCKER_COMPOSE_CMD -f "$d/docker-compose.yml" down --remove-orphans 2>/dev/null || true
-                        fi
-                        _force_remove_dir "$d"
+                        rm -rf "$d" 2>/dev/null
                         removed_stacks+=("$dname")
                     fi
                 done
@@ -3015,16 +3046,21 @@ handle_auth_factory_reset() {
         fi
     fi
 
-    # Remove DOCKER_STACKS from .env so setup wizard shows default 10 stacks
-    if [[ -f "$BASE_DIR/.env" ]]; then
+    # Reset .env to defaults — copy .env.example back to .env
+    local env_reset="false"
+    if [[ -f "$BASE_DIR/.env.example" ]]; then
+        cp -f "$BASE_DIR/.env.example" "$BASE_DIR/.env"
+        env_reset="true"
+    elif [[ -f "$BASE_DIR/.env" ]]; then
+        # No .env.example — fallback to just removing DOCKER_STACKS
         sed -i '/^DOCKER_STACKS=/d' "$BASE_DIR/.env"
-        unset DOCKER_STACKS
     fi
+    unset DOCKER_STACKS
 
     local client_ip="${SOCAT_PEERADDR:-unknown}"
-    _api_audit_log "$client_ip" "FACTORY_RESET" "${AUTH_USERNAME:-unknown}" "Factory reset performed. compose_reset=$compose_reset"
+    _api_audit_log "$client_ip" "FACTORY_RESET" "${AUTH_USERNAME:-unknown}" "Factory reset performed. compose_reset=$compose_reset containers_stopped=$containers_stopped images_removed=$images_removed"
 
-    _api_success "{\"success\": true, \"files_removed\": $removed_json, \"compose_reset\": $compose_reset, \"stacks_removed\": $stacks_removed_json}"
+    _api_success "{\"success\": true, \"files_removed\": $removed_json, \"compose_reset\": $compose_reset, \"stacks_removed\": $stacks_removed_json, \"env_reset\": $env_reset, \"containers_stopped\": $containers_stopped, \"images_removed\": $images_removed}"
 }
 
 # =============================================================================
@@ -5903,9 +5939,58 @@ handle_template_deploy() {
             _api_error 400 "Variable value for $key contains invalid characters"
             return
         fi
+        # Replace ${VAR:-default} patterns FIRST (greedy match for default value)
+        local safe_val
+        safe_val=$(_sed_escape_val "$val")
+        template_compose=$(printf '%s' "$template_compose" | sed "s/\${${key}:-[^}]*}/${safe_val}/g")
+        # Then replace simple ${VAR} and $VAR patterns
         template_compose="${template_compose//\$\{$key\}/$val}"
         template_compose="${template_compose//\$$key/$val}"
     done <<< "$vars"
+
+    # Resolve remaining ${VAR:-default} patterns to their default values
+    template_compose=$(printf '%s' "$template_compose" | sed 's/${[A-Za-z_][A-Za-z0-9_]*:-\([^}]*\)}/\1/g')
+
+    # Optional: exclude services the user toggled off (e.g. docker-socket-proxy)
+    local exclude_services
+    exclude_services=$(printf '%s' "$body" | jq -r '.exclude_services // [] | .[]' 2>/dev/null)
+    if [[ -n "$exclude_services" ]]; then
+        while IFS= read -r exc_svc; do
+            [[ -z "$exc_svc" ]] && continue
+            # Remove the service block from template compose
+            template_compose=$(printf '%s\n' "$template_compose" | awk -v svc="  ${exc_svc}:" '
+                BEGIN { skip=0 }
+                $0 == svc || index($0, svc) == 1 { skip=1; next }
+                skip && /^  [a-zA-Z_-]/ { skip=0 }
+                skip && /^[a-zA-Z]/ { skip=0 }
+                !skip { print }
+            ')
+            # Remove depends_on references to excluded service; drop empty depends_on blocks
+            template_compose=$(printf '%s\n' "$template_compose" | awk -v svc="$exc_svc" '
+                BEGIN { buf_n=0; in_dep=0; dep_indent=0; skip_entry=0; has_other=0 }
+                /[[:space:]]+depends_on:[[:space:]]*$/ {
+                    in_dep=1; match($0,/^[[:space:]]+/); dep_indent=RLENGTH
+                    buf_n++; buf[buf_n]=$0; next
+                }
+                in_dep {
+                    match($0,/^[[:space:]]*/)
+                    ci=RLENGTH
+                    if ($0 !~ /^[[:space:]]*$/ && ci <= dep_indent) {
+                        if (has_other) { for (i=1;i<=buf_n;i++) print buf[i] }
+                        buf_n=0;in_dep=0;has_other=0;skip_entry=0; print; next
+                    }
+                    if (ci == dep_indent+2) {
+                        if (index($0,svc":") > 0) { skip_entry=1; next }
+                        else { skip_entry=0; has_other=1; buf_n++; buf[buf_n]=$0; next }
+                    }
+                    if (skip_entry) next
+                    has_other=1; buf_n++; buf[buf_n]=$0; next
+                }
+                { print }
+                END { if (in_dep && has_other) { for (i=1;i<=buf_n;i++) print buf[i] } }
+            ')
+        done <<< "$exclude_services"
+    fi
 
     # Extract service names from template compose (top-level keys under services:)
     local template_services
@@ -5926,13 +6011,42 @@ handle_template_deploy() {
         fi
     done <<< "$template_services"
 
+    # Allow replacing conflicting services if explicitly requested
+    local replace_services
+    replace_services=$(printf '%s' "$body" | jq -r '.replace_services // false' 2>/dev/null)
+
     if [[ -n "$conflicts" ]]; then
-        _api_error 409 "Service name conflict in target stack: $conflicts"
-        return
+        if [[ "$replace_services" != "true" ]]; then
+            _api_error 409 "Service name conflict in target stack: $conflicts"
+            return
+        fi
+
+        # Remove conflicting services from the existing compose before merging.
+        # We do NOT stop containers here — docker-compose up -d will handle the
+        # lifecycle (stop old → create new → start) atomically without blocking
+        # the API response or dropping the TCP connection.
+        local svc_to_remove
+        while IFS= read -r svc_to_remove; do
+            [[ -z "$svc_to_remove" ]] && continue
+            if printf '%s' "$existing_compose" | grep -q "^  ${svc_to_remove}:"; then
+                existing_compose=$(printf '%s\n' "$existing_compose" | awk -v svc="  ${svc_to_remove}:" '
+                    BEGIN { skip=0 }
+                    $0 == svc || index($0, svc) == 1 { skip=1; next }
+                    skip && /^  [a-zA-Z_-]/ { skip=0 }
+                    skip && /^[a-zA-Z]/ { skip=0 }
+                    !skip { print }
+                ')
+            fi
+        done <<< "$template_services"
+        # Write the cleaned compose back so the merge awk reads the updated version
+        printf '%s\n' "$existing_compose" > "$target_dir/docker-compose.yml"
     fi
 
     # -----------------------------------------------------------------------
-    # Port conflict detection — template ports vs target stack + running system
+    # Port conflict detection — template ports vs OTHER stacks & system
+    # When replace_services=true, we skip the running-container check because
+    # those ports belong to services being replaced — docker-compose up -d
+    # swaps them atomically (stop old → start new).
     # -----------------------------------------------------------------------
     local tpl_ports target_ports
     tpl_ports=$(printf '%s\n' "$template_compose" | awk '
@@ -5944,7 +6058,7 @@ handle_template_deploy() {
         }
         p && !/^[[:space:]]*$/ && !/^[[:space:]]+-/ { p=0 }
     ')
-    target_ports=$(awk '
+    target_ports=$(sed 's/${[A-Za-z_][A-Za-z0-9_]*:-\([^}]*\)}/\1/g' "$target_dir/docker-compose.yml" | awk '
         /[[:space:]]+ports:[[:space:]]*$/ { p=1; next }
         p && /^[[:space:]]+-/ {
             l=$0; gsub(/^[[:space:]]*-[[:space:]]*/, "", l); gsub(/"/, "", l)
@@ -5952,10 +6066,10 @@ handle_template_deploy() {
             if (a[1] ~ /^[0-9]+$/) print a[1] }; next
         }
         p && !/^[[:space:]]*$/ && !/^[[:space:]]+-/ { p=0 }
-    ' "$target_dir/docker-compose.yml")
+    ')
 
     if [[ -n "$tpl_ports" ]]; then
-        # Check against target stack compose file
+        # Check against target stack compose file (already cleaned of replaced services)
         if [[ -n "$target_ports" ]]; then
             local port_conflicts=""
             while IFS= read -r port; do
@@ -5970,8 +6084,9 @@ handle_template_deploy() {
             fi
         fi
 
-        # Check against all running Docker containers (system-wide)
-        if command -v docker >/dev/null 2>&1; then
+        # Check against running containers — but SKIP when replacing services
+        # in the same stack (their ports will be freed by docker-compose up -d)
+        if [[ "$replace_services" != "true" ]] && command -v docker >/dev/null 2>&1; then
             local running_ports
             running_ports=$(docker ps --format '{{.Ports}}' 2>/dev/null | grep -oE '(0\.0\.0\.0:|:::)[0-9]+' | grep -oE '[0-9]+$' | sort -u)
             if [[ -n "$running_ports" ]]; then
@@ -6018,6 +6133,53 @@ handle_template_deploy() {
     tpl_net_block=$(printf '%s\n' "$template_compose" | awk '
         /^networks:/ { f=1; next } f && /^[^ \t]/ { exit } f { print }')
 
+    # Deduplicate: remove template network/volume entries that already exist in target
+    local target_content
+    target_content=$(cat "$target_dir/docker-compose.yml")
+    if [[ -n "$tpl_net_block" ]]; then
+        local existing_nets
+        existing_nets=$(printf '%s\n' "$target_content" | awk '
+            /^networks:/ { f=1; next } f && /^[^ \t#]/ { exit }
+            f && /^  [a-zA-Z0-9_-]+:/ { sub(/:.*/, ""); gsub(/^  /, ""); print }')
+        if [[ -n "$existing_nets" ]]; then
+            while IFS= read -r enet; do
+                [[ -z "$enet" ]] && continue
+                tpl_net_block=$(printf '%s\n' "$tpl_net_block" | awk -v key="  ${enet}:" '
+                    BEGIN { skip=0 }
+                    $0 == key || index($0, key) == 1 { skip=1; next }
+                    skip && /^  [a-zA-Z0-9_-]/ { skip=0 }
+                    skip && /^[^ ]/ { skip=0 }
+                    skip { next }
+                    { print }')
+            done <<< "$existing_nets"
+            # Trim to empty if only whitespace remains
+            if [[ -z "$(printf '%s' "$tpl_net_block" | tr -d '[:space:]')" ]]; then
+                tpl_net_block=""
+            fi
+        fi
+    fi
+    if [[ -n "$tpl_vol_block" ]]; then
+        local existing_vols
+        existing_vols=$(printf '%s\n' "$target_content" | awk '
+            /^volumes:/ { f=1; next } f && /^[^ \t#]/ { exit }
+            f && /^  [a-zA-Z0-9_-]+:/ { sub(/:.*/, ""); gsub(/^  /, ""); print }')
+        if [[ -n "$existing_vols" ]]; then
+            while IFS= read -r evol; do
+                [[ -z "$evol" ]] && continue
+                tpl_vol_block=$(printf '%s\n' "$tpl_vol_block" | awk -v key="  ${evol}:" '
+                    BEGIN { skip=0 }
+                    $0 == key || index($0, key) == 1 { skip=1; next }
+                    skip && /^  [a-zA-Z0-9_-]/ { skip=0 }
+                    skip && /^[^ ]/ { skip=0 }
+                    skip { next }
+                    { print }')
+            done <<< "$existing_vols"
+            if [[ -z "$(printf '%s' "$tpl_vol_block" | tr -d '[:space:]')" ]]; then
+                tpl_vol_block=""
+            fi
+        fi
+    fi
+
     # Merge template sections into target compose at the correct positions:
     #   - services content  → end of services: section (before next top-level key)
     #   - volumes content   → end of volumes: section (or create new section)
@@ -6032,6 +6194,22 @@ handle_template_deploy() {
             svcs = ENVIRON["_TPL_SVCS"]; vols = ENVIRON["_TPL_VOLS"]; nets = ENVIRON["_TPL_NETS"]
             cur = ""; has_vol = 0; has_net = 0
             svcs_done = 0; vols_done = 0; nets_done = 0
+        }
+        # Handle inline empty sections: "services: {}" → "services:" + inject content
+        /^services:[[:space:]]*\{\}/ {
+            print "services:"
+            if (svcs != "") { printf "%s\n", svcs; svcs_done = 1 }
+            cur = "services"; next
+        }
+        /^volumes:[[:space:]]*\{\}/ {
+            print "volumes:"
+            if (vols != "") { printf "%s\n", vols; vols_done = 1 }
+            cur = "volumes"; has_vol = 1; next
+        }
+        /^networks:[[:space:]]*\{\}/ {
+            print "networks:"
+            if (nets != "") { printf "%s\n", nets; nets_done = 1 }
+            cur = "networks"; has_net = 1; next
         }
         /^[a-zA-Z]/ {
             # Entering a new top-level section — close the previous one first
@@ -6114,15 +6292,7 @@ handle_template_deploy() {
     done <<< "$template_services"
     services_json+="]"
 
-    # Auto-start if requested (restart the target stack)
-    local auto_start
-    auto_start=$(printf '%s' "$body" | jq -r '.auto_start // false' 2>/dev/null)
-    local started=false
-    if [[ "$auto_start" == "true" ]]; then
-        $DOCKER_COMPOSE_CMD -f "$target_dir/docker-compose.yml" up -d 2>/dev/null && started=true
-    fi
-
-    # Deploy config files if template includes a config/ directory
+    # Deploy config files BEFORE auto-start so they exist when containers mount volumes
     if [[ -d "$tdir/config" ]]; then
         local config_target_name
         config_target_name=$(printf '%s' "$meta" | jq -r '.config_path // empty' 2>/dev/null)
@@ -6135,15 +6305,42 @@ handle_template_deploy() {
             fi
             local config_target="$app_data/$config_target_name"
             mkdir -p "$config_target"
-            # Copy config files without overwriting existing ones (-n)
-            cp -rn "$tdir/config/"* "$config_target/" 2>/dev/null || true
+            # rsync is more reliable for recursive copies; fall back to cp -a
+            if command -v rsync >/dev/null 2>&1; then
+                rsync -a --ignore-existing "$tdir/config/" "$config_target/" 2>/dev/null || true
+            else
+                cp -a "$tdir/config/"* "$config_target/" 2>/dev/null || true
+            fi
 
-            # Create custom_routes subdirectories from DOCKER_STACKS if present
-            if [[ -d "$config_target/custom_routes" && -n "${DOCKER_STACKS:-}" ]]; then
+            # Create custom_routes subdirectories for ALL existing stacks
+            if [[ -d "$config_target/custom_routes" ]]; then
+                local all_stacks
+                all_stacks=$(_api_get_stacks)
                 local stack_name
-                for stack_name in $DOCKER_STACKS; do
+                for stack_name in $all_stacks; do
                     mkdir -p "$config_target/custom_routes/$stack_name"
                 done
+
+                # Move the traefik route file into the target stack's custom_routes
+                # (the template ships it under core-infrastructure/ by default)
+                if [[ -n "$target_stack" ]]; then
+                    mkdir -p "$config_target/custom_routes/$target_stack"
+                    local route_src=""
+                    # Check all subdirs for a traefik.yml route file
+                    local route_file
+                    for route_file in "$config_target"/custom_routes/*/traefik.yml; do
+                        [[ -f "$route_file" ]] || continue
+                        local route_dir
+                        route_dir=$(basename "$(dirname "$route_file")")
+                        if [[ "$route_dir" != "$target_stack" ]]; then
+                            route_src="$route_file"
+                            break
+                        fi
+                    done
+                    if [[ -n "$route_src" ]]; then
+                        mv "$route_src" "$config_target/custom_routes/$target_stack/traefik.yml"
+                    fi
+                fi
             fi
 
             # Apply variable substitution to all .yml/.yaml config files
@@ -6156,8 +6353,13 @@ handle_template_deploy() {
                     local orig_content="$cfg_content"
                     while IFS='=' read -r ckey cval; do
                         [[ -z "$ckey" ]] && continue
+                        local safe_cval
+                        safe_cval=$(_sed_escape_val "$cval")
+                        cfg_content=$(printf '%s' "$cfg_content" | sed "s/\${${ckey}:-[^}]*}/${safe_cval}/g")
                         cfg_content="${cfg_content//\$\{$ckey\}/$cval}"
                     done <<< "$vars"
+                    # Resolve remaining ${VAR:-default} patterns to their defaults
+                    cfg_content=$(printf '%s' "$cfg_content" | sed 's/${[A-Za-z_][A-Za-z0-9_]*:-\([^}]*\)}/\1/g')
                     # Only write back if content actually changed
                     if [[ "$cfg_content" != "$orig_content" ]]; then
                         printf '%s\n' "$cfg_content" > "$cfg_file"
@@ -6170,6 +6372,19 @@ handle_template_deploy() {
                 chmod 600 "$config_target/acme.json"
             fi
         fi
+    fi
+
+    # Auto-start if requested — run in background so API responds immediately.
+    # docker-compose up -d handles the full lifecycle: stop old → pull → create → start.
+    local auto_start
+    auto_start=$(printf '%s' "$body" | jq -r '.auto_start // false' 2>/dev/null)
+    local started=false
+    if [[ "$auto_start" == "true" ]]; then
+        local env_up=()
+        [[ -f "$target_dir/.env" ]] && env_up=(--env-file "$target_dir/.env")
+        ( $DOCKER_COMPOSE_CMD -f "$target_dir/docker-compose.yml" "${env_up[@]}" up -d --force-recreate --remove-orphans >/dev/null 2>&1 ) &
+        disown
+        started=true
     fi
 
     # Record deploy event in audit log
@@ -6225,9 +6440,56 @@ handle_template_dry_run() {
     while IFS='=' read -r key val; do
         [[ -z "$key" ]] && continue
         if [[ ! "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then continue; fi
+        # Replace ${VAR:-default} patterns FIRST, then simple ${VAR} and $VAR
+        local safe_val
+        safe_val=$(_sed_escape_val "$val")
+        template_compose=$(printf '%s' "$template_compose" | sed "s/\${${key}:-[^}]*}/${safe_val}/g")
         template_compose="${template_compose//\$\{$key\}/$val}"
         template_compose="${template_compose//\$$key/$val}"
     done <<< "$vars"
+
+    # Resolve remaining ${VAR:-default} patterns to their default values
+    # (handles variables the user didn't explicitly set)
+    template_compose=$(printf '%s' "$template_compose" | sed 's/${[A-Za-z_][A-Za-z0-9_]*:-\([^}]*\)}/\1/g')
+
+    # Optional: exclude services the user toggled off
+    local exclude_services
+    exclude_services=$(printf '%s' "$body" | jq -r '.exclude_services // [] | .[]' 2>/dev/null)
+    if [[ -n "$exclude_services" ]]; then
+        while IFS= read -r exc_svc; do
+            [[ -z "$exc_svc" ]] && continue
+            template_compose=$(printf '%s\n' "$template_compose" | awk -v svc="  ${exc_svc}:" '
+                BEGIN { skip=0 }
+                $0 == svc || index($0, svc) == 1 { skip=1; next }
+                skip && /^  [a-zA-Z_-]/ { skip=0 }
+                skip && /^[a-zA-Z]/ { skip=0 }
+                !skip { print }
+            ')
+            template_compose=$(printf '%s\n' "$template_compose" | awk -v svc="$exc_svc" '
+                BEGIN { buf_n=0; in_dep=0; dep_indent=0; skip_entry=0; has_other=0 }
+                /[[:space:]]+depends_on:[[:space:]]*$/ {
+                    in_dep=1; match($0,/^[[:space:]]+/); dep_indent=RLENGTH
+                    buf_n++; buf[buf_n]=$0; next
+                }
+                in_dep {
+                    match($0,/^[[:space:]]*/)
+                    ci=RLENGTH
+                    if ($0 !~ /^[[:space:]]*$/ && ci <= dep_indent) {
+                        if (has_other) { for (i=1;i<=buf_n;i++) print buf[i] }
+                        buf_n=0;in_dep=0;has_other=0;skip_entry=0; print; next
+                    }
+                    if (ci == dep_indent+2) {
+                        if (index($0,svc":") > 0) { skip_entry=1; next }
+                        else { skip_entry=0; has_other=1; buf_n++; buf[buf_n]=$0; next }
+                    }
+                    if (skip_entry) next
+                    has_other=1; buf_n++; buf[buf_n]=$0; next
+                }
+                { print }
+                END { if (in_dep && has_other) { for (i=1;i<=buf_n;i++) print buf[i] } }
+            ')
+        done <<< "$exclude_services"
+    fi
 
     # Extract services
     local template_services
@@ -6269,22 +6531,27 @@ handle_template_dry_run() {
             [[ ! -f "$stack_dir/docker-compose.yml" ]] && continue
             local stack_name
             stack_name=$(basename "$stack_dir")
-            local stack_ports
-            stack_ports=$(awk '
+            # Extract port:service_name pairs for detailed conflict reporting
+            local stack_port_map
+            stack_port_map=$(sed 's/${[A-Za-z_][A-Za-z0-9_]*:-\([^}]*\)}/\1/g' "$stack_dir/docker-compose.yml" 2>/dev/null | awk '
+                /^  [a-zA-Z_-][a-zA-Z0-9_-]*:/ { gsub(/^  /,""); gsub(/:.*/,""); svc=$0 }
                 /[[:space:]]+ports:[[:space:]]*$/ { p=1; next }
                 p && /^[[:space:]]+-/ {
                     l=$0; gsub(/^[[:space:]]*-[[:space:]]*/, "", l); gsub(/"/, "", l)
                     n=split(l, a, ":"); if (n >= 2) { gsub(/[[:space:]]/, "", a[1])
-                    if (a[1] ~ /^[0-9]+$/) print a[1] }; next
+                    if (a[1] ~ /^[0-9]+$/) print a[1] "\t" svc }; next
                 }
                 p && !/^[[:space:]]*$/ && !/^[[:space:]]+-/ { p=0 }
-            ' "$stack_dir/docker-compose.yml" 2>/dev/null)
-            if [[ -n "$stack_ports" ]]; then
+            ')
+            if [[ -n "$stack_port_map" ]]; then
                 while IFS= read -r port; do
                     [[ -z "$port" ]] && continue
-                    if printf '%s\n' "$stack_ports" | grep -qxF "$port"; then
-                        port_conflict_entries+=("{\"port\": $port, \"owner\": \"$(_api_json_escape "$stack_name")\", \"type\": \"stack\"}")
-                        port_conflicts="${port_conflicts}${port_conflicts:+, }${port} (stack: ${stack_name})"
+                    local svc_owner
+                    svc_owner=$(printf '%s\n' "$stack_port_map" | awk -F'\t' -v p="$port" '$1 == p { print $2; exit }')
+                    if [[ -n "$svc_owner" ]]; then
+                        local owner_label="${stack_name}/${svc_owner}"
+                        port_conflict_entries+=("{\"port\": $port, \"owner\": \"$(_api_json_escape "$owner_label")\", \"type\": \"stack\", \"service\": \"$(_api_json_escape "$svc_owner")\"}")
+                        port_conflicts="${port_conflicts}${port_conflicts:+, }${port} (${owner_label})"
                     fi
                 done <<< "$tpl_ports"
             fi
@@ -6471,11 +6738,23 @@ handle_template_undeploy() {
         rm -f "$f"
     done
 
+    # Stop and remove containers BEFORE modifying compose (so service names still resolve)
+    local -a containers_removed=()
+    if [[ "$remove_containers" == "true" ]]; then
+        local env_args_pre=()
+        [[ -f "$target_dir/.env" ]] && env_args_pre=(--env-file "$target_dir/.env")
+        # Kill (instant SIGKILL) + rm for the services being removed
+        $DOCKER_COMPOSE_CMD -f "$target_dir/docker-compose.yml" "${env_args_pre[@]}" kill "${services_to_remove[@]}" >/dev/null 2>&1 || true
+        $DOCKER_COMPOSE_CMD -f "$target_dir/docker-compose.yml" "${env_args_pre[@]}" rm -f "${services_to_remove[@]}" >/dev/null 2>&1 || true
+        containers_removed=("${services_to_remove[@]}")
+    fi
+
     # Remove each service block from the compose file using awk
     local compose_content
     compose_content=$(cat "$target_dir/docker-compose.yml")
 
     for svc in "${services_to_remove[@]}"; do
+        # Remove the service block
         compose_content=$(printf '%s\n' "$compose_content" | awk -v svc="$svc" '
             BEGIN { skip=0 }
             /^  [a-zA-Z0-9_-]/ {
@@ -6487,38 +6766,49 @@ handle_template_undeploy() {
             skip && /^[^ ]/ { skip=0 }
             !skip { print }
         ')
+        # Clean up depends_on references to the removed service in remaining services
+        compose_content=$(printf '%s\n' "$compose_content" | awk -v svc="$svc" '
+            BEGIN { buf_n=0; in_dep=0; dep_indent=0; skip_entry=0; has_other=0 }
+            /[[:space:]]+depends_on:[[:space:]]*$/ {
+                in_dep=1; match($0,/^[[:space:]]+/); dep_indent=RLENGTH
+                buf_n++; buf[buf_n]=$0; next
+            }
+            in_dep {
+                match($0,/^[[:space:]]*/)
+                ci=RLENGTH
+                if ($0 !~ /^[[:space:]]*$/ && ci <= dep_indent) {
+                    if (has_other) { for (i=1;i<=buf_n;i++) print buf[i] }
+                    buf_n=0;in_dep=0;has_other=0;skip_entry=0; print; next
+                }
+                if (ci == dep_indent+2) {
+                    if (index($0,svc":") > 0) { skip_entry=1; next }
+                    else { skip_entry=0; has_other=1; buf_n++; buf[buf_n]=$0; next }
+                }
+                if (skip_entry) next
+                has_other=1; buf_n++; buf[buf_n]=$0; next
+            }
+            { print }
+            END { if (in_dep && has_other) { for (i=1;i<=buf_n;i++) print buf[i] } }
+        ')
     done
 
-    # Check if any services remain after removal
-    # NOTE: grep -c exits 1 when count is 0; using || echo inside $() would
-    # capture BOTH grep's "0" and the fallback "0", producing "0\n0" which
-    # breaks the integer comparison.  Assign separately to avoid this.
+    # Check if any services remain after removal (count only keys under services:, not networks:/volumes:/etc.)
     local remaining_services
-    remaining_services=$(printf '%s\n' "$compose_content" | grep -cE '^  [a-zA-Z0-9_-]+:' 2>/dev/null) || remaining_services=0
-
-    # Remove containers if requested (do this before potential directory deletion)
-    local -a containers_removed=()
-    if [[ "$remove_containers" == "true" ]]; then
-        for svc in "${services_to_remove[@]}"; do
-            # Try common container naming patterns
-            local cid
-            for pattern in "${target_stack}-${svc}-1" "${target_stack}_${svc}_1" "${svc}"; do
-                cid=$(docker ps -aq --filter "name=^/${pattern}$" 2>/dev/null)
-                if [[ -n "$cid" ]]; then
-                    docker rm -f "$cid" 2>/dev/null && containers_removed+=("$pattern")
-                    break
-                fi
-            done
-        done
-    fi
+    remaining_services=$(printf '%s\n' "$compose_content" | awk '
+        /^services:/ { in_svc=1; next }
+        in_svc && /^[^ #]/ { in_svc=0 }
+        in_svc && /^  [a-zA-Z0-9_-]+:/ { c++ }
+        END { print c+0 }
+    ')
 
     # If no services remain, write a valid empty compose (preserves stack dir + App-Data)
     local stack_deleted="false"
     if [[ "$remaining_services" -eq 0 ]]; then
-        # Stop any lingering containers from the original compose
-        $DOCKER_COMPOSE_CMD -f "$target_dir/docker-compose.yml" down --remove-orphans 2>/dev/null || true
+        # Remove any lingering containers (already killed above, just clean up)
+        $DOCKER_COMPOSE_CMD -f "$target_dir/docker-compose.yml" rm -f >/dev/null 2>&1 || true
         # Write a valid minimal compose so the stack remains usable
-        printf 'services: {}\n' > "$target_dir/docker-compose.yml"
+        # Use multi-line format so section-aware merge works correctly on redeploy
+        printf 'services:\n  # (empty — available for template deployment)\n' > "$target_dir/docker-compose.yml"
         stack_deleted="true"
     else
         # Write updated compose
@@ -7062,6 +7352,29 @@ handle_setup_defaults() {
         done < "$BASE_DIR/.env.example"
     fi
     defaults_json+="}"
+
+    # Overlay current .env values on top of .env.example defaults (for resumed setup)
+    if [[ -f "$BASE_DIR/.env" ]]; then
+        local overlay_json="{"
+        local ofirst=true
+        while IFS= read -r line; do
+            [[ "$line" =~ ^[[:space:]]*# ]] && continue
+            [[ -z "${line// /}" ]] && continue
+            if [[ "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*) ]]; then
+                local okey="${BASH_REMATCH[1]}"
+                local oval="${BASH_REMATCH[2]}"
+                oval="${oval#\"}" ; oval="${oval%\"}"
+                oval="${oval#\'}" ; oval="${oval%\'}"
+                [[ "$ofirst" == "true" ]] && ofirst=false || overlay_json+=","
+                overlay_json+="\"$okey\": \"$(_api_json_escape "$oval")\""
+            fi
+        done < "$BASE_DIR/.env"
+        overlay_json+="}"
+        # Merge: .env values override .env.example defaults
+        if command -v jq >/dev/null 2>&1; then
+            defaults_json=$(echo "$defaults_json" "$overlay_json" | jq -s '.[0] * .[1]' 2>/dev/null || echo "$defaults_json")
+        fi
+    fi
 
     # Build stacks array from DOCKER_STACKS or defaults
     local stacks_json="["
