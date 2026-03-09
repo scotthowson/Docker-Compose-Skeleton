@@ -135,6 +135,15 @@ _source_optional "$BASE_DIR/.scripts/ntfy-status.sh"         "ntfy-status.sh"
 _source_optional "$BASE_DIR/.scripts/health-check.sh"        "health-check.sh"
 _source_optional "$BASE_DIR/.scripts/system-info.sh"         "system-info.sh"
 
+# v2.0 subsystem libraries
+_source_optional "$BASE_DIR/.lib/metrics.sh"                 "metrics.sh"
+_source_optional "$BASE_DIR/.lib/rollback.sh"                "rollback.sh"
+_source_optional "$BASE_DIR/.lib/secrets.sh"                 "secrets.sh"
+_source_optional "$BASE_DIR/.lib/scheduler.sh"               "scheduler.sh"
+_source_optional "$BASE_DIR/.lib/health-score.sh"            "health-score.sh"
+_source_optional "$BASE_DIR/.lib/plugins.sh"                 "plugins.sh"
+_source_optional "$BASE_DIR/.lib/sse.sh"                     "sse.sh"
+
 # =============================================================================
 # UTILITY FUNCTIONS
 # =============================================================================
@@ -315,6 +324,36 @@ main() {
         fi
     else
         log_info "Post-startup health check disabled"
+    fi
+
+    # ══════════════════════════════════════════════════════════════════
+    # Optional: Initialize v2.0 Subsystems
+    # ══════════════════════════════════════════════════════════════════
+
+    # Secrets management
+    if [[ "${SECRETS_ENCRYPTION:-true}" == "true" ]] && command -v secrets_init >/dev/null 2>&1; then
+        secrets_init
+        log_success "Secrets management initialized"
+    fi
+
+    # Plugin system
+    if [[ "${PLUGINS_ENABLED:-true}" == "true" ]] && command -v plugins_init >/dev/null 2>&1; then
+        plugins_init
+        plugins_scan
+        log_success "Plugin system initialized"
+    fi
+
+    # Metrics collector daemon
+    if [[ "${METRICS_ENABLED:-true}" == "true" ]] && command -v metrics_init >/dev/null 2>&1; then
+        metrics_init
+        metrics_collector_start
+        log_success "Metrics collector started (interval: ${METRICS_COLLECT_INTERVAL:-30}s)"
+    fi
+
+    # Scheduler daemon
+    if [[ "${SCHEDULER_ENABLED:-false}" == "true" ]] && command -v scheduler_daemon_start >/dev/null 2>&1; then
+        scheduler_daemon_start
+        log_success "Scheduler daemon started (interval: ${SCHEDULER_CHECK_INTERVAL:-60}s)"
     fi
 
     # ══════════════════════════════════════════════════════════════════

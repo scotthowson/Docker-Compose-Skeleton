@@ -3044,6 +3044,44 @@ handle_auth_factory_reset() {
             fi
             compose_reset="true"
         fi
+
+        # Clean up v4.0+ data files
+        local data_dir="$BASE_DIR/.data"
+        if [[ -d "$data_dir" ]]; then
+            rm -f "$data_dir/audit.jsonl" 2>/dev/null
+            rm -f "$data_dir/webhooks.json" 2>/dev/null
+            rm -f "$data_dir/schedules.json" 2>/dev/null
+            rm -f "$data_dir/schedule-history.jsonl" 2>/dev/null
+            rm -f "$data_dir/metrics.jsonl" 2>/dev/null
+            rm -f "$data_dir/secrets.enc" 2>/dev/null
+            rm -f "$data_dir/secrets.key" 2>/dev/null
+            rm -f "$data_dir/plugins.json" 2>/dev/null
+        fi
+
+        # Remove user-imported templates (keep git-tracked ones)
+        local templates_dir="$BASE_DIR/.templates"
+        if [[ -d "$templates_dir" ]] && command -v git >/dev/null 2>&1; then
+            for tdir in "$templates_dir"/*/; do
+                [[ -d "$tdir" ]] || continue
+                local tname
+                tname=$(basename "$tdir")
+                if ! git -C "$BASE_DIR" ls-files --error-unmatch ".templates/$tname/docker-compose.yml" >/dev/null 2>&1; then
+                    rm -rf "$tdir" 2>/dev/null
+                fi
+            done
+        fi
+
+        # Stop scheduler and metrics daemons if running
+        for pidfile in /tmp/dcs-metrics-collector.pid /tmp/dcs-scheduler.pid; do
+            if [[ -f "$pidfile" ]]; then
+                local daemon_pid
+                daemon_pid=$(cat "$pidfile" 2>/dev/null)
+                if [[ -n "$daemon_pid" ]] && kill -0 "$daemon_pid" 2>/dev/null; then
+                    kill "$daemon_pid" 2>/dev/null
+                fi
+                rm -f "$pidfile"
+            fi
+        done
     fi
 
     # Reset .env to defaults — copy .env.example back to .env
@@ -6967,6 +7005,525 @@ handle_template_import() {
     _api_success "{\"success\": true, \"name\": \"$(_api_json_escape "$name")\", \"message\": \"Template imported successfully\"}"
 }
 
+# POST /templates/fetch-url — Fetch compose content from URL without saving
+handle_template_fetch_url() {
+    local body="$1"
+
+    if ! command -v jq >/dev/null 2>&1; then
+        _api_error 500 "jq is required"
+        return
+    fi
+
+    local url
+    url=$(printf '%s' "$body" | jq -r '.url // empty' 2>/dev/null)
+
+    if [[ -z "$url" ]]; then
+        _api_error 400 "Missing required field: url"
+        return
+    fi
+
+    # Security: only allow http/https URLs
+    if [[ "$url" != http://* && "$url" != https://* ]]; then
+        _api_error 400 "URL must start with http:// or https://"
+        return
+    fi
+
+    # Auto-convert GitHub blob URLs to raw URLs
+    if [[ "$url" == *"github.com/"*"/blob/"* ]]; then
+        url=$(echo "$url" | sed 's|github\.com/\([^/]*/[^/]*\)/blob/|raw.githubusercontent.com/\1/|')
+    fi
+
+    # Fetch the compose content
+    local compose_content
+    compose_content=$(curl -fsSL --max-time 30 "$url" 2>/dev/null)
+    if [[ -z "$compose_content" ]]; then
+        _api_error 400 "Failed to fetch content from URL"
+        return
+    fi
+
+    local escaped_content
+    escaped_content=$(_api_json_escape "$compose_content")
+    local escaped_url
+    escaped_url=$(_api_json_escape "$url")
+
+    _api_success "{\"content\": \"$escaped_content\", \"url\": \"$escaped_url\"}"
+}
+
+# POST /templates/import-url — Import a template from a URL
+handle_template_import_url() {
+    local body="$1"
+
+    if ! command -v jq >/dev/null 2>&1; then
+        _api_error 500 "jq is required"
+        return
+    fi
+
+    local url
+    url=$(printf '%s' "$body" | jq -r '.url // empty' 2>/dev/null)
+    local name
+    name=$(printf '%s' "$body" | jq -r '.name // empty' 2>/dev/null)
+
+    if [[ -z "$url" ]]; then
+        _api_error 400 "Missing required field: url"
+        return
+    fi
+
+    # Security: only allow http/https URLs
+    if [[ "$url" != http://* && "$url" != https://* ]]; then
+        _api_error 400 "URL must start with http:// or https://"
+        return
+    fi
+
+    # Auto-convert GitHub blob URLs to raw URLs
+    # https://github.com/user/repo/blob/branch/path → https://raw.githubusercontent.com/user/repo/branch/path
+    if [[ "$url" == *"github.com/"*"/blob/"* ]]; then
+        url=$(echo "$url" | sed 's|github\.com/\([^/]*/[^/]*\)/blob/|raw.githubusercontent.com/\1/|')
+    fi
+
+    # Fetch the compose content
+    local compose_content
+    compose_content=$(curl -fsSL --max-time 30 "$url" 2>/dev/null)
+    if [[ -z "$compose_content" ]]; then
+        _api_error 400 "Failed to fetch content from URL"
+        return
+    fi
+
+    # Auto-detect name from URL if not provided
+    if [[ -z "$name" ]]; then
+        # Extract directory name or filename from URL path
+        name=$(echo "$url" | sed 's|.*/||; s|\.ya\?ml$||; s|docker-compose||; s|compose||' | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_-]/-/g; s/^-*//; s/-*$//')
+        # If name is empty after cleanup, try parent directory
+        if [[ -z "$name" || "$name" == "-" ]]; then
+            name=$(echo "$url" | sed 's|/[^/]*$||; s|.*/||' | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_-]/-/g')
+        fi
+        [[ -z "$name" ]] && name="imported-$(date +%s)"
+    fi
+
+    # Sanitize name
+    name=$(echo "$name" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_-]/-/g' | head -c 64)
+    if [[ "$name" == *".."* || "$name" == *"/"* || -z "$name" ]]; then
+        _api_error 400 "Invalid template name"
+        return
+    fi
+
+    # Validate it looks like a compose file
+    local tmpfile
+    tmpfile=$(mktemp /tmp/dcs-validate-XXXXXX.yml)
+    printf '%s' "$compose_content" > "$tmpfile"
+    local validate_output
+    validate_output=$($DOCKER_COMPOSE_CMD -f "$tmpfile" config 2>&1)
+    local validate_rc=$?
+    rm -f "$tmpfile"
+
+    if [[ $validate_rc -ne 0 ]]; then
+        local escaped_err
+        escaped_err=$(_api_json_escape "$validate_output")
+        _api_error 422 "Invalid compose file: $escaped_err"
+        return
+    fi
+
+    # Extract service names for metadata
+    local services
+    services=$(printf '%s' "$compose_content" | grep -E '^  [a-zA-Z_-][a-zA-Z0-9_-]*:' | sed 's/:.*//' | tr -d ' ' | paste -sd ',' -)
+
+    # Create template directory
+    local tdir="$TEMPLATES_DIR/$name"
+    mkdir -p "$tdir"
+
+    printf '%s' "$compose_content" > "$tdir/docker-compose.yml"
+
+    # Create template.json
+    local escaped_name escaped_url escaped_services
+    escaped_name=$(_api_json_escape "$name")
+    escaped_url=$(_api_json_escape "$url")
+    escaped_services=$(_api_json_escape "$services")
+    printf '{"name": "%s", "description": "Imported from %s", "category": "other", "tags": ["imported", "url"], "source_url": "%s", "services": "%s"}' \
+        "$escaped_name" "$escaped_url" "$escaped_url" "$escaped_services" > "$tdir/template.json"
+
+    _audit_log "template_import_url" "Imported template '$name' from $url" 2>/dev/null
+
+    _api_success "{\"success\": true, \"name\": \"$escaped_name\", \"source_url\": \"$escaped_url\", \"message\": \"Template imported from URL successfully\"}"
+}
+
+# GET /templates/gallery — List templates from gallery catalog
+handle_template_gallery() {
+    local gallery_file="$BASE_DIR/.config/template-gallery.json"
+
+    if [[ ! -f "$gallery_file" ]]; then
+        _api_success "{\"templates\": [], \"total\": 0}"
+        return
+    fi
+
+    local content
+    content=$(cat "$gallery_file" 2>/dev/null)
+    if [[ -z "$content" ]]; then
+        _api_success "{\"templates\": [], \"total\": 0}"
+        return
+    fi
+
+    # Optional category filter from query string
+    local category="${QUERY_PARAMS[category]:-}"
+
+    if [[ -n "$category" ]] && command -v jq >/dev/null 2>&1; then
+        local filtered
+        filtered=$(printf '%s' "$content" | jq --arg cat "$category" '[.[] | select(.category == $cat)]' 2>/dev/null)
+        local count
+        count=$(printf '%s' "$filtered" | jq 'length' 2>/dev/null || echo "0")
+        _api_success "{\"templates\": $filtered, \"total\": $count}"
+    else
+        local count
+        if command -v jq >/dev/null 2>&1; then
+            count=$(printf '%s' "$content" | jq 'length' 2>/dev/null || echo "0")
+        else
+            count="0"
+        fi
+        _api_success "{\"templates\": $content, \"total\": $count}"
+    fi
+}
+
+# POST /stacks/:name/clone — Clone a stack
+handle_stack_clone() {
+    local stack_name="$1"
+    local body="$2"
+
+    if ! command -v jq >/dev/null 2>&1; then
+        _api_error 500 "jq is required"
+        return
+    fi
+
+    local new_name
+    new_name=$(printf '%s' "$body" | jq -r '.new_name // empty' 2>/dev/null)
+
+    if [[ -z "$new_name" ]]; then
+        _api_error 400 "Missing required field: new_name"
+        return
+    fi
+
+    # Sanitize
+    new_name=$(echo "$new_name" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_-]/-/g' | head -c 64)
+    if [[ "$new_name" == *".."* || "$new_name" == *"/"* || -z "$new_name" ]]; then
+        _api_error 400 "Invalid stack name"
+        return
+    fi
+
+    local src_dir="$COMPOSE_DIR/$stack_name"
+    local dst_dir="$COMPOSE_DIR/$new_name"
+
+    if [[ ! -d "$src_dir" ]]; then
+        _api_error 404 "Source stack not found: $stack_name"
+        return
+    fi
+
+    if [[ -d "$dst_dir" ]]; then
+        _api_error 409 "Stack already exists: $new_name"
+        return
+    fi
+
+    # Copy the stack directory
+    cp -r "$src_dir" "$dst_dir"
+
+    # Update container_name references in compose file
+    local compose_file="$dst_dir/docker-compose.yml"
+    if [[ -f "$compose_file" ]]; then
+        sed -i "s/container_name:.*${stack_name}/container_name: ${new_name}/g" "$compose_file" 2>/dev/null
+    fi
+
+    _audit_log "stack_clone" "Cloned stack '$stack_name' to '$new_name'" 2>/dev/null
+
+    local escaped_src escaped_dst
+    escaped_src=$(_api_json_escape "$stack_name")
+    escaped_dst=$(_api_json_escape "$new_name")
+    _api_success "{\"success\": true, \"source\": \"$escaped_src\", \"name\": \"$escaped_dst\", \"message\": \"Stack cloned successfully\"}"
+}
+
+# GET /images/search — Search Docker Hub for images
+handle_image_search() {
+    local query="${QUERY_PARAMS[q]:-}"
+    local limit="${QUERY_PARAMS[limit]:-25}"
+
+    if [[ -z "$query" ]]; then
+        _api_error 400 "Missing required query parameter: q"
+        return
+    fi
+
+    local results
+    results=$(docker search --format '{"name":"{{.Name}}","description":"{{.Description}}","stars":{{.StarCount}},"official":"{{.IsOfficial}}","automated":"{{.IsAutomated}}"}' --limit "$limit" "$query" 2>/dev/null | sed 's/$/,/' | sed '$ s/,$//')
+
+    if [[ -z "$results" ]]; then
+        _api_success "{\"results\": [], \"total\": 0, \"query\": \"$(_api_json_escape "$query")\"}"
+        return
+    fi
+
+    local count
+    count=$(echo "$results" | wc -l)
+    _api_success "{\"results\": [$results], \"total\": $count, \"query\": \"$(_api_json_escape "$query")\"}"
+}
+
+# POST /compose/validate — Validate a compose file
+handle_compose_validate() {
+    local body="$1"
+
+    local content stack
+    if command -v jq >/dev/null 2>&1; then
+        content=$(printf '%s' "$body" | jq -r '.content // empty' 2>/dev/null)
+        stack=$(printf '%s' "$body" | jq -r '.stack // empty' 2>/dev/null)
+    fi
+
+    local tmpfile validate_output validate_rc
+
+    if [[ -n "$content" ]]; then
+        tmpfile=$(mktemp /tmp/dcs-validate-XXXXXX.yml)
+        printf '%s' "$content" > "$tmpfile"
+        validate_output=$($DOCKER_COMPOSE_CMD -f "$tmpfile" config 2>&1)
+        validate_rc=$?
+        rm -f "$tmpfile"
+    elif [[ -n "$stack" ]]; then
+        local compose_file="$COMPOSE_DIR/$stack/docker-compose.yml"
+        if [[ ! -f "$compose_file" ]]; then
+            _api_error 404 "Stack compose file not found: $stack"
+            return
+        fi
+        validate_output=$($DOCKER_COMPOSE_CMD -f "$compose_file" config 2>&1)
+        validate_rc=$?
+    else
+        _api_error 400 "Provide either 'content' or 'stack'"
+        return
+    fi
+
+    local escaped_output
+    escaped_output=$(_api_json_escape "$validate_output")
+
+    # Extract service names from valid config
+    local services="[]"
+    if [[ $validate_rc -eq 0 ]] && command -v jq >/dev/null 2>&1; then
+        services=$(echo "$validate_output" | grep -E '^  [a-zA-Z_-][a-zA-Z0-9_-]*:' | sed 's/:.*//' | tr -d ' ' | jq -R . | jq -s . 2>/dev/null || echo "[]")
+    fi
+
+    if [[ $validate_rc -eq 0 ]]; then
+        _api_success "{\"valid\": true, \"errors\": [], \"warnings\": [], \"services\": $services, \"output\": \"$escaped_output\"}"
+    else
+        _api_success "{\"valid\": false, \"errors\": [\"$escaped_output\"], \"warnings\": [], \"services\": [], \"output\": \"$escaped_output\"}"
+    fi
+}
+
+# GET /export/:type — Export data
+handle_export() {
+    local export_type="$1"
+
+    case "$export_type" in
+        health)
+            # Export current health report as JSON
+            local health_data
+            health_data=$(handle_health_internal 2>/dev/null || echo "{}")
+            _api_success "$health_data"
+            ;;
+        system)
+            local system_data
+            system_data=$(handle_system_info_internal 2>/dev/null || echo "{}")
+            _api_success "$system_data"
+            ;;
+        config)
+            local config_data="{}"
+            if [[ -f "$BASE_DIR/.env" ]]; then
+                local vars=""
+                while IFS='=' read -r key value; do
+                    [[ -z "$key" || "$key" == \#* ]] && continue
+                    key=$(echo "$key" | xargs)
+                    value=$(echo "$value" | xargs | sed 's/^"//; s/"$//')
+                    vars="${vars}\"$(_api_json_escape "$key")\": \"$(_api_json_escape "$value")\","
+                done < "$BASE_DIR/.env"
+                vars="${vars%,}"
+                config_data="{$vars}"
+            fi
+            _api_success "{\"type\": \"config\", \"data\": $config_data}"
+            ;;
+        *)
+            _api_error 400 "Invalid export type: $export_type. Valid types: health, system, config"
+            ;;
+    esac
+}
+
+# GET /audit — Get audit log entries
+handle_audit_log() {
+    local limit="${QUERY_PARAMS[limit]:-100}"
+    local action_filter="${QUERY_PARAMS[action]:-}"
+    local audit_file="$BASE_DIR/.data/audit.jsonl"
+
+    if [[ ! -f "$audit_file" ]]; then
+        _api_success "{\"entries\": [], \"total\": 0}"
+        return
+    fi
+
+    local entries
+    if [[ -n "$action_filter" ]] && command -v jq >/dev/null 2>&1; then
+        entries=$(tail -n "$limit" "$audit_file" | jq --arg action "$action_filter" 'select(.action == $action)' 2>/dev/null | jq -s '.' 2>/dev/null)
+    else
+        entries=$(tail -n "$limit" "$audit_file" | jq -s '.' 2>/dev/null)
+    fi
+
+    if [[ -z "$entries" || "$entries" == "null" ]]; then
+        entries="[]"
+    fi
+
+    local count
+    count=$(printf '%s' "$entries" | jq 'length' 2>/dev/null || echo "0")
+
+    # Reverse so newest first
+    entries=$(printf '%s' "$entries" | jq 'reverse' 2>/dev/null || echo "$entries")
+
+    _api_success "{\"entries\": $entries, \"total\": $count}"
+}
+
+# Audit log helper
+_audit_log() {
+    local action="$1"
+    local detail="$2"
+    local audit_file="$BASE_DIR/.data/audit.jsonl"
+
+    mkdir -p "$BASE_DIR/.data"
+
+    local timestamp
+    timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    local escaped_action escaped_detail
+    escaped_action=$(_api_json_escape "$action")
+    escaped_detail=$(_api_json_escape "$detail")
+
+    printf '{"timestamp":"%s","action":"%s","detail":"%s"}\n' "$timestamp" "$escaped_action" "$escaped_detail" >> "$audit_file"
+
+    # Fire webhooks if configured
+    _webhook_fire "$action" "$detail" 2>/dev/null &
+}
+
+# Webhook fire helper
+_webhook_fire() {
+    local event="$1"
+    local detail="$2"
+    local webhooks_file="$BASE_DIR/.data/webhooks.json"
+
+    [[ ! -f "$webhooks_file" ]] && return
+    command -v jq >/dev/null 2>&1 || return
+
+    local timestamp
+    timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+    local urls
+    urls=$(jq -r --arg evt "$event" '.[] | select(.enabled == true) | select(.events | index($evt)) | .url' "$webhooks_file" 2>/dev/null)
+
+    while IFS= read -r url; do
+        [[ -z "$url" ]] && continue
+        curl -s -X POST -H "Content-Type: application/json" \
+            -d "{\"event\": \"$(_api_json_escape "$event")\", \"detail\": \"$(_api_json_escape "$detail")\", \"timestamp\": \"$timestamp\"}" \
+            --max-time 10 "$url" >/dev/null 2>&1 &
+    done <<< "$urls"
+}
+
+# GET /webhooks — List webhooks
+handle_webhooks_list() {
+    local webhooks_file="$BASE_DIR/.data/webhooks.json"
+
+    if [[ ! -f "$webhooks_file" ]]; then
+        _api_success "{\"webhooks\": [], \"total\": 0}"
+        return
+    fi
+
+    local content
+    content=$(cat "$webhooks_file" 2>/dev/null || echo "[]")
+    local count
+    count=$(printf '%s' "$content" | jq 'length' 2>/dev/null || echo "0")
+
+    _api_success "{\"webhooks\": $content, \"total\": $count}"
+}
+
+# POST /webhooks — Create a webhook
+handle_webhook_create() {
+    local body="$1"
+    local webhooks_file="$BASE_DIR/.data/webhooks.json"
+
+    if ! command -v jq >/dev/null 2>&1; then
+        _api_error 500 "jq is required"
+        return
+    fi
+
+    mkdir -p "$BASE_DIR/.data"
+
+    local url events enabled
+    url=$(printf '%s' "$body" | jq -r '.url // empty' 2>/dev/null)
+    events=$(printf '%s' "$body" | jq -c '.events // ["deploy","health_change"]' 2>/dev/null)
+    enabled=$(printf '%s' "$body" | jq -r '.enabled // true' 2>/dev/null)
+
+    if [[ -z "$url" ]]; then
+        _api_error 400 "Missing required field: url"
+        return
+    fi
+
+    local id
+    id="wh-$(date +%s)-$RANDOM"
+    local timestamp
+    timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+    # Load or create webhooks array
+    local existing="[]"
+    [[ -f "$webhooks_file" ]] && existing=$(cat "$webhooks_file" 2>/dev/null || echo "[]")
+
+    local new_webhook
+    new_webhook=$(jq -n --arg id "$id" --arg url "$url" --argjson events "$events" --argjson enabled "$enabled" --arg ts "$timestamp" \
+        '{id: $id, url: $url, events: $events, enabled: $enabled, created_at: $ts}')
+
+    printf '%s' "$existing" | jq --argjson wh "$new_webhook" '. + [$wh]' > "$webhooks_file"
+
+    _api_success "{\"success\": true, \"webhook\": $new_webhook}"
+}
+
+# DELETE /webhooks/:id — Delete a webhook
+handle_webhook_delete() {
+    local webhook_id="$1"
+    local webhooks_file="$BASE_DIR/.data/webhooks.json"
+
+    if [[ ! -f "$webhooks_file" ]]; then
+        _api_error 404 "Webhook not found"
+        return
+    fi
+
+    if ! command -v jq >/dev/null 2>&1; then
+        _api_error 500 "jq is required"
+        return
+    fi
+
+    local new_list
+    new_list=$(jq --arg id "$webhook_id" '[.[] | select(.id != $id)]' "$webhooks_file" 2>/dev/null)
+    printf '%s' "$new_list" > "$webhooks_file"
+
+    _api_success "{\"success\": true, \"deleted\": \"$(_api_json_escape "$webhook_id")\"}"
+}
+
+# POST /webhooks/:id/test — Test a webhook
+handle_webhook_test() {
+    local webhook_id="$1"
+    local webhooks_file="$BASE_DIR/.data/webhooks.json"
+
+    if [[ ! -f "$webhooks_file" ]]; then
+        _api_error 404 "Webhook not found"
+        return
+    fi
+
+    local url
+    url=$(jq -r --arg id "$webhook_id" '.[] | select(.id == $id) | .url' "$webhooks_file" 2>/dev/null)
+
+    if [[ -z "$url" ]]; then
+        _api_error 404 "Webhook not found"
+        return
+    fi
+
+    local timestamp
+    timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    local http_code
+    http_code=$(curl -s -o /dev/null -w '%{http_code}' -X POST -H "Content-Type: application/json" \
+        -d "{\"event\": \"test\", \"detail\": \"Webhook test from DCS\", \"timestamp\": \"$timestamp\"}" \
+        --max-time 10 "$url" 2>/dev/null)
+
+    _api_success "{\"success\": true, \"status_code\": $http_code, \"url\": \"$(_api_json_escape "$url")\", \"timestamp\": \"$timestamp\"}"
+}
+
 # POST /templates/:name/update — Update an existing template's compose, metadata, and .env
 handle_template_update() {
     local name="$1"
@@ -7693,6 +8250,1167 @@ handle_stack_reorder() {
 }
 
 # =============================================================================
+# FEATURE: METRICS HISTORY & SUMMARY
+# =============================================================================
+
+# Helper: parse time range to epoch cutoff
+_api_range_to_cutoff() {
+    local range="$1"
+    local now
+    now=$(date +%s)
+    case "$range" in
+        1h)  echo $((now - 3600)) ;;
+        6h)  echo $((now - 21600)) ;;
+        24h) echo $((now - 86400)) ;;
+        7d)  echo $((now - 604800)) ;;
+        *)   echo $((now - 3600)) ;;
+    esac
+}
+
+# GET /metrics/history?range=1h|6h|24h|7d
+# Read JSONL metrics files, filter by time range, return as JSON array
+handle_metrics_history() {
+    local range="${QUERY_PARAMS[range]:-1h}"
+    local cutoff
+    cutoff=$(_api_range_to_cutoff "$range")
+
+    local metrics_dir="$BASE_DIR/.data/metrics"
+    if [[ ! -d "$metrics_dir" ]]; then
+        _api_success "{\"range\": \"$(_api_json_escape "$range")\", \"data\": [], \"count\": 0}"
+        return
+    fi
+
+    local -a points=()
+    local now
+    now=$(date +%s)
+
+    # Determine which date-stamped files to read based on range
+    local days_back=1
+    case "$range" in
+        6h)  days_back=1 ;;
+        24h) days_back=2 ;;
+        7d)  days_back=8 ;;
+    esac
+
+    local i
+    for (( i=0; i<days_back; i++ )); do
+        local date_str
+        date_str=$(date -d "-${i} days" '+%Y-%m-%d' 2>/dev/null || date '+%Y-%m-%d')
+        local mfile="$metrics_dir/metrics-${date_str}.jsonl"
+        [[ -f "$mfile" ]] || continue
+
+        while IFS= read -r line; do
+            [[ -z "$line" ]] && continue
+            local ts_val
+            ts_val=$(printf '%s' "$line" | grep -oP '"ts":\K[0-9]+' 2>/dev/null || echo 0)
+            [[ $ts_val -ge $cutoff ]] && points+=("$line")
+        done < "$mfile"
+    done
+
+    local json
+    if [[ ${#points[@]} -eq 0 ]]; then
+        json="[]"
+    else
+        json=$(printf '%s,' "${points[@]}")
+        json="[${json%,}]"
+    fi
+
+    _api_success "{\"range\": \"$(_api_json_escape "$range")\", \"data\": $json, \"count\": ${#points[@]}}"
+}
+
+# GET /metrics/summary?range=1h|6h|24h|7d
+# Compute avg/min/max for cpu, mem from metrics history
+handle_metrics_summary() {
+    local range="${QUERY_PARAMS[range]:-1h}"
+    local cutoff
+    cutoff=$(_api_range_to_cutoff "$range")
+
+    local metrics_dir="$BASE_DIR/.data/metrics"
+    if [[ ! -d "$metrics_dir" ]]; then
+        _api_success "{\"range\": \"$(_api_json_escape "$range")\", \"samples\": 0, \"cpu\": {\"avg\": 0, \"min\": 0, \"max\": 0}, \"mem\": {\"avg\": 0, \"min\": 0, \"max\": 0}}"
+        return
+    fi
+
+    local days_back=1
+    case "$range" in
+        6h)  days_back=1 ;;
+        24h) days_back=2 ;;
+        7d)  days_back=8 ;;
+    esac
+
+    # Collect all matching lines into a temp file for awk processing
+    local tmpfile
+    tmpfile=$(mktemp)
+
+    local i
+    for (( i=0; i<days_back; i++ )); do
+        local date_str
+        date_str=$(date -d "-${i} days" '+%Y-%m-%d' 2>/dev/null || date '+%Y-%m-%d')
+        local mfile="$metrics_dir/metrics-${date_str}.jsonl"
+        [[ -f "$mfile" ]] || continue
+
+        while IFS= read -r line; do
+            [[ -z "$line" ]] && continue
+            local ts_val
+            ts_val=$(printf '%s' "$line" | grep -oP '"ts":\K[0-9]+' 2>/dev/null || echo 0)
+            [[ $ts_val -ge $cutoff ]] && echo "$line" >> "$tmpfile"
+        done < "$mfile"
+    done
+
+    if [[ ! -s "$tmpfile" ]]; then
+        rm -f "$tmpfile"
+        _api_success "{\"range\": \"$(_api_json_escape "$range")\", \"samples\": 0, \"cpu\": {\"avg\": 0, \"min\": 0, \"max\": 0}, \"mem\": {\"avg\": 0, \"min\": 0, \"max\": 0}}"
+        return
+    fi
+
+    # Use awk to extract cpu and mem values and compute stats
+    local stats
+    stats=$(awk '
+    BEGIN { cpu_sum=0; cpu_min=999999; cpu_max=0; mem_sum=0; mem_min=999999; mem_max=0; n=0 }
+    {
+        cpu=0; mem=0
+        if (match($0, /"cpu":([0-9.]+)/, a)) cpu=a[1]
+        if (match($0, /"mem":([0-9.]+)/, a)) mem=a[1]
+        cpu_sum+=cpu; mem_sum+=mem; n++
+        if (cpu<cpu_min) cpu_min=cpu; if (cpu>cpu_max) cpu_max=cpu
+        if (mem<mem_min) mem_min=mem; if (mem>mem_max) mem_max=mem
+    }
+    END {
+        if (n==0) { print "0 0 0 0 0 0 0 0"; exit }
+        printf "%.1f %.1f %.1f %.1f %.1f %.1f %d %d\n", cpu_sum/n, cpu_min, cpu_max, mem_sum/n, mem_min, mem_max, n, n
+    }' "$tmpfile" 2>/dev/null)
+
+    rm -f "$tmpfile"
+
+    local cpu_avg cpu_min cpu_max mem_avg mem_min mem_max samples _
+    read -r cpu_avg cpu_min cpu_max mem_avg mem_min mem_max samples _ <<< "$stats"
+    [[ -z "$samples" ]] && samples=0
+
+    _api_success "{\"range\": \"$(_api_json_escape "$range")\", \"samples\": $samples, \"cpu\": {\"avg\": $cpu_avg, \"min\": $cpu_min, \"max\": $cpu_max}, \"mem\": {\"avg\": $mem_avg, \"min\": $mem_min, \"max\": $mem_max}}"
+}
+
+# =============================================================================
+# FEATURE: ROLLBACK MANAGEMENT
+# =============================================================================
+
+# GET /rollback/<stack>/snapshots
+# List all rollback snapshots for a stack
+handle_rollback_snapshots() {
+    local stack="$1"
+    local snap_dir="$BASE_DIR/.data/rollback/$stack"
+
+    if [[ ! -d "$snap_dir" ]]; then
+        _api_success "{\"stack\": \"$(_api_json_escape "$stack")\", \"snapshots\": [], \"count\": 0}"
+        return
+    fi
+
+    local -a entries=()
+    local dir
+    for dir in "$snap_dir"/*/; do
+        [[ -d "$dir" ]] || continue
+        local ts
+        ts=$(basename "$dir")
+        local meta_file="$dir/metadata.json"
+
+        if [[ -f "$meta_file" ]]; then
+            local meta
+            meta=$(cat "$meta_file" 2>/dev/null)
+            entries+=("{\"timestamp\": \"$(_api_json_escape "$ts")\", \"metadata\": $meta}")
+        else
+            local has_compose="false" has_env="false" has_images="false"
+            [[ -f "$dir/docker-compose.yml" ]] && has_compose="true"
+            [[ -f "$dir/.env" ]] && has_env="true"
+            [[ -f "$dir/images.json" ]] && has_images="true"
+            entries+=("{\"timestamp\": \"$(_api_json_escape "$ts")\", \"has_compose\": $has_compose, \"has_env\": $has_env, \"has_images\": $has_images}")
+        fi
+    done
+
+    local json
+    if [[ ${#entries[@]} -eq 0 ]]; then
+        json="[]"
+    else
+        json=$(printf '%s,' "${entries[@]}")
+        json="[${json%,}]"
+    fi
+
+    _api_success "{\"stack\": \"$(_api_json_escape "$stack")\", \"snapshots\": $json, \"count\": ${#entries[@]}}"
+}
+
+# GET /rollback/<stack>/snapshots/<timestamp>
+# Return metadata.json content for a specific snapshot
+handle_rollback_snapshot_detail() {
+    local stack="$1"
+    local timestamp="$2"
+    local snap_dir="$BASE_DIR/.data/rollback/$stack/$timestamp"
+
+    if [[ ! -d "$snap_dir" ]]; then
+        _api_error 404 "Snapshot not found: $stack/$timestamp"
+        return
+    fi
+
+    local meta="{}"
+    [[ -f "$snap_dir/metadata.json" ]] && meta=$(cat "$snap_dir/metadata.json" 2>/dev/null)
+
+    local compose_content=""
+    if [[ -f "$snap_dir/docker-compose.yml" ]]; then
+        compose_content=$(_api_json_escape "$(cat "$snap_dir/docker-compose.yml" 2>/dev/null)")
+    fi
+
+    local env_content=""
+    if [[ -f "$snap_dir/.env" ]]; then
+        env_content=$(_api_json_escape "$(cat "$snap_dir/.env" 2>/dev/null)")
+    fi
+
+    local images="[]"
+    [[ -f "$snap_dir/images.json" ]] && images=$(cat "$snap_dir/images.json" 2>/dev/null)
+
+    _api_success "{\"stack\": \"$(_api_json_escape "$stack")\", \"timestamp\": \"$(_api_json_escape "$timestamp")\", \"metadata\": $meta, \"compose\": \"$compose_content\", \"env\": \"$env_content\", \"images\": $images}"
+}
+
+# POST /rollback/<stack>/restore — body: {"timestamp": "..."}
+# Restore a snapshot: copy files back, pull images, restart stack
+handle_rollback_restore() {
+    local stack="$1"
+    local body="$2"
+
+    local timestamp
+    if command -v jq >/dev/null 2>&1; then
+        timestamp=$(echo "$body" | jq -r '.timestamp // empty' 2>/dev/null)
+    else
+        timestamp=$(echo "$body" | sed -n 's/.*"timestamp" *: *"\([^"]*\)".*/\1/p')
+    fi
+
+    if [[ -z "$timestamp" ]]; then
+        _api_error 400 "Missing required field: timestamp"
+        return
+    fi
+
+    # Validate timestamp format (prevent path traversal)
+    if [[ "$timestamp" == *"/"* ]] || [[ "$timestamp" == *".."* ]]; then
+        _api_error 400 "Invalid timestamp format"
+        return
+    fi
+
+    local snap_dir="$BASE_DIR/.data/rollback/$stack/$timestamp"
+    local stack_dir="$COMPOSE_DIR/$stack"
+
+    if [[ ! -d "$snap_dir" ]]; then
+        _api_error 404 "Snapshot not found: $stack/$timestamp"
+        return
+    fi
+
+    if [[ ! -d "$stack_dir" ]]; then
+        _api_error 404 "Stack directory not found: $stack"
+        return
+    fi
+
+    # Stop the stack first
+    local compose_file="$stack_dir/docker-compose.yml"
+    local env_file="$stack_dir/.env"
+    local -a compose_args=(-f "$compose_file")
+    [[ -f "$env_file" ]] && compose_args+=(--env-file "$env_file")
+    $DOCKER_COMPOSE_CMD "${compose_args[@]}" down --remove-orphans 2>/dev/null || true
+
+    # Copy snapshot files back
+    [[ -f "$snap_dir/docker-compose.yml" ]] && cp "$snap_dir/docker-compose.yml" "$stack_dir/docker-compose.yml"
+    [[ -f "$snap_dir/.env" ]] && cp "$snap_dir/.env" "$stack_dir/.env"
+
+    # Pull images listed in snapshot
+    local pull_output=""
+    if [[ -f "$snap_dir/images.json" ]] && command -v jq >/dev/null 2>&1; then
+        local img
+        while IFS= read -r img; do
+            [[ -z "$img" ]] && continue
+            docker pull "$img" 2>&1 || true
+        done < <(jq -r '.[]' "$snap_dir/images.json" 2>/dev/null)
+    fi
+
+    # Restart the stack with restored files
+    compose_args=(-f "$stack_dir/docker-compose.yml")
+    [[ -f "$stack_dir/.env" ]] && compose_args+=(--env-file "$stack_dir/.env")
+    local start_output
+    start_output=$($DOCKER_COMPOSE_CMD "${compose_args[@]}" up -d 2>&1) || true
+
+    _api_success "{\"success\": true, \"stack\": \"$(_api_json_escape "$stack")\", \"restored_from\": \"$(_api_json_escape "$timestamp")\", \"message\": \"Stack restored and restarted\"}"
+}
+
+# GET /rollback/<stack>/diff/<timestamp>
+# Diff current compose/env against snapshot
+handle_rollback_diff() {
+    local stack="$1"
+    local timestamp="$2"
+    local snap_dir="$BASE_DIR/.data/rollback/$stack/$timestamp"
+    local stack_dir="$COMPOSE_DIR/$stack"
+
+    if [[ ! -d "$snap_dir" ]]; then
+        _api_error 404 "Snapshot not found: $stack/$timestamp"
+        return
+    fi
+
+    if [[ ! -d "$stack_dir" ]]; then
+        _api_error 404 "Stack directory not found: $stack"
+        return
+    fi
+
+    local compose_diff="" env_diff=""
+
+    if [[ -f "$snap_dir/docker-compose.yml" ]] && [[ -f "$stack_dir/docker-compose.yml" ]]; then
+        compose_diff=$(_api_json_escape "$(diff -u "$snap_dir/docker-compose.yml" "$stack_dir/docker-compose.yml" 2>/dev/null || true)")
+    fi
+
+    if [[ -f "$snap_dir/.env" ]] && [[ -f "$stack_dir/.env" ]]; then
+        env_diff=$(_api_json_escape "$(diff -u "$snap_dir/.env" "$stack_dir/.env" 2>/dev/null || true)")
+    fi
+
+    local compose_changed="false" env_changed="false"
+    [[ -n "$compose_diff" ]] && compose_changed="true"
+    [[ -n "$env_diff" ]] && env_changed="true"
+
+    _api_success "{\"stack\": \"$(_api_json_escape "$stack")\", \"snapshot\": \"$(_api_json_escape "$timestamp")\", \"compose_changed\": $compose_changed, \"env_changed\": $env_changed, \"compose_diff\": \"$compose_diff\", \"env_diff\": \"$env_diff\"}"
+}
+
+# =============================================================================
+# FEATURE: SECRETS MANAGEMENT
+# =============================================================================
+
+# GET /secrets — List secret key names (never values)
+handle_secrets_list() {
+    local secrets_dir="$BASE_DIR/.secrets"
+
+    if [[ ! -d "$secrets_dir" ]]; then
+        _api_success "{\"secrets\": [], \"count\": 0}"
+        return
+    fi
+
+    local -a entries=()
+    local f
+    for f in "$secrets_dir"/*.enc; do
+        [[ -f "$f" ]] || continue
+        local key
+        key=$(basename "$f" .enc)
+        local modified
+        modified=$(stat -c '%Y' "$f" 2>/dev/null || echo 0)
+        local modified_ts
+        modified_ts=$(date -u -d "@$modified" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || echo "unknown")
+        local size
+        size=$(stat -c '%s' "$f" 2>/dev/null || echo 0)
+        entries+=("{\"key\": \"$(_api_json_escape "$key")\", \"modified\": \"$modified_ts\", \"size\": $size}")
+    done
+
+    local json
+    if [[ ${#entries[@]} -eq 0 ]]; then
+        json="[]"
+    else
+        json=$(printf '%s,' "${entries[@]}")
+        json="[${json%,}]"
+    fi
+
+    _api_success "{\"secrets\": $json, \"count\": ${#entries[@]}}"
+}
+
+# POST /secrets — body: {"key": "...", "value": "..."}
+# Encrypt and store a secret value
+handle_secret_set() {
+    local body="$1"
+
+    local key value
+    if command -v jq >/dev/null 2>&1; then
+        key=$(echo "$body" | jq -r '.key // empty' 2>/dev/null)
+        value=$(echo "$body" | jq -r '.value // empty' 2>/dev/null)
+    else
+        key=$(echo "$body" | sed -n 's/.*"key" *: *"\([^"]*\)".*/\1/p')
+        value=$(echo "$body" | sed -n 's/.*"value" *: *"\([^"]*\)".*/\1/p')
+    fi
+
+    if [[ -z "$key" ]] || [[ -z "$value" ]]; then
+        _api_error 400 "Missing required fields: key and value"
+        return
+    fi
+
+    # Validate key name: alphanumeric, hyphens, underscores only
+    if [[ ! "$key" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+        _api_error 400 "Invalid key name. Use only alphanumeric characters, hyphens, and underscores."
+        return
+    fi
+
+    local secrets_dir="$BASE_DIR/.secrets"
+    mkdir -p "$secrets_dir"
+
+    local master_key_file="$secrets_dir/.master-key"
+    if [[ ! -f "$master_key_file" ]]; then
+        # Generate master key on first use
+        openssl rand -hex 32 > "$master_key_file"
+        chmod 600 "$master_key_file"
+    fi
+
+    local master_key
+    master_key=$(cat "$master_key_file" 2>/dev/null)
+
+    local enc_file="$secrets_dir/${key}.enc"
+    if printf '%s' "$value" | openssl enc -aes-256-cbc -salt -pbkdf2 -pass "pass:${master_key}" -out "$enc_file" 2>/dev/null; then
+        chmod 600 "$enc_file"
+        _api_success "{\"success\": true, \"key\": \"$(_api_json_escape "$key")\", \"message\": \"Secret stored successfully\"}"
+    else
+        _api_error 500 "Failed to encrypt secret"
+    fi
+}
+
+# DELETE /secrets/<key> — Securely delete a secret
+handle_secret_delete() {
+    local key="$1"
+
+    # Validate key name
+    if [[ ! "$key" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+        _api_error 400 "Invalid key name"
+        return
+    fi
+
+    local enc_file="$BASE_DIR/.secrets/${key}.enc"
+
+    if [[ ! -f "$enc_file" ]]; then
+        _api_error 404 "Secret not found: $key"
+        return
+    fi
+
+    # Securely overwrite before deleting (if shred is available)
+    if command -v shred >/dev/null 2>&1; then
+        shred -u "$enc_file" 2>/dev/null
+    else
+        dd if=/dev/urandom of="$enc_file" bs=$(stat -c '%s' "$enc_file" 2>/dev/null || echo 64) count=1 2>/dev/null
+        rm -f "$enc_file"
+    fi
+
+    _api_success "{\"success\": true, \"key\": \"$(_api_json_escape "$key")\", \"message\": \"Secret deleted securely\"}"
+}
+
+# GET /secrets/<key>/exists — Check if a secret exists (boolean)
+handle_secret_exists() {
+    local key="$1"
+
+    # Validate key name
+    if [[ ! "$key" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+        _api_error 400 "Invalid key name"
+        return
+    fi
+
+    local enc_file="$BASE_DIR/.secrets/${key}.enc"
+    local exists="false"
+    [[ -f "$enc_file" ]] && exists="true"
+
+    _api_success "{\"key\": \"$(_api_json_escape "$key")\", \"exists\": $exists}"
+}
+
+# =============================================================================
+# FEATURE: SCHEDULE MANAGEMENT
+# =============================================================================
+
+# GET /schedules — Return schedules.json content
+handle_schedules_list() {
+    local sched_file="$BASE_DIR/.data/schedules/schedules.json"
+
+    if [[ ! -f "$sched_file" ]]; then
+        _api_success "{\"schedules\": [], \"count\": 0}"
+        return
+    fi
+
+    local content
+    content=$(cat "$sched_file" 2>/dev/null)
+
+    # Validate JSON content
+    if command -v jq >/dev/null 2>&1; then
+        if ! echo "$content" | jq '.' >/dev/null 2>&1; then
+            _api_error 500 "Invalid schedules data file"
+            return
+        fi
+        local count
+        count=$(echo "$content" | jq 'length' 2>/dev/null || echo 0)
+        _api_success "{\"schedules\": $content, \"count\": $count}"
+    else
+        _api_success "{\"schedules\": $content, \"count\": 0}"
+    fi
+}
+
+# POST /schedules — body: schedule entry JSON
+# Add a new schedule entry
+handle_schedule_create() {
+    local body="$1"
+    local sched_dir="$BASE_DIR/.data/schedules"
+    local sched_file="$sched_dir/schedules.json"
+    mkdir -p "$sched_dir"
+
+    if ! command -v jq >/dev/null 2>&1; then
+        _api_error 500 "jq is required for schedule management"
+        return
+    fi
+
+    # Validate required fields
+    local name action cron
+    name=$(echo "$body" | jq -r '.name // empty' 2>/dev/null)
+    action=$(echo "$body" | jq -r '.action // empty' 2>/dev/null)
+    cron=$(echo "$body" | jq -r '.cron // empty' 2>/dev/null)
+
+    if [[ -z "$name" ]] || [[ -z "$action" ]] || [[ -z "$cron" ]]; then
+        _api_error 400 "Missing required fields: name, action, and cron"
+        return
+    fi
+
+    # Generate unique ID
+    local id
+    id="sched_$(date +%s)_$$"
+
+    # Build new entry with id, enabled=true, and created timestamp
+    local new_entry
+    new_entry=$(echo "$body" | jq --arg id "$id" --arg ts "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+        '. + {id: $id, enabled: true, created: $ts}' 2>/dev/null)
+
+    # Append to schedules array
+    local current="[]"
+    [[ -f "$sched_file" ]] && current=$(cat "$sched_file" 2>/dev/null)
+    echo "$current" | jq --argjson entry "$new_entry" '. + [$entry]' > "$sched_file" 2>/dev/null
+
+    _api_success "{\"success\": true, \"schedule\": $new_entry}"
+}
+
+# POST /schedules/<id>/update — body: updated fields
+# Update an existing schedule
+handle_schedule_update() {
+    local sched_id="$1"
+    local body="$2"
+    local sched_file="$BASE_DIR/.data/schedules/schedules.json"
+
+    if ! command -v jq >/dev/null 2>&1; then
+        _api_error 500 "jq is required for schedule management"
+        return
+    fi
+
+    if [[ ! -f "$sched_file" ]]; then
+        _api_error 404 "No schedules found"
+        return
+    fi
+
+    # Check if schedule exists
+    local exists
+    exists=$(jq --arg id "$sched_id" '[.[] | select(.id == $id)] | length' "$sched_file" 2>/dev/null)
+    if [[ "$exists" -eq 0 ]]; then
+        _api_error 404 "Schedule not found: $sched_id"
+        return
+    fi
+
+    # Merge updates into existing entry (preserve id)
+    local updated
+    updated=$(jq --arg id "$sched_id" --argjson updates "$body" \
+        '[.[] | if .id == $id then . * $updates | .id = $id else . end]' \
+        "$sched_file" 2>/dev/null)
+
+    echo "$updated" > "$sched_file"
+
+    local entry
+    entry=$(echo "$updated" | jq --arg id "$sched_id" '.[] | select(.id == $id)' 2>/dev/null)
+
+    _api_success "{\"success\": true, \"schedule\": $entry}"
+}
+
+# DELETE /schedules/<id> — Remove a schedule
+handle_schedule_delete() {
+    local sched_id="$1"
+    local sched_file="$BASE_DIR/.data/schedules/schedules.json"
+
+    if ! command -v jq >/dev/null 2>&1; then
+        _api_error 500 "jq is required for schedule management"
+        return
+    fi
+
+    if [[ ! -f "$sched_file" ]]; then
+        _api_error 404 "No schedules found"
+        return
+    fi
+
+    local exists
+    exists=$(jq --arg id "$sched_id" '[.[] | select(.id == $id)] | length' "$sched_file" 2>/dev/null)
+    if [[ "$exists" -eq 0 ]]; then
+        _api_error 404 "Schedule not found: $sched_id"
+        return
+    fi
+
+    jq --arg id "$sched_id" '[.[] | select(.id != $id)]' "$sched_file" > "${sched_file}.tmp" && \
+        mv "${sched_file}.tmp" "$sched_file"
+
+    _api_success "{\"success\": true, \"deleted\": \"$(_api_json_escape "$sched_id")\"}"
+}
+
+# POST /schedules/<id>/toggle — Enable/disable a schedule
+handle_schedule_toggle() {
+    local sched_id="$1"
+    local sched_file="$BASE_DIR/.data/schedules/schedules.json"
+
+    if ! command -v jq >/dev/null 2>&1; then
+        _api_error 500 "jq is required for schedule management"
+        return
+    fi
+
+    if [[ ! -f "$sched_file" ]]; then
+        _api_error 404 "No schedules found"
+        return
+    fi
+
+    local exists
+    exists=$(jq --arg id "$sched_id" '[.[] | select(.id == $id)] | length' "$sched_file" 2>/dev/null)
+    if [[ "$exists" -eq 0 ]]; then
+        _api_error 404 "Schedule not found: $sched_id"
+        return
+    fi
+
+    # Toggle the enabled field
+    jq --arg id "$sched_id" \
+        '[.[] | if .id == $id then .enabled = (.enabled | not) else . end]' \
+        "$sched_file" > "${sched_file}.tmp" && mv "${sched_file}.tmp" "$sched_file"
+
+    local new_state
+    new_state=$(jq -r --arg id "$sched_id" '.[] | select(.id == $id) | .enabled' "$sched_file" 2>/dev/null)
+
+    _api_success "{\"success\": true, \"id\": \"$(_api_json_escape "$sched_id")\", \"enabled\": $new_state}"
+}
+
+# GET /schedules/<id>/history — Return execution history filtered by schedule id
+handle_schedule_history() {
+    local sched_id="$1"
+    local history_file="$BASE_DIR/.data/schedules/history.jsonl"
+
+    if [[ ! -f "$history_file" ]]; then
+        _api_success "{\"schedule_id\": \"$(_api_json_escape "$sched_id")\", \"history\": [], \"count\": 0}"
+        return
+    fi
+
+    local -a entries=()
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        local line_id
+        if command -v jq >/dev/null 2>&1; then
+            line_id=$(printf '%s' "$line" | jq -r '.schedule_id // .id // empty' 2>/dev/null)
+        else
+            line_id=$(printf '%s' "$line" | grep -oP '"schedule_id" *: *"\K[^"]+' 2>/dev/null || \
+                      printf '%s' "$line" | grep -oP '"id" *: *"\K[^"]+' 2>/dev/null || echo "")
+        fi
+        [[ "$line_id" == "$sched_id" ]] && entries+=("$line")
+    done < "$history_file"
+
+    local json
+    if [[ ${#entries[@]} -eq 0 ]]; then
+        json="[]"
+    else
+        json=$(printf '%s,' "${entries[@]}")
+        json="[${json%,}]"
+    fi
+
+    _api_success "{\"schedule_id\": \"$(_api_json_escape "$sched_id")\", \"history\": $json, \"count\": ${#entries[@]}}"
+}
+
+# =============================================================================
+# FEATURE: HEALTH SCORING
+# =============================================================================
+
+# GET /health/score — Compute system-wide health score (0-100)
+# Factors: stacks (container health), resources (CPU/mem), images (freshness), uptime
+handle_health_score() {
+    local now
+    now=$(date +%s)
+
+    # ── Factor 1: Stack/container health (40% weight) ──
+    local total_containers=0 healthy_count=0 unhealthy_count=0
+    while IFS= read -r cid; do
+        [[ -z "$cid" ]] && continue
+        total_containers=$((total_containers + 1))
+        local state health
+        state=$(docker inspect --format='{{.State.Status}}' "$cid" 2>/dev/null)
+        health=$(docker inspect --format='{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$cid" 2>/dev/null)
+
+        if [[ "$state" == "running" ]]; then
+            if [[ "$health" == "unhealthy" ]]; then
+                unhealthy_count=$((unhealthy_count + 1))
+            else
+                healthy_count=$((healthy_count + 1))
+            fi
+        fi
+    done < <(docker ps -a -q 2>/dev/null)
+
+    local stack_score=100
+    if [[ $total_containers -gt 0 ]]; then
+        stack_score=$(awk "BEGIN { printf \"%d\", ($healthy_count / $total_containers) * 100 }")
+    fi
+
+    # ── Factor 2: Resource usage (30% weight) ──
+    local load1
+    read -r load1 _ < /proc/loadavg 2>/dev/null || load1=0
+    local cpu_count
+    cpu_count=$(nproc 2>/dev/null || echo 1)
+    local cpu_pct
+    cpu_pct=$(awk "BEGIN { v = ($load1 / $cpu_count) * 100; if (v > 100) v = 100; printf \"%.0f\", v }")
+
+    local mem_total=0 mem_available=0
+    while IFS=':' read -r key val; do
+        val="${val// /}"; val="${val%%kB*}"
+        case "$key" in
+            MemTotal)     mem_total=$((val / 1024)) ;;
+            MemAvailable) mem_available=$((val / 1024)) ;;
+        esac
+    done < /proc/meminfo 2>/dev/null
+    local mem_pct=0
+    [[ $mem_total -gt 0 ]] && mem_pct=$(awk "BEGIN { printf \"%.0f\", (($mem_total - $mem_available) / $mem_total) * 100 }")
+
+    # Resource score: 100 when usage is low, decreases as usage rises
+    local resource_score
+    resource_score=$(awk "BEGIN { s = 100 - (($cpu_pct + $mem_pct) / 2); if (s < 0) s = 0; printf \"%d\", s }")
+
+    # ── Factor 3: Image freshness (15% weight) ──
+    local total_images=0 stale_images=0
+    while IFS= read -r line; do
+        [[ -z "$line" || "$line" == "REPOSITORY"* ]] && continue
+        local repo tag _rest
+        read -r repo tag _rest <<< "$line"
+        [[ "$repo" == "<none>" ]] && continue
+        total_images=$((total_images + 1))
+
+        local full_image="${repo}:${tag}"
+        local created_ts
+        created_ts=$(docker inspect --format '{{.Created}}' "$full_image" 2>/dev/null | head -1)
+        if [[ -n "$created_ts" ]]; then
+            local created_epoch
+            created_epoch=$(date -d "$created_ts" +%s 2>/dev/null || echo 0)
+            local age_days=$(( (now - created_epoch) / 86400 ))
+            [[ $age_days -gt 30 ]] && stale_images=$((stale_images + 1))
+        fi
+    done < <(docker images --format "{{.Repository}}\t{{.Tag}}\t{{.Size}}" 2>/dev/null)
+
+    local image_score=100
+    if [[ $total_images -gt 0 ]]; then
+        image_score=$(awk "BEGIN { printf \"%d\", (1 - ($stale_images / $total_images)) * 100 }")
+    fi
+
+    # ── Factor 4: System uptime (15% weight) ──
+    local uptime_seconds
+    uptime_seconds=$(awk '{printf "%d", $1}' /proc/uptime 2>/dev/null || echo 0)
+    # Score: 100 if uptime > 7 days, scales linearly below that
+    local uptime_score
+    uptime_score=$(awk "BEGIN { s = ($uptime_seconds / 604800) * 100; if (s > 100) s = 100; printf \"%d\", s }")
+
+    # ── Weighted total ──
+    local total_score
+    total_score=$(awk "BEGIN { printf \"%d\", ($stack_score * 0.4) + ($resource_score * 0.3) + ($image_score * 0.15) + ($uptime_score * 0.15) }")
+
+    # Determine grade
+    local grade="A"
+    if [[ $total_score -ge 90 ]]; then grade="A"
+    elif [[ $total_score -ge 80 ]]; then grade="B"
+    elif [[ $total_score -ge 70 ]]; then grade="C"
+    elif [[ $total_score -ge 60 ]]; then grade="D"
+    else grade="F"
+    fi
+
+    _api_success "{\"score\": $total_score, \"grade\": \"$grade\", \"factors\": {\"stacks\": {\"score\": $stack_score, \"weight\": 0.4, \"healthy\": $healthy_count, \"unhealthy\": $unhealthy_count, \"total\": $total_containers}, \"resources\": {\"score\": $resource_score, \"weight\": 0.3, \"cpu_pct\": $cpu_pct, \"mem_pct\": $mem_pct}, \"images\": {\"score\": $image_score, \"weight\": 0.15, \"total\": $total_images, \"stale\": $stale_images}, \"uptime\": {\"score\": $uptime_score, \"weight\": 0.15, \"seconds\": $uptime_seconds}}, \"timestamp\": \"$(date -u '+%Y-%m-%dT%H:%M:%SZ')\"}"
+}
+
+# GET /health/score/<stack> — Compute health score for a specific stack
+handle_health_score_stack() {
+    local stack="$1"
+    local compose_file="$COMPOSE_DIR/$stack/docker-compose.yml"
+    local env_file="$COMPOSE_DIR/$stack/.env"
+
+    if [[ ! -f "$compose_file" ]]; then
+        _api_error 404 "Stack not found: $stack"
+        return
+    fi
+
+    local -a compose_args=(-f "$compose_file")
+    [[ -f "$env_file" ]] && compose_args+=(--env-file "$env_file")
+
+    # Get container IDs for this stack
+    local -a container_ids=()
+    while IFS= read -r cid; do
+        [[ -n "$cid" ]] && container_ids+=("$cid")
+    done < <($DOCKER_COMPOSE_CMD "${compose_args[@]}" ps -q 2>/dev/null)
+
+    local total=${#container_ids[@]}
+    local running=0 healthy=0 unhealthy=0 stopped=0
+
+    local cid
+    for cid in "${container_ids[@]}"; do
+        local state health
+        state=$(docker inspect --format='{{.State.Status}}' "$cid" 2>/dev/null)
+        health=$(docker inspect --format='{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$cid" 2>/dev/null)
+
+        if [[ "$state" == "running" ]]; then
+            running=$((running + 1))
+            if [[ "$health" == "unhealthy" ]]; then
+                unhealthy=$((unhealthy + 1))
+            else
+                healthy=$((healthy + 1))
+            fi
+        else
+            stopped=$((stopped + 1))
+        fi
+    done
+
+    # Count expected services from compose file
+    local expected_services
+    expected_services=$(grep -c 'container_name:' "$compose_file" 2>/dev/null) || expected_services=0
+    [[ $expected_services -eq 0 ]] && expected_services=$total
+
+    # Score: penalize for unhealthy and stopped containers
+    local score=100
+    if [[ $expected_services -gt 0 ]]; then
+        score=$(awk "BEGIN { s = ($healthy / $expected_services) * 100; if (s > 100) s = 100; printf \"%d\", s }")
+    fi
+
+    # Additional penalty for unhealthy containers
+    if [[ $unhealthy -gt 0 ]]; then
+        local penalty=$((unhealthy * 15))
+        score=$((score - penalty))
+        [[ $score -lt 0 ]] && score=0
+    fi
+
+    local grade="A"
+    if [[ $score -ge 90 ]]; then grade="A"
+    elif [[ $score -ge 80 ]]; then grade="B"
+    elif [[ $score -ge 70 ]]; then grade="C"
+    elif [[ $score -ge 60 ]]; then grade="D"
+    else grade="F"
+    fi
+
+    _api_success "{\"stack\": \"$(_api_json_escape "$stack")\", \"score\": $score, \"grade\": \"$grade\", \"containers\": {\"total\": $total, \"running\": $running, \"healthy\": $healthy, \"unhealthy\": $unhealthy, \"stopped\": $stopped, \"expected\": $expected_services}, \"timestamp\": \"$(date -u '+%Y-%m-%dT%H:%M:%SZ')\"}"
+}
+
+# GET /health/score/history?range=1h|24h|7d
+# Read health score history from metrics data
+handle_health_score_history() {
+    local range="${QUERY_PARAMS[range]:-24h}"
+    local cutoff
+    cutoff=$(_api_range_to_cutoff "$range")
+
+    local metrics_dir="$BASE_DIR/.data/metrics"
+    if [[ ! -d "$metrics_dir" ]]; then
+        _api_success "{\"range\": \"$(_api_json_escape "$range")\", \"history\": [], \"count\": 0}"
+        return
+    fi
+
+    local days_back=1
+    case "$range" in
+        1h)  days_back=1 ;;
+        24h) days_back=2 ;;
+        7d)  days_back=8 ;;
+    esac
+
+    local -a points=()
+    local i
+    for (( i=0; i<days_back; i++ )); do
+        local date_str
+        date_str=$(date -d "-${i} days" '+%Y-%m-%d' 2>/dev/null || date '+%Y-%m-%d')
+        local mfile="$metrics_dir/metrics-${date_str}.jsonl"
+        [[ -f "$mfile" ]] || continue
+
+        while IFS= read -r line; do
+            [[ -z "$line" ]] && continue
+            local ts_val
+            ts_val=$(printf '%s' "$line" | grep -oP '"ts":\K[0-9]+' 2>/dev/null || echo 0)
+            if [[ $ts_val -ge $cutoff ]]; then
+                # Extract health_score field if present
+                local hs
+                hs=$(printf '%s' "$line" | grep -oP '"health_score":\K[0-9]+' 2>/dev/null || echo "")
+                if [[ -n "$hs" ]]; then
+                    points+=("{\"ts\": $ts_val, \"score\": $hs}")
+                fi
+            fi
+        done < "$mfile"
+    done
+
+    local json
+    if [[ ${#points[@]} -eq 0 ]]; then
+        json="[]"
+    else
+        json=$(printf '%s,' "${points[@]}")
+        json="[${json%,}]"
+    fi
+
+    _api_success "{\"range\": \"$(_api_json_escape "$range")\", \"history\": $json, \"count\": ${#points[@]}}"
+}
+
+# =============================================================================
+# FEATURE: PLUGIN MANAGEMENT
+# =============================================================================
+
+# GET /plugins — Scan .plugins/ directory, return plugin manifest data
+handle_plugins_list() {
+    local plugins_dir="$BASE_DIR/.plugins"
+
+    if [[ ! -d "$plugins_dir" ]]; then
+        _api_success "{\"plugins\": [], \"count\": 0}"
+        return
+    fi
+
+    local -a entries=()
+    local dir
+    for dir in "$plugins_dir"/*/; do
+        [[ -d "$dir" ]] || continue
+        local name
+        name=$(basename "$dir")
+        local manifest="$dir/plugin.json"
+
+        if [[ -f "$manifest" ]]; then
+            local content
+            content=$(cat "$manifest" 2>/dev/null)
+            # Ensure the name field matches directory name
+            if command -v jq >/dev/null 2>&1; then
+                content=$(echo "$content" | jq --arg name "$name" '. + {dir_name: $name}' 2>/dev/null || echo "$content")
+            fi
+            entries+=("$content")
+        else
+            entries+=("{\"dir_name\": \"$(_api_json_escape "$name")\", \"name\": \"$(_api_json_escape "$name")\", \"version\": \"unknown\", \"enabled\": false, \"has_manifest\": false}")
+        fi
+    done
+
+    local json
+    if [[ ${#entries[@]} -eq 0 ]]; then
+        json="[]"
+    else
+        json=$(printf '%s,' "${entries[@]}")
+        json="[${json%,}]"
+    fi
+
+    _api_success "{\"plugins\": $json, \"count\": ${#entries[@]}}"
+}
+
+# POST /plugins/install — body: {"url": "..."}
+# Git clone a plugin to .plugins/
+handle_plugin_install() {
+    local body="$1"
+
+    local url
+    if command -v jq >/dev/null 2>&1; then
+        url=$(echo "$body" | jq -r '.url // empty' 2>/dev/null)
+    else
+        url=$(echo "$body" | sed -n 's/.*"url" *: *"\([^"]*\)".*/\1/p')
+    fi
+
+    if [[ -z "$url" ]]; then
+        _api_error 400 "Missing required field: url"
+        return
+    fi
+
+    # Validate URL format (basic safety check)
+    if [[ ! "$url" =~ ^https?:// ]] && [[ ! "$url" =~ ^git@ ]]; then
+        _api_error 400 "Invalid URL format. Must be an HTTP(S) or git URL."
+        return
+    fi
+
+    if ! command -v git >/dev/null 2>&1; then
+        _api_error 500 "git is required for plugin installation"
+        return
+    fi
+
+    local plugins_dir="$BASE_DIR/.plugins"
+    mkdir -p "$plugins_dir"
+
+    # Derive plugin name from URL
+    local plugin_name
+    plugin_name=$(basename "$url" .git)
+    plugin_name="${plugin_name%.git}"
+
+    if [[ -z "$plugin_name" ]] || [[ ! "$plugin_name" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+        _api_error 400 "Cannot derive a valid plugin name from URL"
+        return
+    fi
+
+    local target_dir="$plugins_dir/$plugin_name"
+    if [[ -d "$target_dir" ]]; then
+        _api_error 409 "Plugin already installed: $plugin_name"
+        return
+    fi
+
+    local clone_output
+    clone_output=$(git clone --depth 1 "$url" "$target_dir" 2>&1)
+    local exit_code=$?
+
+    if [[ $exit_code -ne 0 ]]; then
+        rm -rf "$target_dir" 2>/dev/null
+        _api_error 500 "Failed to clone plugin: $(_api_json_escape "$clone_output")"
+        return
+    fi
+
+    # Read manifest if available
+    local manifest="{}"
+    if [[ -f "$target_dir/plugin.json" ]]; then
+        manifest=$(cat "$target_dir/plugin.json" 2>/dev/null)
+    fi
+
+    _api_success "{\"success\": true, \"name\": \"$(_api_json_escape "$plugin_name")\", \"path\": \"$(_api_json_escape "$target_dir")\", \"manifest\": $manifest}"
+}
+
+# DELETE /plugins/<name> — Remove plugin directory
+handle_plugin_remove() {
+    local name="$1"
+
+    # Validate name (prevent path traversal)
+    if [[ ! "$name" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+        _api_error 400 "Invalid plugin name"
+        return
+    fi
+
+    local target_dir="$BASE_DIR/.plugins/$name"
+
+    if [[ ! -d "$target_dir" ]]; then
+        _api_error 404 "Plugin not found: $name"
+        return
+    fi
+
+    rm -rf "$target_dir"
+
+    _api_success "{\"success\": true, \"name\": \"$(_api_json_escape "$name")\", \"message\": \"Plugin removed\"}"
+}
+
+# POST /plugins/<name>/toggle — Enable/disable by writing to plugin.json
+handle_plugin_toggle() {
+    local name="$1"
+
+    # Validate name
+    if [[ ! "$name" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+        _api_error 400 "Invalid plugin name"
+        return
+    fi
+
+    local target_dir="$BASE_DIR/.plugins/$name"
+    local manifest="$target_dir/plugin.json"
+
+    if [[ ! -d "$target_dir" ]]; then
+        _api_error 404 "Plugin not found: $name"
+        return
+    fi
+
+    if ! command -v jq >/dev/null 2>&1; then
+        _api_error 500 "jq is required for plugin management"
+        return
+    fi
+
+    # Create manifest if missing
+    if [[ ! -f "$manifest" ]]; then
+        echo "{\"name\": \"$name\", \"enabled\": true}" > "$manifest"
+    fi
+
+    # Toggle the enabled field
+    local current_state
+    current_state=$(jq -r '.enabled // false' "$manifest" 2>/dev/null)
+
+    if [[ "$current_state" == "true" ]]; then
+        jq '.enabled = false' "$manifest" > "${manifest}.tmp" && mv "${manifest}.tmp" "$manifest"
+        _api_success "{\"success\": true, \"name\": \"$(_api_json_escape "$name")\", \"enabled\": false}"
+    else
+        jq '.enabled = true' "$manifest" > "${manifest}.tmp" && mv "${manifest}.tmp" "$manifest"
+        _api_success "{\"success\": true, \"name\": \"$(_api_json_escape "$name")\", \"enabled\": true}"
+    fi
+}
+
+# =============================================================================
+# FEATURE: CONFIG SCHEMA
+# =============================================================================
+
+# GET /config/schema — Return contents of .config/schema.json
+handle_config_schema() {
+    local schema_file="$BASE_DIR/.config/schema.json"
+
+    if [[ ! -f "$schema_file" ]]; then
+        _api_error 404 "Config schema not found"
+        return
+    fi
+
+    local content
+    content=$(cat "$schema_file" 2>/dev/null)
+
+    if [[ -z "$content" ]]; then
+        _api_error 500 "Failed to read config schema"
+        return
+    fi
+
+    _api_success "$content"
+}
+
+# =============================================================================
+# FEATURE: SSE EVENT STREAM
+# =============================================================================
+
+# GET /stream — SSE endpoint: docker events + periodic metrics
+handle_sse_stream() {
+    local cors_origin
+    cors_origin=$(_api_cors_origin)
+
+    # Send SSE headers manually
+    {
+        printf "HTTP/1.1 200 OK\r\n"
+        printf "Content-Type: text/event-stream\r\n"
+        printf "Cache-Control: no-cache\r\n"
+        printf "Connection: keep-alive\r\n"
+        printf "X-Content-Type-Options: nosniff\r\n"
+        printf "X-API-Version: %s\r\n" "$API_VERSION"
+        if [[ -n "$cors_origin" ]]; then
+            printf "Access-Control-Allow-Origin: %s\r\n" "$cors_origin"
+            printf "Access-Control-Allow-Headers: Content-Type, Authorization\r\n"
+            printf "Access-Control-Allow-Private-Network: true\r\n"
+            printf "Vary: Origin\r\n"
+        fi
+        printf "\r\n"
+    } 2>/dev/null
+
+    # Start docker events listener in background
+    local events_pid=""
+    docker events --format '{{json .}}' 2>/dev/null | while IFS= read -r event_line; do
+        local escaped
+        escaped=$(_api_json_escape "$event_line")
+        printf "event: docker-event\ndata: %s\n\n" "$event_line" 2>/dev/null || break
+    done &
+    events_pid=$!
+
+    # Periodic metrics loop (every 5 seconds)
+    local iteration=0
+    while true; do
+        # Send heartbeat/metrics
+        local load1
+        read -r load1 _ < /proc/loadavg 2>/dev/null || load1=0
+        local cpu_count
+        cpu_count=$(nproc 2>/dev/null || echo 1)
+        local cpu_pct
+        cpu_pct=$(awk "BEGIN { printf \"%.1f\", ($load1 / $cpu_count) * 100 }")
+
+        local mem_total=0 mem_available=0
+        while IFS=':' read -r key val; do
+            val="${val// /}"; val="${val%%kB*}"
+            case "$key" in
+                MemTotal)     mem_total=$((val / 1024)) ;;
+                MemAvailable) mem_available=$((val / 1024)) ;;
+            esac
+        done < /proc/meminfo 2>/dev/null
+        local mem_pct=0
+        [[ $mem_total -gt 0 ]] && mem_pct=$(awk "BEGIN { printf \"%.1f\", (($mem_total - $mem_available) / $mem_total) * 100 }")
+
+        local running
+        running=$(docker ps -q 2>/dev/null | wc -l)
+        local total
+        total=$(docker ps -a -q 2>/dev/null | wc -l)
+
+        local ts
+        ts=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+
+        printf "event: metrics\ndata: {\"ts\":\"%s\",\"cpu_pct\":%s,\"mem_pct\":%s,\"containers_running\":%d,\"containers_total\":%d}\n\n" \
+            "$ts" "$cpu_pct" "$mem_pct" "$running" "$total" 2>/dev/null || break
+
+        # Heartbeat comment to keep connection alive
+        printf ": heartbeat %d\n\n" "$iteration" 2>/dev/null || break
+
+        iteration=$((iteration + 1))
+        sleep 5
+    done
+
+    # Cleanup background docker events listener
+    [[ -n "$events_pid" ]] && kill "$events_pid" 2>/dev/null
+}
+
+# =============================================================================
 # REQUEST ROUTER
 # =============================================================================
 
@@ -7835,11 +9553,74 @@ handle_request() {
             /templates/deploy-history)  handle_deploy_history ;;
             /automations)               handle_automations_list ;;
             /topology)                  handle_topology ;;
+            /metrics/history)           handle_metrics_history ;;
+            /metrics/summary)           handle_metrics_summary ;;
+            /health/score)              handle_health_score ;;
+            /health/score/history)      handle_health_score_history ;;
+            /secrets)                   handle_secrets_list ;;
+            /schedules)                 handle_schedules_list ;;
+            /plugins)                   handle_plugins_list ;;
+            /config/schema)             handle_config_schema ;;
+            /stream)                    handle_sse_stream ;;
 
+            /rollback/*/snapshots/*)
+                local rpath="${path#/rollback/}"
+                local stack="${rpath%%/*}"
+                local rest="${rpath#*/snapshots/}"
+                _api_validate_stack_name "$stack" || return
+                handle_rollback_snapshot_detail "$stack" "$rest"
+                ;;
+            /rollback/*/snapshots)
+                local stack="${path#/rollback/}"
+                stack="${stack%/snapshots}"
+                _api_validate_stack_name "$stack" || return
+                handle_rollback_snapshots "$stack"
+                ;;
+            /rollback/*/diff/*)
+                local rpath="${path#/rollback/}"
+                local stack="${rpath%%/*}"
+                local timestamp="${rpath#*/diff/}"
+                _api_validate_stack_name "$stack" || return
+                handle_rollback_diff "$stack" "$timestamp"
+                ;;
+            /secrets/*/exists)
+                local key="${path#/secrets/}"
+                key="${key%/exists}"
+                _api_validate_resource_name "$key" "secret" || return
+                handle_secret_exists "$key"
+                ;;
+            /health/score/*)
+                local stack="${path#/health/score/}"
+                _api_validate_stack_name "$stack" || return
+                handle_health_score_stack "$stack"
+                ;;
+            /schedules/*/history)
+                local sched_id="${path#/schedules/}"
+                sched_id="${sched_id%/history}"
+                _api_validate_resource_name "$sched_id" "schedule" || return
+                handle_schedule_history "$sched_id"
+                ;;
+
+            /templates/gallery)
+                handle_template_gallery
+                ;;
             /templates/*)
                 local tname="${path#/templates/}"
                 _api_validate_resource_name "$tname" "template" || return
                 handle_template_detail "$tname"
+                ;;
+            /images/search)
+                handle_image_search
+                ;;
+            /export/*)
+                local export_type="${path#/export/}"
+                handle_export "$export_type"
+                ;;
+            /audit)
+                handle_audit_log
+                ;;
+            /webhooks)
+                handle_webhooks_list
                 ;;
             /snapshots/*/download)
                 local snap="${path#/snapshots/}"
@@ -8195,6 +9976,29 @@ handle_request() {
             /templates/import)
                 handle_template_import "$request_body"
                 ;;
+            /templates/fetch-url)
+                handle_template_fetch_url "$request_body"
+                ;;
+            /templates/import-url)
+                handle_template_import_url "$request_body"
+                ;;
+            /stacks/*/clone)
+                local sname="${path#/stacks/}"
+                sname="${sname%/clone}"
+                _api_validate_resource_name "$sname" "stack" || return
+                handle_stack_clone "$sname" "$request_body"
+                ;;
+            /compose/validate)
+                handle_compose_validate "$request_body"
+                ;;
+            /webhooks)
+                handle_webhook_create "$request_body"
+                ;;
+            /webhooks/*/test)
+                local wid="${path#/webhooks/}"
+                wid="${wid%/test}"
+                handle_webhook_test "$wid"
+                ;;
             /templates/*/update)
                 local tname="${path#/templates/}"
                 tname="${tname%/update}"
@@ -8234,6 +10038,39 @@ handle_request() {
                 _api_validate_stack_name "$stack" || return
                 handle_stack_action "$stack" "update"
                 ;;
+            /secrets)
+                handle_secret_set "$request_body"
+                ;;
+            /schedules)
+                handle_schedule_create "$request_body"
+                ;;
+            /plugins/install)
+                handle_plugin_install "$request_body"
+                ;;
+            /rollback/*/restore)
+                local stack="${path#/rollback/}"
+                stack="${stack%/restore}"
+                _api_validate_stack_name "$stack" || return
+                handle_rollback_restore "$stack" "$request_body"
+                ;;
+            /schedules/*/update)
+                local sched_id="${path#/schedules/}"
+                sched_id="${sched_id%/update}"
+                _api_validate_resource_name "$sched_id" "schedule" || return
+                handle_schedule_update "$sched_id" "$request_body"
+                ;;
+            /schedules/*/toggle)
+                local sched_id="${path#/schedules/}"
+                sched_id="${sched_id%/toggle}"
+                _api_validate_resource_name "$sched_id" "schedule" || return
+                handle_schedule_toggle "$sched_id"
+                ;;
+            /plugins/*/toggle)
+                local pname="${path#/plugins/}"
+                pname="${pname%/toggle}"
+                _api_validate_resource_name "$pname" "plugin" || return
+                handle_plugin_toggle "$pname"
+                ;;
             *)
                 _api_error 404 "Endpoint not found: $path"
                 ;;
@@ -8265,6 +10102,10 @@ handle_request() {
                 _api_validate_resource_name "$snap" "snapshot" || return
                 handle_snapshot_delete "$snap"
                 ;;
+            /webhooks/*)
+                local wid="${path#/webhooks/}"
+                handle_webhook_delete "$wid"
+                ;;
             /templates/*)
                 local tname="${path#/templates/}"
                 _api_validate_resource_name "$tname" "template" || return
@@ -8274,6 +10115,21 @@ handle_request() {
                 local auto_id="${path#/automations/}"
                 _api_validate_resource_name "$auto_id" "automation" || return
                 handle_automation_delete "$auto_id"
+                ;;
+            /secrets/*)
+                local key="${path#/secrets/}"
+                _api_validate_resource_name "$key" "secret" || return
+                handle_secret_delete "$key"
+                ;;
+            /schedules/*)
+                local sched_id="${path#/schedules/}"
+                _api_validate_resource_name "$sched_id" "schedule" || return
+                handle_schedule_delete "$sched_id"
+                ;;
+            /plugins/*)
+                local pname="${path#/plugins/}"
+                _api_validate_resource_name "$pname" "plugin" || return
+                handle_plugin_remove "$pname"
                 ;;
             *)
                 _api_error 404 "Endpoint not found: $path"

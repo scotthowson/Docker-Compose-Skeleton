@@ -29,6 +29,10 @@ declare -g  LOG_ENTRY_COUNT=0
 # Named timers for profiling (associative: name -> epoch seconds)
 declare -gA LOG_TIMERS=()
 
+# Structured logging (JSONL dual-write)
+declare -g JSONL_LOG_FILE=""
+declare -g JSONL_ENABLED=false
+
 #===============================================================================
 # DEPENDENCY DETECTION
 #===============================================================================
@@ -204,6 +208,13 @@ initiate_logger() {
     export LOGGER_INITIALIZED=true
     export LOGGER_START_TIME="$(date '+%s')"
 
+    # Initialize structured JSONL logging if enabled
+    if [[ "${ENABLE_STRUCTURED_LOGGING:-true}" == "true" ]]; then
+        JSONL_LOG_FILE="${LOG_FILE%.log}.jsonl"
+        JSONL_ENABLED=true
+        touch "$JSONL_LOG_FILE" 2>/dev/null
+    fi
+
     _log_event "SUCCESS" "Logger System v${LOGGER_VERSION} initialized successfully" "NODATE"
 
     return 0
@@ -270,7 +281,61 @@ close_logger() {
         echo ""
     } >> "$LOG_FILE"
 
+    # Write session summary to JSONL
+    if [[ "$JSONL_ENABLED" == "true" && -n "$JSONL_LOG_FILE" ]]; then
+        _log_jsonl "SESSION" "Logger session closed" \
+            "duration" "$duration_str" \
+            "duration_seconds" "$raw_seconds" \
+            "errors" "$LOG_ERROR_COUNT" \
+            "warnings" "$LOG_WARNING_COUNT" \
+            "entries" "$LOG_ENTRY_COUNT" \
+            "status" "$session_status"
+    fi
+
     export LOGGER_INITIALIZED=false
+}
+
+#===============================================================================
+# STRUCTURED LOGGING (JSONL)
+#===============================================================================
+
+# Escape a string for JSON embedding (minimal, fast)
+_jsonl_escape() {
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    s="${s//$'\n'/\\n}"
+    s="${s//$'\r'/\\r}"
+    s="${s//$'\t'/\\t}"
+    printf '%s' "$s"
+}
+
+# Write a structured JSONL log entry alongside the plain text output
+# Usage: _log_jsonl "LEVEL" "message" ["extra_key" "extra_value" ...]
+_log_jsonl() {
+    [[ "$JSONL_ENABLED" != "true" ]] && return 0
+    [[ -z "$JSONL_LOG_FILE" ]] && return 0
+
+    local level="$1"
+    local message="$2"
+    shift 2
+
+    local ts
+    ts="$(date -u '+%Y-%m-%dT%H:%M:%S.%3NZ' 2>/dev/null || date -u '+%Y-%m-%dT%H:%M:%SZ')"
+
+    local json="{\"ts\":\"${ts}\",\"level\":\"${level}\",\"msg\":\"$(_jsonl_escape "$message")\""
+    json+=",\"entry\":${LOG_ENTRY_COUNT:-0}"
+    json+=",\"pid\":$$"
+
+    # Add optional extra fields (key-value pairs)
+    while [[ $# -ge 2 ]]; do
+        json+=",\"$1\":\"$(_jsonl_escape "$2")\""
+        shift 2
+    done
+
+    json+="}"
+
+    printf '%s\n' "$json" >> "$JSONL_LOG_FILE" 2>/dev/null
 }
 
 #===============================================================================
@@ -333,6 +398,9 @@ _log_event() {
 
     # Handle special actions for certain log levels
     _handle_special_actions "$mood" "$message"
+
+    # Write structured JSONL entry (dual-write)
+    _log_jsonl "$mood" "$message"
 
     return 0
 }

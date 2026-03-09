@@ -74,11 +74,38 @@ _ensure_tool_installed() {
 verify_environment() {
     log_nodate_important "Environment Verification: Ensuring Compatibility..."
 
-    local -a required_tools=("curl" "docker" "jq" "socat" "ncat")
+    local -a required_tools=("curl" "docker" "jq" "socat" "ncat" "openssl" "git" "python3")
 
     for tool in "${required_tools[@]}"; do
         _ensure_tool_installed "$tool"
     done
+
+    # Verify optional but recommended tools
+    local -a optional_tools=("awk" "diff" "tar" "dd" "nproc")
+    for tool in "${optional_tools[@]}"; do
+        if ! command -v "$tool" &>/dev/null; then
+            log_warning "Optional tool '$tool' not found — some features may be limited"
+        fi
+    done
+
+    # Create required data directories for new subsystems
+    local -a data_dirs=(
+        "${BASE_DIR}/.data"
+        "${BASE_DIR}/.data/metrics"
+        "${BASE_DIR}/.data/rollback"
+        "${BASE_DIR}/.data/schedules"
+        "${BASE_DIR}/.secrets"
+        "${BASE_DIR}/.plugins"
+    )
+    for dir in "${data_dirs[@]}"; do
+        if [[ ! -d "$dir" ]]; then
+            mkdir -p "$dir" 2>/dev/null
+            log_debug "Created directory: $dir"
+        fi
+    done
+
+    # Set secure permissions on secrets directory
+    [[ -d "${BASE_DIR}/.secrets" ]] && chmod 700 "${BASE_DIR}/.secrets" 2>/dev/null
 
     log_bold_nodate_success "Environment Verification: Successful."
 }

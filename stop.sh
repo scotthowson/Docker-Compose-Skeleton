@@ -211,6 +211,29 @@ main() {
     log_keyvalue "Compose" "$(_docker_compose_version_string)"
     log_success "Docker environment verified"
 
+    # ── Stop v2.0 background daemons ────────────────────────────────
+    # Metrics collector
+    if [[ -f "/tmp/dcs-metrics-collector.pid" ]]; then
+        local metrics_pid
+        metrics_pid=$(cat /tmp/dcs-metrics-collector.pid 2>/dev/null)
+        if [[ -n "$metrics_pid" ]] && kill -0 "$metrics_pid" 2>/dev/null; then
+            kill "$metrics_pid" 2>/dev/null
+            log_success "Metrics collector stopped (PID: $metrics_pid)"
+        fi
+        rm -f /tmp/dcs-metrics-collector.pid
+    fi
+
+    # Scheduler daemon
+    if [[ -f "/tmp/dcs-scheduler.pid" ]]; then
+        local sched_pid
+        sched_pid=$(cat /tmp/dcs-scheduler.pid 2>/dev/null)
+        if [[ -n "$sched_pid" ]] && kill -0 "$sched_pid" 2>/dev/null; then
+            kill "$sched_pid" 2>/dev/null
+            log_success "Scheduler daemon stopped (PID: $sched_pid)"
+        fi
+        rm -f /tmp/dcs-scheduler.pid
+    fi
+
     # ── Stop REST API server if running ──────────────────────────────
     # Stop if: PID file exists OR API_ENABLED=true (covers orphaned processes)
     local api_script="$BASE_DIR/.scripts/api-server.sh"
