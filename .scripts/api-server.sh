@@ -3071,6 +3071,15 @@ handle_auth_factory_reset() {
             done
         fi
 
+        # Remove all installed plugins
+        local plugins_dir="$BASE_DIR/.plugins"
+        if [[ -d "$plugins_dir" ]]; then
+            for pdir in "$plugins_dir"/*/; do
+                [[ -d "$pdir" ]] || continue
+                rm -rf "$pdir" 2>/dev/null
+            done
+        fi
+
         # Stop scheduler and metrics daemons if running
         for pidfile in /tmp/dcs-metrics-collector.pid /tmp/dcs-scheduler.pid; do
             if [[ -f "$pidfile" ]]; then
@@ -9154,16 +9163,50 @@ handle_plugins_list() {
         name=$(basename "$dir")
         local manifest="$dir/plugin.json"
 
+        # Scan templates directory
+        local templates_json="["
+        local tfirst=true
+        if [[ -d "$dir/templates" ]]; then
+            local tmpl_dir
+            for tmpl_dir in "$dir/templates"/*/; do
+                [[ -d "$tmpl_dir" ]] || continue
+                [[ "$tfirst" == "true" ]] && tfirst=false || templates_json+=","
+                templates_json+="\"$(basename "$tmpl_dir")\""
+            done
+        fi
+        templates_json+="]"
+
+        # Scan hooks directory
+        local hooks_json="["
+        local hfirst=true
+        if [[ -d "$dir/hooks" ]]; then
+            local hook_file
+            for hook_file in "$dir/hooks"/*; do
+                [[ -f "$hook_file" ]] || continue
+                [[ "$hfirst" == "true" ]] && hfirst=false || hooks_json+=","
+                hooks_json+="\"$(basename "$hook_file")\""
+            done
+        fi
+        hooks_json+="]"
+
+        # Check enabled state
+        local enabled="true"
+        [[ -f "$dir/.disabled" ]] && enabled="false"
+
         if [[ -f "$manifest" ]]; then
             local content
             content=$(cat "$manifest" 2>/dev/null)
-            # Ensure the name field matches directory name
             if command -v jq >/dev/null 2>&1; then
-                content=$(echo "$content" | jq --arg name "$name" '. + {dir_name: $name}' 2>/dev/null || echo "$content")
+                content=$(echo "$content" | jq \
+                    --arg name "$name" \
+                    --argjson templates "$templates_json" \
+                    --argjson hooks "$hooks_json" \
+                    --argjson enabled "$enabled" \
+                    '. + {dir_name: $name, templates: $templates, hooks: $hooks, enabled: $enabled}' 2>/dev/null || echo "$content")
             fi
             entries+=("$content")
         else
-            entries+=("{\"dir_name\": \"$(_api_json_escape "$name")\", \"name\": \"$(_api_json_escape "$name")\", \"version\": \"unknown\", \"enabled\": false, \"has_manifest\": false}")
+            entries+=("{\"dir_name\": \"$(_api_json_escape "$name")\", \"name\": \"$(_api_json_escape "$name")\", \"version\": \"unknown\", \"enabled\": $enabled, \"has_manifest\": false, \"templates\": $templates_json, \"hooks\": $hooks_json}")
         fi
     done
 
@@ -9235,13 +9278,112 @@ handle_plugin_install() {
         return
     fi
 
-    # Read manifest if available
+    # Read manifest if available and ensure disabled by default
     local manifest="{}"
     if [[ -f "$target_dir/plugin.json" ]]; then
+        if command -v jq >/dev/null 2>&1; then
+            jq '.enabled = false' "$target_dir/plugin.json" > "$target_dir/plugin.json.tmp" && mv "$target_dir/plugin.json.tmp" "$target_dir/plugin.json"
+        fi
         manifest=$(cat "$target_dir/plugin.json" 2>/dev/null)
     fi
 
     _api_success "{\"success\": true, \"name\": \"$(_api_json_escape "$plugin_name")\", \"path\": \"$(_api_json_escape "$target_dir")\", \"manifest\": $manifest}"
+}
+
+# POST /plugins/scaffold — Create a plugin from inline definition (for bundled/featured plugins)
+# Body: {"name": "...", "manifest": {...}, "hooks": {"pre-deploy": "#!/bin/bash\n..."}}
+handle_plugin_scaffold() {
+    local body="$1"
+
+    local name
+    if command -v jq >/dev/null 2>&1; then
+        name=$(echo "$body" | jq -r '.name // empty' 2>/dev/null)
+    else
+        name=$(echo "$body" | sed -n 's/.*"name" *: *"\([^"]*\)".*/\1/p')
+    fi
+
+    if [[ -z "$name" ]]; then
+        _api_error 400 "Missing required field: name"
+        return
+    fi
+
+    # Validate name (prevent path traversal)
+    if [[ ! "$name" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+        _api_error 400 "Invalid plugin name"
+        return
+    fi
+
+    local plugins_dir="$BASE_DIR/.plugins"
+    mkdir -p "$plugins_dir"
+
+    local target_dir="$plugins_dir/$name"
+    if [[ -d "$target_dir" ]]; then
+        _api_error 409 "Plugin already installed: $name"
+        return
+    fi
+
+    mkdir -p "$target_dir/hooks"
+
+    # Write manifest (plugin.json)
+    if command -v jq >/dev/null 2>&1; then
+        local manifest
+        manifest=$(echo "$body" | jq -r '.manifest // empty' 2>/dev/null)
+        if [[ -n "$manifest" && "$manifest" != "null" ]]; then
+            echo "$body" | jq '.manifest + {enabled: false}' > "$target_dir/plugin.json"
+        else
+            # Build minimal manifest
+            local desc
+            desc=$(echo "$body" | jq -r '.description // ""' 2>/dev/null)
+            local version
+            version=$(echo "$body" | jq -r '.version // "1.0.0"' 2>/dev/null)
+            local author
+            author=$(echo "$body" | jq -r '.author // "DCS Community"' 2>/dev/null)
+            cat > "$target_dir/plugin.json" <<MANIFEST_EOF
+{
+  "name": "$name",
+  "version": "$version",
+  "description": "$desc",
+  "author": "$author",
+  "enabled": false
+}
+MANIFEST_EOF
+        fi
+
+        # Write hook scripts
+        local hook_keys
+        hook_keys=$(echo "$body" | jq -r '.hooks // {} | keys[]' 2>/dev/null)
+        for hook_name in $hook_keys; do
+            # Validate hook name
+            if [[ ! "$hook_name" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+                continue
+            fi
+            local hook_content
+            hook_content=$(echo "$body" | jq -r ".hooks[\"$hook_name\"] // empty" 2>/dev/null)
+            if [[ -n "$hook_content" ]]; then
+                printf '%s' "$hook_content" > "$target_dir/hooks/$hook_name"
+                chmod +x "$target_dir/hooks/$hook_name"
+            fi
+        done
+    else
+        # Fallback without jq — just create minimal manifest
+        cat > "$target_dir/plugin.json" <<MANIFEST_EOF
+{
+  "name": "$name",
+  "version": "1.0.0",
+  "description": "",
+  "author": "DCS Community",
+  "enabled": false
+}
+MANIFEST_EOF
+    fi
+
+    # Read back manifest
+    local final_manifest="{}"
+    if [[ -f "$target_dir/plugin.json" ]]; then
+        final_manifest=$(cat "$target_dir/plugin.json" 2>/dev/null)
+    fi
+
+    _api_success "{\"success\": true, \"name\": \"$(_api_json_escape "$name")\", \"path\": \"$(_api_json_escape "$target_dir")\", \"manifest\": $final_manifest}"
 }
 
 # DELETE /plugins/<name> — Remove plugin directory
@@ -9298,13 +9440,43 @@ handle_plugin_toggle() {
     local current_state
     current_state=$(jq -r '.enabled // false' "$manifest" 2>/dev/null)
 
+    local new_state="true"
     if [[ "$current_state" == "true" ]]; then
-        jq '.enabled = false' "$manifest" > "${manifest}.tmp" && mv "${manifest}.tmp" "$manifest"
-        _api_success "{\"success\": true, \"name\": \"$(_api_json_escape "$name")\", \"enabled\": false}"
-    else
-        jq '.enabled = true' "$manifest" > "${manifest}.tmp" && mv "${manifest}.tmp" "$manifest"
-        _api_success "{\"success\": true, \"name\": \"$(_api_json_escape "$name")\", \"enabled\": true}"
+        new_state="false"
     fi
+    jq ".enabled = $new_state" "$manifest" > "${manifest}.tmp" && mv "${manifest}.tmp" "$manifest"
+
+    # Scan templates and hooks for full response
+    local templates_json="["
+    local tfirst=true
+    if [[ -d "$target_dir/templates" ]]; then
+        local tmpl_dir
+        for tmpl_dir in "$target_dir/templates"/*/; do
+            [[ -d "$tmpl_dir" ]] || continue
+            [[ "$tfirst" == "true" ]] && tfirst=false || templates_json+=","
+            templates_json+="\"$(basename "$tmpl_dir")\""
+        done
+    fi
+    templates_json+="]"
+
+    local hooks_json="["
+    local hfirst=true
+    if [[ -d "$target_dir/hooks" ]]; then
+        local hook_file
+        for hook_file in "$target_dir/hooks"/*; do
+            [[ -f "$hook_file" ]] || continue
+            [[ "$hfirst" == "true" ]] && hfirst=false || hooks_json+=","
+            hooks_json+="\"$(basename "$hook_file")\""
+        done
+    fi
+    hooks_json+="]"
+
+    local version description author
+    version=$(jq -r '.version // "1.0.0"' "$manifest" 2>/dev/null)
+    description=$(jq -r '.description // ""' "$manifest" 2>/dev/null)
+    author=$(jq -r '.author // ""' "$manifest" 2>/dev/null)
+
+    _api_success "{\"name\": \"$(_api_json_escape "$name")\", \"version\": \"$(_api_json_escape "$version")\", \"description\": \"$(_api_json_escape "$description")\", \"author\": \"$(_api_json_escape "$author")\", \"enabled\": $new_state, \"templates\": $templates_json, \"hooks\": $hooks_json}"
 }
 
 # =============================================================================
@@ -10046,6 +10218,9 @@ handle_request() {
                 ;;
             /plugins/install)
                 handle_plugin_install "$request_body"
+                ;;
+            /plugins/scaffold)
+                handle_plugin_scaffold "$request_body"
                 ;;
             /rollback/*/restore)
                 local stack="${path#/rollback/}"

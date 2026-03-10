@@ -414,19 +414,7 @@ echo ""
 # STEP 7: Setup Wizard — Launch API for remote configuration
 # =============================================================================
 
-SETUP_COMPLETE_MARKER="$BASE_DIR/.api-auth/.setup-complete"
-
-if [[ -f "$SETUP_COMPLETE_MARKER" ]]; then
-    _info "Setup already complete. Run ${C_BOLD}./start.sh${C_RESET} to launch all services."
-    echo ""
-    exit 0
-fi
-
-_header "Step 7/7: Setup Wizard"
-_divider
-echo ""
-
-# Detect host IP for the connection banner
+# Detect host IP for connection banners
 _detect_ip() {
     local ip
     ip=$(ip route get 1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if ($i=="src") print $(i+1)}' | head -1)
@@ -435,6 +423,67 @@ _detect_ip() {
     [[ -n "$ip" ]] && { echo "$ip"; return; }
     echo "localhost"
 }
+
+SETUP_COMPLETE_MARKER="$BASE_DIR/.api-auth/.setup-complete"
+
+if [[ -f "$SETUP_COMPLETE_MARKER" ]]; then
+    _ok "Initial setup already complete."
+    echo ""
+
+    # Check if API server is already running
+    API_PID_FILE="$BASE_DIR/.data/api-server.pid"
+    if [[ -f "$API_PID_FILE" ]] && kill -0 "$(cat "$API_PID_FILE")" 2>/dev/null; then
+        _info "API server is already running (PID $(cat "$API_PID_FILE"))"
+        _info "Run ${C_BOLD}./start.sh${C_RESET} to launch all services."
+        echo ""
+        exit 0
+    fi
+
+    # Offer to start the API server
+    echo -e "  ${C_CYAN}Would you like to start the API server?${C_RESET}"
+    echo ""
+    echo -e "    ${C_BOLD}1)${C_RESET} Start in background (recommended)"
+    echo -e "    ${C_BOLD}2)${C_RESET} Start in foreground"
+    echo -e "    ${C_BOLD}3)${C_RESET} Skip — just run ${C_DIM}./start.sh${C_RESET} later"
+    echo ""
+    read -r -p "  Choose [1/2/3]: " _api_choice
+    echo ""
+
+    API_PORT="${API_PORT:-9876}"
+    HOST_IP=$(_detect_ip 2>/dev/null || echo "localhost")
+
+    case "$_api_choice" in
+        1)
+            _info "Starting API server in background..."
+            mkdir -p "$BASE_DIR/.data"
+            nohup "$BASE_DIR/.scripts/api-server.sh" --bind 0.0.0.0 --port "$API_PORT" \
+                > "$BASE_DIR/logs/api-server.log" 2>&1 &
+            echo "$!" > "$API_PID_FILE"
+            sleep 1
+            if kill -0 "$(cat "$API_PID_FILE")" 2>/dev/null; then
+                _ok "API server started (PID $(cat "$API_PID_FILE"))"
+                _info "Listening on http://${HOST_IP}:${API_PORT}"
+                _info "Logs: $BASE_DIR/logs/api-server.log"
+            else
+                _fail "API server failed to start — check logs/api-server.log"
+            fi
+            ;;
+        2)
+            _info "Starting API server in foreground (Ctrl+C to stop)..."
+            echo ""
+            exec "$BASE_DIR/.scripts/api-server.sh" --bind 0.0.0.0 --port "$API_PORT"
+            ;;
+        *)
+            _info "Skipped. Run ${C_BOLD}./start.sh${C_RESET} to launch all services."
+            ;;
+    esac
+    echo ""
+    exit 0
+fi
+
+_header "Step 7/7: Setup Wizard"
+_divider
+echo ""
 
 HOST_IP=$(_detect_ip)
 API_PORT="${API_PORT:-9876}"
