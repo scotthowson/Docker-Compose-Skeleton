@@ -132,6 +132,12 @@ API_RATE_WINDOW="${API_RATE_WINDOW:-60}"  # window in seconds
 API_RATE_DIR="/tmp/dcs-api-rates"
 mkdir -p "$API_RATE_DIR" 2>/dev/null
 
+# API server start time (epoch) — used by /health for uptime & request counters
+API_START_EPOCH="$(date +%s)"
+API_STATS_FILE="/tmp/dcs-api-stats"
+# Initialize stats file (request count, error count) — shared across forked handlers
+[[ -f "$API_STATS_FILE" ]] || printf '0\n0\n' > "$API_STATS_FILE"
+
 # =============================================================================
 # DOCKER COMPOSE DETECTION
 # =============================================================================
@@ -369,6 +375,13 @@ _api_error() {
     local message="$2"
     local escaped
     escaped="$(_api_json_escape "$message")"
+    # Increment error counter
+    if [[ -f "${API_STATS_FILE:-/tmp/dcs-api-stats}" ]]; then
+        local _rc _ec
+        _rc=$(sed -n '1p' "$API_STATS_FILE" 2>/dev/null || echo 0)
+        _ec=$(sed -n '2p' "$API_STATS_FILE" 2>/dev/null || echo 0)
+        printf '%d\n%d\n' "$_rc" "$(( _ec + 1 ))" > "$API_STATS_FILE" 2>/dev/null
+    fi
     _api_response "$code" "{\"error\": true, \"code\": $code, \"message\": \"$escaped\"}"
 }
 
@@ -407,8 +420,18 @@ _api_parse_query() {
 # =============================================================================
 
 # Auth audit log — append-only structured log for security events
+# Sanitizes all fields to prevent log injection (strips pipes, newlines, control chars)
 _api_audit_log() {
     local ip="$1" event="$2" username="${3:-}" detail="${4:-}"
+    # Strip pipe characters, newlines, and control chars from user-supplied fields
+    username="${username//|/}"
+    username="${username//$'\n'/}"
+    username="${username//$'\r'/}"
+    detail="${detail//|/}"
+    detail="${detail//$'\n'/ }"
+    detail="${detail//$'\r'/}"
+    # Truncate detail to prevent log flooding (max 256 chars)
+    [[ ${#detail} -gt 256 ]] && detail="${detail:0:256}..."
     printf '%s | %-15s | %-14s | %-15s | %s\n' \
         "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$ip" "$event" "$username" "$detail" \
         >> "${API_AUTH_DIR}/auth-audit.log" 2>/dev/null
@@ -912,6 +935,61 @@ _api_validate_resource_name() {
     return 0
 }
 
+# Validate a URL for SSRF protection — blocks private/internal IPs
+# Returns 0 if safe, 1 if blocked (and sends 400 error response)
+_api_validate_url() {
+    local url="$1" context="${2:-URL}"
+
+    # Must be http(s) or git@
+    if [[ ! "$url" =~ ^https?:// ]] && [[ ! "$url" =~ ^git@ ]]; then
+        _api_error 400 "$context must use http://, https://, or git@ scheme"
+        return 1
+    fi
+
+    # Extract hostname from URL
+    local host
+    host=$(echo "$url" | sed -E 's|^https?://||; s|^git@||; s|[:/].*||; s|@.*||')
+
+    if [[ -z "$host" ]]; then
+        _api_error 400 "Cannot parse hostname from $context"
+        return 1
+    fi
+
+    # Block obvious internal/private hostnames
+    case "$host" in
+        localhost|*.local|*.internal|*.localhost)
+            _api_error 400 "$context blocked: private hostname ($host)"
+            return 1
+            ;;
+    esac
+
+    # Resolve hostname to IP and check for private ranges
+    local resolved_ip
+    resolved_ip=$(getent hosts "$host" 2>/dev/null | awk '{print $1; exit}')
+    # Also try dig if getent fails
+    [[ -z "$resolved_ip" ]] && resolved_ip=$(dig +short "$host" 2>/dev/null | head -1)
+
+    if [[ -n "$resolved_ip" ]]; then
+        case "$resolved_ip" in
+            # IPv4 private ranges
+            10.*|172.1[6-9].*|172.2[0-9].*|172.3[0-1].*|192.168.*) ;;
+            # Loopback
+            127.*) ;;
+            # Link-local / metadata (AWS, GCP, Azure)
+            169.254.*|100.100.100.200) ;;
+            # IPv6 loopback/link-local
+            ::1|fe80:*|fd*) ;;
+            # Safe — skip blocking
+            *) return 0 ;;
+        esac
+        _api_error 400 "$context blocked: resolves to private/internal address ($resolved_ip)"
+        return 1
+    fi
+
+    # If we can't resolve, allow it (DNS may not be available in all environments)
+    return 0
+}
+
 # Rate limiting: check if an IP is locked out
 _api_check_rate_limit() {
     local client_ip="${1:-unknown}"
@@ -1252,7 +1330,9 @@ handle_root() {
     {"method": "POST",   "path": "/automations/:id/update",   "description": "Update an automation rule"},
     {"method": "DELETE", "path": "/automations/:id",          "description": "Delete an automation rule"},
     {"method": "GET",    "path": "/automations/:id/history",  "description": "Automation run history"},
-    {"method": "GET",    "path": "/topology",                 "description": "Network topology graph data"}
+    {"method": "GET",    "path": "/topology",                 "description": "Network topology graph data"},
+    {"method": "GET",    "path": "/auth/sessions",            "description": "List active sessions", "auth": "admin"},
+    {"method": "DELETE", "path": "/auth/sessions/:prefix",    "description": "Revoke a session by token prefix", "auth": "admin"}
   ]'
 
     _api_success "{\"name\": \"Docker Compose Skeleton API\", \"version\": \"$API_VERSION\", \"auth_enabled\": $API_AUTH_ENABLED, \"endpoints\": $endpoints}"
@@ -1362,7 +1442,27 @@ handle_health() {
     containers_json=$(printf '%s,' "${results[@]}")
     containers_json="[${containers_json%,}]"
 
-    _api_success "{\"status\": \"$overall\", \"summary\": {\"total\": $total, \"healthy\": $healthy, \"unhealthy\": $unhealthy, \"stopped\": $stopped}, \"containers\": $containers_json}"
+    # API server metrics: uptime, request/error counts, memory usage
+    local api_uptime=0 api_requests=0 api_errors=0
+    local now_epoch
+    now_epoch=$(date +%s)
+    api_uptime=$(( now_epoch - ${API_START_EPOCH:-now_epoch} ))
+
+    if [[ -f "$API_STATS_FILE" ]]; then
+        api_requests=$(sed -n '1p' "$API_STATS_FILE" 2>/dev/null || echo 0)
+        api_errors=$(sed -n '2p' "$API_STATS_FILE" 2>/dev/null || echo 0)
+    fi
+
+    # API process memory (RSS in KB)
+    local api_pid_val api_mem_kb=0
+    if [[ -f "$API_PID_FILE" ]]; then
+        api_pid_val=$(cat "$API_PID_FILE" 2>/dev/null)
+        if [[ -n "$api_pid_val" ]] && kill -0 "$api_pid_val" 2>/dev/null; then
+            api_mem_kb=$(ps -o rss= -p "$api_pid_val" 2>/dev/null | tr -d ' ' || echo 0)
+        fi
+    fi
+
+    _api_success "{\"status\": \"$overall\", \"summary\": {\"total\": $total, \"healthy\": $healthy, \"unhealthy\": $unhealthy, \"stopped\": $stopped}, \"containers\": $containers_json, \"api\": {\"uptime_seconds\": $api_uptime, \"requests_total\": ${api_requests:-0}, \"errors_total\": ${api_errors:-0}, \"memory_kb\": ${api_mem_kb:-0}, \"pid\": ${api_pid_val:-0}}}"
 }
 
 handle_stacks() {
@@ -2885,6 +2985,84 @@ handle_auth_logout_all() {
     _api_audit_log "$client_ip" "LOGOUT_ALL" "$target_username" "All sessions revoked by ${AUTH_USERNAME:-unknown}"
 
     _api_success "{\"success\": true, \"username\": \"$(_api_json_escape "$target_username")\", \"message\": \"All sessions invalidated\"}"
+}
+
+# GET /auth/sessions — List active sessions (admin only)
+handle_auth_sessions() {
+    _api_init_auth_dir
+
+    if ! _api_check_admin; then
+        _api_error 403 "Admin access required"
+        return
+    fi
+
+    local tokens
+    tokens=$(_api_read_auth_file "tokens.json")
+    local now
+    now=$(_api_now_epoch)
+
+    if command -v jq >/dev/null 2>&1; then
+        # Filter active (non-expired) tokens, redact the token value, add time-remaining
+        local sessions
+        sessions=$(echo "$tokens" | jq --argjson now "$now" '
+            [.[] | select(.expires_at > $now) |
+            {
+                id: (.token[:12] + "..."),
+                username: .username,
+                role: (.role // "user"),
+                created_at: .created_at,
+                expires_at: .expires_at,
+                remaining_seconds: (.expires_at - $now),
+                ip: (.ip // "unknown")
+            }]' 2>/dev/null)
+        [[ -z "$sessions" ]] && sessions="[]"
+        local count
+        count=$(echo "$sessions" | jq 'length' 2>/dev/null || echo 0)
+        _api_success "{\"sessions\": $sessions, \"total\": $count}"
+    else
+        _api_success '{"sessions": [], "total": 0, "error": "jq required for session listing"}'
+    fi
+}
+
+# DELETE /auth/sessions/:token_prefix — Revoke a specific session by token prefix (admin only)
+handle_auth_session_revoke() {
+    local token_prefix="$1"
+
+    _api_init_auth_dir
+
+    if ! _api_check_admin; then
+        _api_error 403 "Admin access required"
+        return
+    fi
+
+    if [[ -z "$token_prefix" || ${#token_prefix} -lt 8 ]]; then
+        _api_error 400 "Token prefix must be at least 8 characters"
+        return
+    fi
+
+    local tokens
+    tokens=$(_api_read_auth_file "tokens.json")
+
+    if command -v jq >/dev/null 2>&1; then
+        local match_count
+        match_count=$(echo "$tokens" | jq --arg p "$token_prefix" '[.[] | select(.token | startswith($p))] | length' 2>/dev/null || echo 0)
+
+        if [[ "$match_count" == "0" ]]; then
+            _api_error 404 "No session found with that prefix"
+            return
+        fi
+
+        local new_tokens
+        new_tokens=$(echo "$tokens" | jq --arg p "$token_prefix" '[.[] | select(.token | startswith($p) | not)]' 2>/dev/null)
+        _api_write_auth_file "tokens.json" "$new_tokens"
+
+        local client_ip="${SOCAT_PEERADDR:-unknown}"
+        _api_audit_log "$client_ip" "SESSION_REVOKE" "${AUTH_USERNAME:-unknown}" "Revoked session ${token_prefix}..."
+
+        _api_success "{\"success\": true, \"revoked\": $match_count, \"message\": \"Session revoked\"}"
+    else
+        _api_error 500 "jq is required"
+    fi
 }
 
 # POST /auth/refresh — Refresh the current session token
@@ -4444,6 +4622,38 @@ handle_terminal_exec() {
 
     [[ -z "$command" ]] && { _api_error 400 "Missing 'command' field"; return; }
     [[ -z "$cwd" ]] && cwd="$BASE_DIR"
+
+    # ── Terminal Command Guard: block dangerous shell patterns ──
+    local _cmd_lower="${command,,}"
+    local -a _blocked_patterns=(
+        "rm -rf /"          # filesystem wipe
+        "rm -rf /*"         # filesystem wipe variant
+        "mkfs"              # format disk
+        "dd if="            # raw disk write
+        "> /dev/sd"         # raw device write
+        ":(){ :|:& };:"    # fork bomb
+        "chmod -R 777 /"    # permission wipe
+        "chown -R"          # ownership change on system dirs
+        "/etc/shadow"       # password file access
+        "/etc/passwd"       # user file access
+        "curl.*| *bash"     # pipe-to-shell
+        "wget.*| *bash"     # pipe-to-shell
+        "curl.*| *sh"       # pipe-to-shell
+        "wget.*| *sh"       # pipe-to-shell
+        "shutdown"          # system shutdown
+        "reboot"            # system reboot
+        "init 0"            # system halt
+        "poweroff"          # system poweroff
+    )
+
+    for _pat in "${_blocked_patterns[@]}"; do
+        if [[ "$_cmd_lower" == *"${_pat,,}"* ]]; then
+            local client_ip="${SOCAT_PEERADDR:-unknown}"
+            _api_audit_log "$client_ip" "TERM_BLOCKED" "$session_user" "Blocked: $command"
+            _api_error 403 "Command blocked by security policy"
+            return
+        fi
+    done
 
     # Rate limit: 10 commands/minute
     local rate_file="$BASE_DIR/.api-auth/terminal-rate.log"
@@ -7037,6 +7247,9 @@ handle_template_fetch_url() {
         return
     fi
 
+    # SSRF protection: block private/internal IPs
+    _api_validate_url "$url" "Template fetch URL" || return
+
     # Auto-convert GitHub blob URLs to raw URLs
     if [[ "$url" == *"github.com/"*"/blob/"* ]]; then
         url=$(echo "$url" | sed 's|github\.com/\([^/]*/[^/]*\)/blob/|raw.githubusercontent.com/\1/|')
@@ -7082,6 +7295,9 @@ handle_template_import_url() {
         _api_error 400 "URL must start with http:// or https://"
         return
     fi
+
+    # SSRF protection: block private/internal IPs
+    _api_validate_url "$url" "Template import URL" || return
 
     # Auto-convert GitHub blob URLs to raw URLs
     # https://github.com/user/repo/blob/branch/path → https://raw.githubusercontent.com/user/repo/branch/path
@@ -7464,6 +7680,9 @@ handle_webhook_create() {
         _api_error 400 "Missing required field: url"
         return
     fi
+
+    # SSRF protection: block private/internal IPs for webhook targets
+    _api_validate_url "$url" "Webhook URL" || return
 
     local id
     id="wh-$(date +%s)-$RANDOM"
@@ -9238,11 +9457,8 @@ handle_plugin_install() {
         return
     fi
 
-    # Validate URL format (basic safety check)
-    if [[ ! "$url" =~ ^https?:// ]] && [[ ! "$url" =~ ^git@ ]]; then
-        _api_error 400 "Invalid URL format. Must be an HTTP(S) or git URL."
-        return
-    fi
+    # Validate URL format and SSRF protection
+    _api_validate_url "$url" "Plugin URL" || return
 
     if ! command -v git >/dev/null 2>&1; then
         _api_error 500 "git is required for plugin installation"
@@ -9647,9 +9863,16 @@ handle_request() {
         return
     fi
 
-    # Log the request
+    # Log the request and increment stats counter
     local client_ip="${SOCAT_PEERADDR:-127.0.0.1}"
     echo "$(date '+%Y-%m-%d %H:%M:%S') $method $path [${client_ip}]" >> "$API_LOG_FILE" 2>/dev/null
+    # Atomic request counter increment (file-based, safe across forked handlers)
+    if [[ -f "$API_STATS_FILE" ]]; then
+        local _rc _ec
+        _rc=$(sed -n '1p' "$API_STATS_FILE" 2>/dev/null || echo 0)
+        _ec=$(sed -n '2p' "$API_STATS_FILE" 2>/dev/null || echo 0)
+        printf '%d\n%d\n' "$(( _rc + 1 ))" "$_ec" > "$API_STATS_FILE" 2>/dev/null
+    fi
 
     # IP whitelist check — reject before any processing
     if ! _api_check_ip_whitelist; then
@@ -9684,6 +9907,7 @@ handle_request() {
         case "$path" in
             /auth/users)    handle_auth_users; return ;;
             /auth/invites)  handle_auth_invites; return ;;
+            /auth/sessions) handle_auth_sessions; return ;;
         esac
 
         # Standard authenticated GET endpoints
@@ -10263,6 +10487,10 @@ handle_request() {
         fi
 
         case "$path" in
+            /auth/sessions/*)
+                local token_prefix="${path#/auth/sessions/}"
+                handle_auth_session_revoke "$token_prefix"
+                ;;
             /auth/invite/*)
                 local code="${path#/auth/invite/}"
                 handle_auth_delete_invite "$code"
