@@ -47,6 +47,11 @@
 #   GET    /auth/invites            List active invite codes (admin only)
 #   DELETE /auth/invite/:code       Delete an invite code (admin only)
 #
+# System Update Endpoints:
+#   GET  /system/update/check       Check for available updates via git
+#   POST /system/update/apply       Apply update (git pull --ff-only with backup)
+#   POST /system/update/rollback    Rollback to a previous backup tag
+#
 # All responses are JSON with Content-Type: application/json.
 # CORS headers are included for Electron app compatibility.
 # =============================================================================
@@ -1332,7 +1337,10 @@ handle_root() {
     {"method": "GET",    "path": "/automations/:id/history",  "description": "Automation run history"},
     {"method": "GET",    "path": "/topology",                 "description": "Network topology graph data"},
     {"method": "GET",    "path": "/auth/sessions",            "description": "List active sessions", "auth": "admin"},
-    {"method": "DELETE", "path": "/auth/sessions/:prefix",    "description": "Revoke a session by token prefix", "auth": "admin"}
+    {"method": "DELETE", "path": "/auth/sessions/:prefix",    "description": "Revoke a session by token prefix", "auth": "admin"},
+    {"method": "GET",    "path": "/system/update/check",     "description": "Check for available DCS updates via git"},
+    {"method": "POST",   "path": "/system/update/apply",     "description": "Apply update safely with backup tag"},
+    {"method": "POST",   "path": "/system/update/rollback",  "description": "Rollback to a previous backup tag"}
   ]'
 
     _api_success "{\"name\": \"Docker Compose Skeleton API\", \"version\": \"$API_VERSION\", \"auth_enabled\": $API_AUTH_ENABLED, \"endpoints\": $endpoints}"
@@ -5279,6 +5287,245 @@ handle_stack_services() {
     services_json+="]"
 
     _api_success "{\"stack\": \"$(_api_json_escape "$stack_name")\", \"services\": $services_json}"
+}
+
+# =============================================================================
+# SYSTEM UPDATE MANAGEMENT
+# =============================================================================
+
+# GET /system/update/check — Check for available DCS updates via git
+handle_system_update_check() {
+    cd "$BASE_DIR" || { _api_error 500 "Cannot access BASE_DIR"; return; }
+
+    if ! command -v git >/dev/null 2>&1; then
+        _api_error 500 "Git is not installed on this system"
+        return
+    fi
+
+    if [[ ! -d "$BASE_DIR/.git" ]]; then
+        _api_error 400 "Not a git repository — updates are not available for manual installations"
+        return
+    fi
+
+    git fetch origin 2>/dev/null
+    local current branch latest behind has_local changelog
+
+    current=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+    branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "unknown")
+    latest=$(git rev-parse --short "origin/$branch" 2>/dev/null || echo "$current")
+    behind=$(git rev-list HEAD.."origin/$branch" --count 2>/dev/null || echo "0")
+    has_local=$(git status --porcelain 2>/dev/null | head -1)
+
+    # Get changelog (commits we're behind)
+    changelog="[]"
+    if [[ "$behind" -gt 0 ]]; then
+        if command -v jq >/dev/null 2>&1; then
+            changelog=$(git log HEAD.."origin/$branch" --pretty=format:'{"hash":"%h","message":"%s","author":"%an","date":"%ci"}' 2>/dev/null | head -20 | jq -s '.' 2>/dev/null || echo "[]")
+        else
+            # Fallback: build JSON array manually without jq
+            local entries="" entry_line
+            while IFS= read -r entry_line; do
+                [[ -n "$entries" ]] && entries="$entries,"
+                entries="$entries$entry_line"
+            done < <(git log HEAD.."origin/$branch" --pretty=format:'{"hash":"%h","message":"%s","author":"%an","date":"%ci"}' 2>/dev/null | head -20)
+            changelog="[$entries]"
+        fi
+    fi
+
+    local available="false"
+    [[ "$behind" -gt 0 ]] && available="true"
+
+    local has_changes="false"
+    [[ -n "$has_local" ]] && has_changes="true"
+
+    _api_success "{
+  \"available\": $available,
+  \"current_version\": \"$(_api_json_escape "$current")\",
+  \"latest_version\": \"$(_api_json_escape "$latest")\",
+  \"commits_behind\": $behind,
+  \"changelog\": $changelog,
+  \"has_local_changes\": $has_changes,
+  \"branch\": \"$(_api_json_escape "$branch")\"
+}"
+}
+
+# POST /system/update/apply — Apply update safely using git pull --ff-only
+handle_system_update_apply() {
+    local body="$1"
+
+    cd "$BASE_DIR" || { _api_error 500 "Cannot access BASE_DIR"; return; }
+
+    if ! command -v git >/dev/null 2>&1; then
+        _api_error 500 "Git is not installed on this system"
+        return
+    fi
+
+    if [[ ! -d "$BASE_DIR/.git" ]]; then
+        _api_error 400 "Not a git repository — updates are not available for manual installations"
+        return
+    fi
+
+    # Optional: require explicit confirmation in the payload
+    if command -v jq >/dev/null 2>&1 && [[ -n "$body" ]]; then
+        local confirm
+        confirm=$(printf '%s' "$body" | jq -r '.confirm // empty' 2>/dev/null)
+        if [[ "$confirm" != "true" ]]; then
+            _api_error 400 "Missing confirmation. Send {\"confirm\": true} to apply the update."
+            return
+        fi
+    fi
+
+    # Check for local changes — refuse to update if the working tree is dirty
+    local has_local
+    has_local=$(git status --porcelain 2>/dev/null | head -1)
+    if [[ -n "$has_local" ]]; then
+        _api_error 409 "Cannot update: local changes detected. Commit or stash changes before updating."
+        return
+    fi
+
+    local branch current
+    branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "unknown")
+    current=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+
+    # Fetch latest
+    git fetch origin 2>/dev/null
+
+    local behind
+    behind=$(git rev-list HEAD.."origin/$branch" --count 2>/dev/null || echo "0")
+    if [[ "$behind" -eq 0 ]]; then
+        _api_success "{
+  \"updated\": false,
+  \"message\": \"Already up to date\",
+  \"current_version\": \"$(_api_json_escape "$current")\",
+  \"branch\": \"$(_api_json_escape "$branch")\"
+}"
+        return
+    fi
+
+    # Create backup tag before updating
+    local backup_tag
+    backup_tag="dcs-backup-$(date +%Y%m%d-%H%M%S)-${current}"
+    git tag "$backup_tag" HEAD 2>/dev/null || true
+
+    # Attempt fast-forward-only pull (safe — no merge conflicts possible)
+    local pull_output pull_exit
+    pull_output=$(git pull --ff-only origin "$branch" 2>&1)
+    pull_exit=$?
+
+    if [[ $pull_exit -ne 0 ]]; then
+        # Rollback to backup tag
+        git checkout "$backup_tag" 2>/dev/null || true
+        git checkout "$branch" 2>/dev/null || true
+        git reset --hard "$backup_tag" 2>/dev/null || true
+
+        local escaped_output
+        escaped_output=$(_api_json_escape "$pull_output")
+        _api_error 500 "Update failed (rolled back to $backup_tag): $escaped_output"
+        return
+    fi
+
+    local new_version
+    new_version=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+
+    # Collect changelog of what was applied
+    local changelog="[]"
+    if command -v jq >/dev/null 2>&1; then
+        changelog=$(git log "${backup_tag}..HEAD" --pretty=format:'{"hash":"%h","message":"%s","author":"%an","date":"%ci"}' 2>/dev/null | head -20 | jq -s '.' 2>/dev/null || echo "[]")
+    fi
+
+    # NOTE: After a successful update, the API server process should be restarted
+    # to pick up any code changes. The UI should trigger a restart or the server
+    # can self-restart. A simple approach: touch a sentinel file that the server
+    # monitors, or have the UI call a restart endpoint after update completes.
+
+    _api_success "{
+  \"updated\": true,
+  \"previous_version\": \"$(_api_json_escape "$current")\",
+  \"new_version\": \"$(_api_json_escape "$new_version")\",
+  \"backup_tag\": \"$(_api_json_escape "$backup_tag")\",
+  \"branch\": \"$(_api_json_escape "$branch")\",
+  \"commits_applied\": $behind,
+  \"changelog\": $changelog,
+  \"message\": \"Update applied successfully. API server restart may be required to load new code.\"
+}"
+}
+
+# POST /system/update/rollback — Rollback to a previously created backup tag
+handle_system_update_rollback() {
+    local body="$1"
+
+    cd "$BASE_DIR" || { _api_error 500 "Cannot access BASE_DIR"; return; }
+
+    if ! command -v git >/dev/null 2>&1; then
+        _api_error 500 "Git is not installed on this system"
+        return
+    fi
+
+    if [[ ! -d "$BASE_DIR/.git" ]]; then
+        _api_error 400 "Not a git repository — rollback is not available for manual installations"
+        return
+    fi
+
+    # Extract backup_tag from payload
+    local backup_tag=""
+    if command -v jq >/dev/null 2>&1 && [[ -n "$body" ]]; then
+        backup_tag=$(printf '%s' "$body" | jq -r '.backup_tag // empty' 2>/dev/null)
+    fi
+
+    if [[ -z "$backup_tag" ]]; then
+        # List available backup tags if none specified
+        local tags_json="[]"
+        local tag_list
+        tag_list=$(git tag -l 'dcs-backup-*' --sort=-creatordate 2>/dev/null | head -20)
+        if [[ -n "$tag_list" ]] && command -v jq >/dev/null 2>&1; then
+            tags_json=$(printf '%s\n' "$tag_list" | jq -R '.' | jq -s '.' 2>/dev/null || echo "[]")
+        fi
+        _api_error 400 "Missing backup_tag in request body. Available tags: $(printf '%s' "$tag_list" | tr '\n' ', ' | sed 's/,$//')"
+        return
+    fi
+
+    # Validate: backup_tag must match our naming pattern to prevent arbitrary checkout
+    if [[ ! "$backup_tag" =~ ^dcs-backup-[0-9]{8}-[0-9]{6}-[a-f0-9]+$ ]]; then
+        _api_error 400 "Invalid backup tag format. Expected: dcs-backup-YYYYMMDD-HHMMSS-<hash>"
+        return
+    fi
+
+    # Verify the tag exists
+    if ! git rev-parse "$backup_tag" >/dev/null 2>&1; then
+        _api_error 404 "Backup tag not found: $backup_tag"
+        return
+    fi
+
+    local current branch
+    current=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+    branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "unknown")
+
+    # Perform rollback: reset the branch to the backup tag
+    local reset_output reset_exit
+    reset_output=$(git reset --hard "$backup_tag" 2>&1)
+    reset_exit=$?
+
+    if [[ $reset_exit -ne 0 ]]; then
+        local escaped_output
+        escaped_output=$(_api_json_escape "$reset_output")
+        _api_error 500 "Rollback failed: $escaped_output"
+        return
+    fi
+
+    local rolled_back_to
+    rolled_back_to=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+
+    # NOTE: After rollback, the API server should be restarted to load the
+    # previous version of the code. Same restart considerations as update/apply.
+
+    _api_success "{
+  \"rolled_back\": true,
+  \"previous_version\": \"$(_api_json_escape "$current")\",
+  \"restored_version\": \"$(_api_json_escape "$rolled_back_to")\",
+  \"backup_tag\": \"$(_api_json_escape "$backup_tag")\",
+  \"branch\": \"$(_api_json_escape "$branch")\",
+  \"message\": \"Rollback successful. API server restart may be required to load restored code.\"
+}"
 }
 
 # =============================================================================
@@ -9695,6 +9942,262 @@ handle_plugin_toggle() {
     _api_success "{\"name\": \"$(_api_json_escape "$name")\", \"version\": \"$(_api_json_escape "$version")\", \"description\": \"$(_api_json_escape "$description")\", \"author\": \"$(_api_json_escape "$author")\", \"enabled\": $new_state, \"templates\": $templates_json, \"hooks\": $hooks_json}"
 }
 
+# GET /plugins/:name/hooks — List all hooks with metadata
+handle_plugin_hooks_list() {
+    local plugin_name="$1"
+
+    # Validate name
+    if [[ ! "$plugin_name" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+        _api_error 400 "Invalid plugin name"
+        return
+    fi
+
+    local plugin_dir="$BASE_DIR/.plugins/$plugin_name"
+
+    if [[ ! -d "$plugin_dir" ]]; then
+        _api_error 404 "Plugin not found: $plugin_name"
+        return
+    fi
+
+    local hooks_json="["
+    local first=true
+    local hooks_dir="$plugin_dir/hooks"
+
+    if [[ -d "$hooks_dir" ]]; then
+        for hook_file in "$hooks_dir"/*; do
+            [[ -f "$hook_file" ]] || continue
+            local hook_name
+            hook_name=$(basename "$hook_file")
+            local size
+            size=$(stat -c%s "$hook_file" 2>/dev/null || echo "0")
+            local executable="false"
+            [[ -x "$hook_file" ]] && executable="true"
+            local modified
+            modified=$(stat -c%Y "$hook_file" 2>/dev/null || echo "0")
+            local line_count
+            line_count=$(wc -l < "$hook_file" 2>/dev/null || echo "0")
+
+            $first || hooks_json+=","
+            first=false
+            hooks_json+="{\"name\":\"$(_api_json_escape "$hook_name")\",\"size\":$size,\"executable\":$executable,\"modified\":$modified,\"lines\":$line_count}"
+        done
+    fi
+    hooks_json+="]"
+
+    _api_success "{\"plugin\": \"$(_api_json_escape "$plugin_name")\", \"hooks\": $hooks_json}"
+}
+
+# GET /plugins/:name/hooks/:hook — Read hook script content
+handle_plugin_hook_read() {
+    local plugin_name="$1"
+    local hook_name="$2"
+
+    # Validate names
+    if [[ ! "$plugin_name" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+        _api_error 400 "Invalid plugin name"
+        return
+    fi
+    if [[ "$hook_name" == *"/"* ]] || [[ "$hook_name" == *".."* ]]; then
+        _api_error 400 "Invalid hook name"
+        return
+    fi
+
+    local hook_file="$BASE_DIR/.plugins/$plugin_name/hooks/$hook_name"
+
+    if [[ ! -f "$hook_file" ]]; then
+        _api_error 404 "Hook not found: $hook_name"
+        return
+    fi
+
+    local content
+    content=$(cat "$hook_file" 2>/dev/null)
+    local executable="false"
+    [[ -x "$hook_file" ]] && executable="true"
+    local size
+    size=$(stat -c%s "$hook_file" 2>/dev/null || echo "0")
+
+    # JSON-escape the content
+    local escaped_content
+    escaped_content=$(printf '%s' "$content" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))' 2>/dev/null || printf '%s' "$content" | sed 's/\\/\\\\/g; s/"/\\"/g; s/\t/\\t/g' | awk '{printf "%s\\n", $0}' | sed '$ s/\\n$//')
+
+    _api_success "{\"plugin\": \"$(_api_json_escape "$plugin_name")\", \"hook\": \"$(_api_json_escape "$hook_name")\", \"content\": $escaped_content, \"executable\": $executable, \"size\": $size}"
+}
+
+# PUT /plugins/:name/hooks/:hook — Update hook script
+handle_plugin_hook_update() {
+    local plugin_name="$1"
+    local hook_name="$2"
+    local request_body="$3"
+
+    # Validate names
+    if [[ ! "$plugin_name" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+        _api_error 400 "Invalid plugin name"
+        return
+    fi
+    if [[ "$hook_name" == *"/"* ]] || [[ "$hook_name" == *".."* ]]; then
+        _api_error 400 "Invalid hook name"
+        return
+    fi
+
+    local plugin_dir="$BASE_DIR/.plugins/$plugin_name"
+    local hooks_dir="$plugin_dir/hooks"
+    local hook_file="$hooks_dir/$hook_name"
+
+    # Validate plugin exists
+    if [[ ! -d "$plugin_dir" ]]; then
+        _api_error 404 "Plugin not found: $plugin_name"
+        return
+    fi
+
+    local content
+    content=$(echo "$request_body" | jq -r '.content // empty' 2>/dev/null)
+
+    if [[ -z "$content" ]]; then
+        _api_error 400 "Content is required"
+        return
+    fi
+
+    mkdir -p "$hooks_dir"
+    printf '%s' "$content" > "$hook_file"
+    chmod +x "$hook_file"
+
+    _api_success "{\"plugin\": \"$(_api_json_escape "$plugin_name")\", \"hook\": \"$(_api_json_escape "$hook_name")\", \"message\": \"Hook updated successfully\"}"
+}
+
+# POST /plugins/:name/hooks/:hook/test — Dry-run a hook
+handle_plugin_hook_test() {
+    local plugin_name="$1"
+    local hook_name="$2"
+    local request_body="$3"
+
+    # Validate names
+    if [[ ! "$plugin_name" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+        _api_error 400 "Invalid plugin name"
+        return
+    fi
+    if [[ "$hook_name" == *"/"* ]] || [[ "$hook_name" == *".."* ]]; then
+        _api_error 400 "Invalid hook name"
+        return
+    fi
+
+    local hook_file="$BASE_DIR/.plugins/$plugin_name/hooks/$hook_name"
+
+    if [[ ! -f "$hook_file" ]]; then
+        _api_error 404 "Hook not found: $hook_name"
+        return
+    fi
+
+    if [[ ! -x "$hook_file" ]]; then
+        _api_error 400 "Hook is not executable"
+        return
+    fi
+
+    # Build test context
+    local test_context
+    test_context=$(echo "$request_body" | jq -r '.context // empty' 2>/dev/null)
+    [[ -z "$test_context" ]] && test_context="{\"stack\":\"test\",\"event\":\"$hook_name\",\"dry_run\":true,\"timestamp\":\"$(date -Iseconds)\"}"
+
+    # Execute with timeout, capture output
+    local output
+    local exit_code
+    output=$(echo "$test_context" | timeout 30 bash "$hook_file" 2>&1) || true
+    exit_code=$?
+
+    local escaped_output
+    escaped_output=$(printf '%s' "$output" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))' 2>/dev/null || printf '"%s"' "$output")
+
+    _api_success "{\"plugin\": \"$(_api_json_escape "$plugin_name")\", \"hook\": \"$(_api_json_escape "$hook_name")\", \"exit_code\": $exit_code, \"output\": $escaped_output}"
+}
+
+# GET /plugins/:name/logs — Execution history
+handle_plugin_logs() {
+    local plugin_name="$1"
+
+    # Validate name
+    if [[ ! "$plugin_name" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+        _api_error 400 "Invalid plugin name"
+        return
+    fi
+
+    local plugin_dir="$BASE_DIR/.plugins/$plugin_name"
+
+    if [[ ! -d "$plugin_dir" ]]; then
+        _api_error 404 "Plugin not found: $plugin_name"
+        return
+    fi
+
+    local log_file="$plugin_dir/execution.log"
+
+    if [[ ! -f "$log_file" ]]; then
+        _api_success "{\"plugin\": \"$(_api_json_escape "$plugin_name")\", \"entries\": [], \"total\": 0}"
+        return
+    fi
+
+    # Read last 50 log entries (JSONL format)
+    local entries="["
+    local first=true
+    local count=0
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        $first || entries+=","
+        first=false
+        entries+="$line"
+        count=$((count+1))
+    done < <(tail -50 "$log_file" 2>/dev/null)
+    entries+="]"
+
+    _api_success "{\"plugin\": \"$(_api_json_escape "$plugin_name")\", \"entries\": $entries, \"total\": $count}"
+}
+
+# POST /plugins/:name/config — Update plugin configuration
+handle_plugin_config_update() {
+    local plugin_name="$1"
+    local request_body="$2"
+
+    # Validate name
+    if [[ ! "$plugin_name" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+        _api_error 400 "Invalid plugin name"
+        return
+    fi
+
+    local plugin_dir="$BASE_DIR/.plugins/$plugin_name"
+    local manifest="$plugin_dir/plugin.json"
+
+    if [[ ! -d "$plugin_dir" ]]; then
+        _api_error 404 "Plugin not found: $plugin_name"
+        return
+    fi
+
+    if ! command -v jq >/dev/null 2>&1; then
+        _api_error 500 "jq is required for plugin management"
+        return
+    fi
+
+    local config
+    config=$(echo "$request_body" | jq -r '.config // empty' 2>/dev/null)
+
+    if [[ -z "$config" ]] || [[ "$config" == "null" ]]; then
+        _api_error 400 "Config object is required"
+        return
+    fi
+
+    # Merge config into manifest
+    if [[ -f "$manifest" ]]; then
+        local updated
+        updated=$(jq --argjson cfg "$config" '.config = $cfg' "$manifest" 2>/dev/null)
+        if [[ -n "$updated" ]]; then
+            echo "$updated" > "$manifest"
+        else
+            _api_error 500 "Failed to update manifest"
+            return
+        fi
+    else
+        echo "{\"name\":\"$plugin_name\",\"config\":$config}" > "$manifest"
+    fi
+
+    _api_success "{\"plugin\": \"$(_api_json_escape "$plugin_name")\", \"message\": \"Configuration updated\"}"
+}
+
 # =============================================================================
 # FEATURE: CONFIG SCHEMA
 # =============================================================================
@@ -9937,6 +10440,7 @@ handle_request() {
             /backups/config)            handle_backup_config ;;
             /terminal/history)          handle_terminal_history ;;
             /system/metrics)            handle_system_metrics ;;
+            /system/update/check)       handle_system_update_check ;;
             /alerts/config)             handle_alerts_config ;;
             /system/crontab)            handle_crontab ;;
             /system/crontab/system)     handle_crontab_system ;;
@@ -9956,6 +10460,25 @@ handle_request() {
             /secrets)                   handle_secrets_list ;;
             /schedules)                 handle_schedules_list ;;
             /plugins)                   handle_plugins_list ;;
+            /plugins/*/hooks/*)
+                local pname="${path#/plugins/}"
+                local hook_name="${pname#*/hooks/}"
+                pname="${pname%%/*}"
+                _api_validate_resource_name "$pname" "plugin" || return
+                handle_plugin_hook_read "$pname" "$hook_name"
+                ;;
+            /plugins/*/hooks)
+                local pname="${path#/plugins/}"
+                pname="${pname%/hooks}"
+                _api_validate_resource_name "$pname" "plugin" || return
+                handle_plugin_hooks_list "$pname"
+                ;;
+            /plugins/*/logs)
+                local pname="${path#/plugins/}"
+                pname="${pname%/logs}"
+                _api_validate_resource_name "$pname" "plugin" || return
+                handle_plugin_logs "$pname"
+                ;;
             /config/schema)             handle_config_schema ;;
             /stream)                    handle_sse_stream ;;
 
@@ -10188,6 +10711,12 @@ handle_request() {
                 ;;
             /system/crontab)
                 handle_crontab_update "$request_body"
+                ;;
+            /system/update/apply)
+                handle_system_update_apply "$request_body"
+                ;;
+            /system/update/rollback)
+                handle_system_update_rollback "$request_body"
                 ;;
             /stacks)
                 handle_create_stack "$request_body"
@@ -10469,6 +10998,28 @@ handle_request() {
                 pname="${pname%/toggle}"
                 _api_validate_resource_name "$pname" "plugin" || return
                 handle_plugin_toggle "$pname"
+                ;;
+            /plugins/*/hooks/*/test)
+                local pname="${path#/plugins/}"
+                local rest="${pname#*/hooks/}"
+                local hook_name="${rest%/test}"
+                pname="${pname%%/*}"
+                _api_validate_resource_name "$pname" "plugin" || return
+                handle_plugin_hook_test "$pname" "$hook_name" "$request_body"
+                ;;
+            /plugins/*/hooks/*/update)
+                local pname="${path#/plugins/}"
+                local rest="${pname#*/hooks/}"
+                local hook_name="${rest%/update}"
+                pname="${pname%%/*}"
+                _api_validate_resource_name "$pname" "plugin" || return
+                handle_plugin_hook_update "$pname" "$hook_name" "$request_body"
+                ;;
+            /plugins/*/config)
+                local pname="${path#/plugins/}"
+                pname="${pname%/config}"
+                _api_validate_resource_name "$pname" "plugin" || return
+                handle_plugin_config_update "$pname" "$request_body"
                 ;;
             *)
                 _api_error 404 "Endpoint not found: $path"
