@@ -123,6 +123,11 @@ API_CORS_ORIGINS="${API_CORS_ORIGINS:-}"
 # Whether the API runs behind a TLS-terminating proxy (enables HSTS header)
 API_BEHIND_TLS_PROXY="${API_BEHIND_TLS_PROXY:-false}"
 
+# TLS/HTTPS support — direct TLS termination via socat OPENSSL-LISTEN
+API_TLS_ENABLED="${API_TLS_ENABLED:-false}"
+API_TLS_CERT="${API_TLS_CERT:-$BASE_DIR/.api-auth/server.crt}"
+API_TLS_KEY="${API_TLS_KEY:-$BASE_DIR/.api-auth/server.key}"
+
 # Single-session enforcement (revoke old tokens on new login)
 API_SINGLE_SESSION="${API_SINGLE_SESSION:-true}"
 
@@ -250,6 +255,12 @@ else
     exit 1
 fi
 
+if ! command -v jq >/dev/null 2>&1; then
+    echo "ERROR: jq is required for API authentication security." >&2
+    echo "Install: sudo apt install jq  |  sudo dnf install jq  |  sudo pacman -S jq" >&2
+    exit 1
+fi
+
 # =============================================================================
 # JSON HELPERS
 # =============================================================================
@@ -360,12 +371,13 @@ _api_response() {
     # Security headers
     printf "X-Content-Type-Options: nosniff\r\n"
     printf "X-Frame-Options: DENY\r\n"
-    printf "Cache-Control: no-store, no-cache, must-revalidate, private\r\n"
+    printf "X-XSS-Protection: 1; mode=block\r\n"
+    printf "Cache-Control: no-store, no-cache, must-revalidate\r\n"
     printf "Pragma: no-cache\r\n"
     printf "Content-Security-Policy: default-src 'none'; frame-ancestors 'none'\r\n"
-    printf "Referrer-Policy: no-referrer\r\n"
-    if [[ "$API_BEHIND_TLS_PROXY" == "true" ]]; then
-        printf "Strict-Transport-Security: max-age=31536000\r\n"
+    printf "Referrer-Policy: strict-origin-when-cross-origin\r\n"
+    if [[ "$API_TLS_ENABLED" == "true" ]] || [[ "$API_BEHIND_TLS_PROXY" == "true" ]]; then
+        printf "Strict-Transport-Security: max-age=31536000; includeSubDomains\r\n"
     fi
 
     printf "X-API-Version: %s\r\n" "$API_VERSION"
@@ -445,13 +457,12 @@ _api_audit_log() {
 # Initialize auth data directory and files
 _api_init_auth_dir() {
     if [[ ! -d "$API_AUTH_DIR" ]]; then
-        mkdir -p "$API_AUTH_DIR" 2>/dev/null
-        chmod 700 "$API_AUTH_DIR"
+        (umask 0077 && mkdir -p "$API_AUTH_DIR")
     fi
-    [[ ! -f "$API_AUTH_DIR/users.json" ]]  && echo '[]' > "$API_AUTH_DIR/users.json"
-    [[ ! -f "$API_AUTH_DIR/tokens.json" ]] && echo '[]' > "$API_AUTH_DIR/tokens.json"
-    [[ ! -f "$API_AUTH_DIR/invites.json" ]] && echo '[]' > "$API_AUTH_DIR/invites.json"
-    [[ ! -f "$API_AUTH_DIR/rate_limits.json" ]] && echo '{}' > "$API_AUTH_DIR/rate_limits.json"
+    [[ ! -f "$API_AUTH_DIR/users.json" ]]  && install -m 0600 /dev/stdin "$API_AUTH_DIR/users.json" <<< '[]'
+    [[ ! -f "$API_AUTH_DIR/tokens.json" ]] && install -m 0600 /dev/stdin "$API_AUTH_DIR/tokens.json" <<< '[]'
+    [[ ! -f "$API_AUTH_DIR/invites.json" ]] && install -m 0600 /dev/stdin "$API_AUTH_DIR/invites.json" <<< '[]'
+    [[ ! -f "$API_AUTH_DIR/rate_limits.json" ]] && install -m 0600 /dev/stdin "$API_AUTH_DIR/rate_limits.json" <<< '{}'
 }
 
 # Force-remove a directory, using Docker as fallback for root-owned files.
@@ -531,25 +542,38 @@ _api_update_user_hash() {
 
 # Generate a random token
 _api_generate_token() {
-    openssl rand -hex 32 2>/dev/null || {
-        # Fallback if openssl is not available
-        local hex=""
-        for i in $(seq 1 32); do
-            hex+=$(printf '%02x' $(( RANDOM % 256 )))
-        done
-        echo "$hex"
-    }
+    # SECURITY: Always use cryptographic randomness — never bash $RANDOM
+    local token=""
+    token=$(head -c 32 /dev/urandom 2>/dev/null | xxd -p -c 64 2>/dev/null)
+    if [[ -z "$token" ]]; then
+        token=$(head -c 32 /dev/urandom 2>/dev/null | od -An -tx1 2>/dev/null | tr -d ' \n')
+    fi
+    if [[ -z "$token" ]]; then
+        token=$(openssl rand -hex 32 2>/dev/null)
+    fi
+    if [[ -z "$token" || ${#token} -lt 32 ]]; then
+        echo "FATAL: Cannot generate secure token — /dev/urandom unavailable" >&2
+        return 1
+    fi
+    echo "$token"
 }
 
 # Generate a random salt
 _api_generate_salt() {
-    openssl rand -hex 16 2>/dev/null || {
-        local hex=""
-        for i in $(seq 1 16); do
-            hex+=$(printf '%02x' $(( RANDOM % 256 )))
-        done
-        echo "$hex"
-    }
+    # SECURITY: Always use cryptographic randomness — never bash $RANDOM
+    local salt=""
+    salt=$(head -c 16 /dev/urandom 2>/dev/null | xxd -p -c 32 2>/dev/null)
+    if [[ -z "$salt" ]]; then
+        salt=$(head -c 16 /dev/urandom 2>/dev/null | od -An -tx1 2>/dev/null | tr -d ' \n')
+    fi
+    if [[ -z "$salt" ]]; then
+        salt=$(openssl rand -hex 16 2>/dev/null)
+    fi
+    if [[ -z "$salt" || ${#salt} -lt 16 ]]; then
+        echo "FATAL: Cannot generate secure salt — /dev/urandom unavailable" >&2
+        return 1
+    fi
+    echo "$salt"
 }
 
 # Read a JSON auth file (returns contents)
@@ -562,11 +586,11 @@ _api_read_auth_file() {
     fi
 }
 
-# Write a JSON auth file
+# Write a JSON auth file (restricted permissions)
 _api_write_auth_file() {
     local file="$API_AUTH_DIR/$1"
     local content="$2"
-    printf '%s' "$content" > "$file" 2>/dev/null
+    install -m 0600 /dev/stdin "$file" <<< "$content"
 }
 
 # Get current epoch timestamp
@@ -713,25 +737,13 @@ _api_validate_token() {
     local now
     now=$(_api_now_epoch)
 
-    if command -v jq >/dev/null 2>&1; then
-        local record
-        record=$(echo "$tokens" | jq -r --arg t "$token" --argjson n "$now" \
-            '.[] | select(.token == $t and .expires_at > $n)' 2>/dev/null)
-        if [[ -n "$record" ]]; then
-            AUTH_USERNAME=$(echo "$record" | jq -r '.username' 2>/dev/null)
-            AUTH_ROLE=$(echo "$record" | jq -r '.role' 2>/dev/null)
-            return 0
-        fi
-    else
-        # Fallback: grep-based token search
-        if echo "$tokens" | grep -q "\"token\": *\"$token\""; then
-            # Basic extraction — limited without jq
-            AUTH_USERNAME=$(echo "$tokens" | grep -A5 "\"token\": *\"$token\"" | grep '"username"' | head -1 | sed 's/.*: *"\([^"]*\)".*/\1/')
-            AUTH_ROLE=$(echo "$tokens" | grep -A5 "\"token\": *\"$token\"" | grep '"role"' | head -1 | sed 's/.*: *"\([^"]*\)".*/\1/')
-            if [[ -n "$AUTH_USERNAME" ]]; then
-                return 0
-            fi
-        fi
+    local record
+    record=$(echo "$tokens" | jq -r --arg t "$token" --argjson n "$now" \
+        '.[] | select(.token == $t and .expires_at > $n)' 2>/dev/null)
+    if [[ -n "$record" ]]; then
+        AUTH_USERNAME=$(echo "$record" | jq -r '.username' 2>/dev/null)
+        AUTH_ROLE=$(echo "$record" | jq -r '.role' 2>/dev/null)
+        return 0
     fi
     return 1
 }
@@ -2522,6 +2534,14 @@ handle_auth_setup() {
 
     _api_init_auth_dir
 
+    # Rate limit check
+    local client_ip="${SOCAT_PEERADDR:-unknown}"
+    if ! _api_check_rate_limit "$client_ip"; then
+        _api_audit_log "$client_ip" "LOCKOUT" "" "Rate limit lockout on /auth/setup"
+        _api_error 429 "Too many attempts. Please try again later."
+        return
+    fi
+
     local user_count
     user_count=$(_api_user_count)
     if [[ "$user_count" -gt 0 ]]; then
@@ -2708,6 +2728,14 @@ handle_auth_register() {
     local body="$1"
 
     _api_init_auth_dir
+
+    # Rate limit check
+    local client_ip="${SOCAT_PEERADDR:-unknown}"
+    if ! _api_check_rate_limit "$client_ip"; then
+        _api_audit_log "$client_ip" "LOCKOUT" "" "Rate limit lockout on /auth/register"
+        _api_error 429 "Too many attempts. Please try again later."
+        return
+    fi
 
     local username password invite_code
     if command -v jq >/dev/null 2>&1; then
@@ -3356,10 +3384,16 @@ handle_container_exec() {
         return
     fi
 
-    # Execute the command (with timeout to prevent hanging)
+    # SECURITY: Command length limit
+    if [[ ${#command} -gt 4096 ]]; then
+        _api_error 400 "Command too long (max 4096 characters)"
+        return
+    fi
+
+    # Execute the command (with timeout to prevent hanging, output capped at 1MB)
     local output=""
     local exit_code=0
-    output=$(timeout 30 docker exec -T "$name" sh -c "$command" 2>&1) || exit_code=$?
+    output=$(timeout 30 docker exec -T "$name" sh -c "$command" 2>&1 | head -c 1048576) || exit_code=$?
 
     # Handle timeout specifically
     if [[ $exit_code -eq 124 ]]; then
@@ -4739,6 +4773,15 @@ handle_container_files() {
     [[ -z "$container" ]] && { _api_error 400 "Missing container name"; return; }
     [[ -z "$query_path" ]] && query_path="/"
 
+    # SECURITY: Reject path traversal attempts
+    if [[ "$query_path" == *".."* ]] || [[ "$query_path" == *$'\0'* ]] || [[ "$query_path" == *"~"* ]]; then
+        _api_error 400 "Invalid file path — path traversal not allowed"
+        return
+    fi
+    if [[ "$query_path" != /* ]]; then
+        query_path="/$query_path"
+    fi
+
     # Verify container exists and is running
     local state
     state=$(docker inspect -f '{{.State.Status}}' "$container" 2>/dev/null)
@@ -4810,6 +4853,15 @@ handle_container_file_content() {
     local file_path="$2"
     [[ -z "$container" ]] && { _api_error 400 "Missing container name"; return; }
     [[ -z "$file_path" ]] && { _api_error 400 "Missing file path"; return; }
+
+    # SECURITY: Reject path traversal attempts
+    if [[ "$file_path" == *".."* ]] || [[ "$file_path" == *$'\0'* ]] || [[ "$file_path" == *"~"* ]]; then
+        _api_error 400 "Invalid file path — path traversal not allowed"
+        return
+    fi
+    if [[ "$file_path" != /* ]]; then
+        file_path="/$file_path"
+    fi
 
     # Verify container exists and is running
     local state
@@ -11157,8 +11209,22 @@ start_server() {
     # Start the listener — socat/ncat invoke this script with --handle-request
     # which triggers the internal request handler (see ENTRY POINT below)
     if [[ "$LISTENER_CMD" == "socat" ]]; then
-        socat "TCP-LISTEN:${API_PORT},bind=${API_BIND},reuseaddr,fork" \
-            EXEC:"$self_path --handle-request",nofork
+        if [[ "$API_TLS_ENABLED" == "true" ]]; then
+            if [[ ! -f "$API_TLS_CERT" ]] || [[ ! -f "$API_TLS_KEY" ]]; then
+                echo "ERROR: TLS enabled but certificate/key not found." >&2
+                echo "  Certificate: $API_TLS_CERT" >&2
+                echo "  Key: $API_TLS_KEY" >&2
+                echo "  Generate with: openssl req -x509 -newkey rsa:4096 -keyout server.key -out server.crt -days 365 -nodes -subj '/CN=dcs-api'" >&2
+                exit 1
+            fi
+            echo "Starting API server on https://${API_BIND}:${API_PORT} (TLS enabled)"
+            socat "OPENSSL-LISTEN:${API_PORT},bind=${API_BIND},reuseaddr,fork,cert=${API_TLS_CERT},key=${API_TLS_KEY},verify=0" \
+                EXEC:"$self_path --handle-request",nofork
+        else
+            echo "Starting API server on http://${API_BIND}:${API_PORT}"
+            socat "TCP-LISTEN:${API_PORT},bind=${API_BIND},reuseaddr,fork" \
+                EXEC:"$self_path --handle-request",nofork
+        fi
     else
         # ncat mode
         ncat -l -k "${API_BIND}" "${API_PORT}" -e "$self_path --handle-request"
