@@ -1,1 +1,10 @@
-[]
+[
+  {
+    "username": "Howson",
+    "password_hash": "15b7c0fb2dda50ce01630f33dd99793bbf0c760b3e40bf72684b61b65af2ee08",
+    "salt": "935f9d8559d36cd0bc95035ed4c2b19c",
+    "role": "admin",
+    "created_at": "2026-03-19T04:37:11Z",
+    "hash_version": 2
+  }
+]

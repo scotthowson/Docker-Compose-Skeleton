@@ -1,0 +1,7 @@
+{
+  "name": "compose-linter",
+  "version": "1.2.0",
+  "description": "Comprehensive compose validation — catches missing restart policies, privileged containers, unbound ports, Docker socket mounts, missing health checks, resource limits, and 18+ security rules before deployment.",
+  "author": "DCS Community",
+  "enabled": false
+}

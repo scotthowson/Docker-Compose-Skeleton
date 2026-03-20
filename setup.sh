@@ -92,6 +92,7 @@ WHAT IT DOES:
   4. Sets executable permissions on all .sh scripts
   5. Sets ownership to the current user (${CURRENT_USER})
   6. Verifies Docker and Docker Compose are installed
+  7. Launches API server for Setup Wizard configuration
 
 EOF
     exit 0
@@ -150,7 +151,7 @@ _info "Running as user : ${CURRENT_USER}:${CURRENT_GROUP}"
 # STEP 1: Environment File
 # =============================================================================
 
-_header "Step 1/5: Environment Configuration"
+_header "Step 1/7: Environment Configuration"
 _divider
 
 if [[ -f "$BASE_DIR/.env" ]]; then
@@ -168,7 +169,7 @@ fi
 # STEP 2: Create Directories
 # =============================================================================
 
-_header "Step 2/5: Directory Structure"
+_header "Step 2/7: Directory Structure"
 _divider
 
 declare -a REQUIRED_DIRS=(
@@ -189,7 +190,7 @@ done
 # STEP 3: Stack Directories
 # =============================================================================
 
-_header "Step 3/6: Stack Directories"
+_header "Step 3/7: Stack Directories"
 _divider
 
 # Read stack list from .env (DOCKER_STACKS), or use defaults
@@ -277,7 +278,7 @@ unset _SETUP_STACKS
 # STEP 4: Set Executable Permissions
 # =============================================================================
 
-_header "Step 4/6: Script Permissions"
+_header "Step 4/7: Script Permissions"
 _divider
 
 chmod_count=0
@@ -323,10 +324,10 @@ fi
 _ok "Set executable on $chmod_count script files"
 
 # =============================================================================
-# STEP 4: Set Ownership
+# STEP 5: Set Ownership
 # =============================================================================
 
-_header "Step 5/6: File Ownership"
+_header "Step 5/7: File Ownership"
 _divider
 
 # Only attempt chown if we can (avoids errors in unprivileged containers)
@@ -341,10 +342,10 @@ else
 fi
 
 # =============================================================================
-# STEP 5: Verify Docker Environment
+# STEP 6: Verify Docker Environment
 # =============================================================================
 
-_header "Step 6/6: Docker Environment"
+_header "Step 6/7: Docker Environment"
 _divider
 
 docker_ok=true

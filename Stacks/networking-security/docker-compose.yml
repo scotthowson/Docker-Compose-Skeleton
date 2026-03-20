@@ -6,4 +6,4 @@ services:
     environment:
       - TZ=${TZ:-UTC}
     ports:
-      - "8080:80"
+      - "8084:80"

@@ -1,0 +1,24 @@
+#!/bin/bash
+# env-validator — pre-deploy hook
+CONTEXT=$(cat)
+STACK=$(echo "$CONTEXT" | jq -r '.stack // "unknown"' 2>/dev/null)
+COMPOSE=$(echo "$CONTEXT" | jq -r '.compose // empty' 2>/dev/null)
+WARNINGS=""
+WARN_COUNT=0
+if [[ -n "$COMPOSE" ]]; then
+    REFERENCED_VARS=$(echo "$COMPOSE" | grep -oE '\$\{[A-Z_][A-Z0-9_]*' | sed 's/\${//' | sort -u)
+    for var in $REFERENCED_VARS; do
+        VAL=$(eval echo "\${$var:-}" 2>/dev/null)
+        if [[ -z "$VAL" ]]; then
+            WARN_COUNT=$((WARN_COUNT+1))
+            [[ -n "$WARNINGS" ]] && WARNINGS+=","
+            WARNINGS+="{\"variable\":\"$var\",\"rule\":\"undefined\",\"message\":\"Referenced but not set\",\"severity\":\"warning\"}"
+        fi
+    done
+fi
+if [[ $WARN_COUNT -eq 0 ]]; then
+    echo "{\"plugin\":\"env-validator\",\"event\":\"pre-deploy\",\"stack\":\"$STACK\",\"status\":\"pass\",\"warnings\":[],\"message\":\"All environment variables resolved\"}"
+else
+    echo "{\"plugin\":\"env-validator\",\"event\":\"pre-deploy\",\"stack\":\"$STACK\",\"status\":\"warn\",\"warning_count\":$WARN_COUNT,\"warnings\":[$WARNINGS],\"message\":\"$WARN_COUNT undefined variable(s)\"}"
+fi
+exit 0
