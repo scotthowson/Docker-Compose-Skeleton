@@ -1,7 +1,0 @@
-{
-  "name": "env-validator",
-  "version": "1.1.0",
-  "description": "Scans compose files for referenced environment variables that are not defined, detects duplicate keys, flags empty values, and warns about hardcoded secrets — catching configuration gaps before deployment.",
-  "author": "DCS Community",
-  "enabled": true
-}

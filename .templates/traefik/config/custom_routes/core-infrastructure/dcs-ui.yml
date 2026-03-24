@@ -13,7 +13,7 @@ http:
       rule: "Host(`ui.${TRAEFIK_DOMAIN}`)"
       service: "dcs-ui"
       middlewares:
-        - "secure-chain"
+        - "traefik-chain"
         - "compress-gzip"
       tls:
         certResolver: "letsencrypt"

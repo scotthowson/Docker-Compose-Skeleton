@@ -7,9 +7,19 @@
 # Keep per-stack .env files (they are templates, not secrets)
 !Stacks/*/.env
 
+# API auth data (tokens, sessions, deploy history)
+.api-auth/
+
+# Compose history snapshots
+.compose-history/
+
 # Logs
 logs/
 *.log
+
+# Backup files from deploy/undeploy operations
+*.bak
+*.bak.*
 
 # Persistent container data
 App-Data/

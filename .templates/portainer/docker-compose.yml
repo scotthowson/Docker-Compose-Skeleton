@@ -15,8 +15,4 @@ services:
     mem_limit: 1G
     cpus: 1
     healthcheck:
-      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider https://localhost:9443/api/status || exit 1"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 15s
+      test: ["NONE"]

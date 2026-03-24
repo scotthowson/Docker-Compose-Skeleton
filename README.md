@@ -1,475 +1,276 @@
 # Docker Compose Skeleton
 
-A modular Docker service orchestration framework with a REST API, 28 deployable service templates, dependency-ordered startup/shutdown, enhanced logging, NTFY push notifications, intelligent image updates, and a full suite of management utilities.
+A portable, modular Docker service orchestration framework with a hardened REST API, 100 deployable service templates, dependency-ordered startup/shutdown, enhanced logging, push notifications, intelligent image updates, and a comprehensive management UI.
 
-Clone it, configure it, run it — from any directory, by any user.
+Clone it. Configure it. Run it — from any directory, by any user, on any Linux distro.
+
+---
+
+## Features
+
+- **100 Service Templates** — Deploy Traefik, Portainer, Jellyfin, Nextcloud, Grafana, and 95 more with one command
+- **REST API** — 76+ endpoints for full remote management (stacks, containers, templates, networks, volumes, backups, terminal)
+- **Two-Factor Authentication** — TOTP 2FA with authenticator app support, auto-lock after inactivity
+- **Setup Wizard** — 5-step guided first-run configuration via the companion UI
+- **Dependency-Ordered Startup** — 10 stack categories start in order, shutdown in reverse
+- **Intelligent Updates** — SHA256-based image change detection with rolling restarts
+- **Compose Security Scanner** — Blocks privileged containers, dangerous mounts, capability escalation, and container escape vectors (7 rounds of penetration testing, 67+ security fixes)
+- **Traefik Integration** — Auto-generated route files, Cloudflare DNS records, wildcard TLS certificates, Dynamic DNS
+- **Plugin System** — Extensible with custom dashboard cards, hooks, and templates
+- **Push Notifications** — NTFY integration for start, stop, failure, and health events
+- **Health Monitoring** — Container health scoring, uptime tracking, resource trending
+- **Backup & Restore** — Full system snapshots with path traversal protection
+- **Encrypted Secrets** — AES-256-CBC encrypted key-value store for API keys, passwords, and tokens
+- **Terminal Access** — Authenticated remote command execution with audit logging
+- **System Updates** — Git-based framework updates with backup tags and one-click rollback
+- **Cross-Distro** — Works on Ubuntu, Fedora, Arch, Alpine, openSUSE, Debian, and more
 
 ---
 
 ## Quick Start
 
 ```bash
-# 1. Clone the repository
+# 1. Clone
 git clone https://github.com/scotthowson/Docker-Compose-Skeleton.git
 cd Docker-Compose-Skeleton
 
-# 2. Run first-run setup
+# 2. Run setup (installs dependencies, creates directories, launches setup API)
 ./setup.sh
-#    → Verifies Docker, creates directories, launches setup API
-#    → Prints your server IP — enter it in DCS Manager to complete setup
 
-# 3. Open DCS Manager, connect to your server IP, and walk through the Setup Wizard
-#    (creates admin account, configures .env, selects stack categories)
+# 3. Open DCS Manager, connect to your server IP, complete the Setup Wizard
 
 # 4. Start all services
 ./start.sh
-
-# 5. Check status
-./status.sh
 ```
 
-### First-Run Setup Wizard
+### What `./setup.sh` Does
 
-When you clone DCS fresh and run `./setup.sh`, the script:
+| Step | Action |
+|------|--------|
+| 1 | Copies `.env.example` to `.env` |
+| 2 | Creates `logs/` and archive directories |
+| 3 | Creates stack directories from `DOCKER_STACKS` |
+| 4 | Sets executable permissions on all scripts |
+| 5 | Sets ownership to the current user |
+| 6 | Installs required + optional system dependencies |
+| 7 | Verifies Docker and Docker Compose |
+| 8 | Launches the API server for Setup Wizard |
 
-1. Verifies Docker and Docker Compose are installed
-2. Creates required directories and permissions
-3. Detects your server's IP address
-4. Launches the API in **setup mode** on `http://<your-ip>:9876`
+After setup, open [DCS Manager](https://github.com/scotthowson/Docker-Compose-Skeleton-UI) and the 5-step wizard walks you through admin account creation, server config, Traefik domain setup, DDNS, and stack selection.
 
-Open [DCS Manager](https://github.com/scotthowson/Docker-Compose-Skeleton-UI), enter your server IP, and the 5-step Setup Wizard guides you through:
-
-| Step | What it does |
-|------|-------------|
-| **Connect** | Enter server IP, verify connection, detect system info |
-| **Admin Account** | Create your admin username and password |
-| **Server Config** | Set timezone, domain, data directory, PUID/PGID |
-| **Stack Categories** | Choose, rename, reorder, or add stack categories |
-| **Review & Complete** | Review all settings, apply configuration, write `.env` |
-
-After setup completes, run `./start.sh` to launch all services. Re-running `./setup.sh` on a configured server exits immediately with a "setup already complete" message.
+---
 
 ## REST API
 
-A built-in REST API server provides remote management of your entire Docker infrastructure. Starts automatically with `./start.sh` and listens on `0.0.0.0:9876`.
+A 13,000+ line hardened bash API server with 60+ endpoints. Starts automatically with `./start.sh` on port `9876`.
 
-### Key Endpoints
+### Endpoints
 
 | Group | Endpoints | Description |
 |-------|-----------|-------------|
-| **System** | `/status`, `/health`, `/version` | Server health, system metrics, Docker info |
-| **Stacks** | `/stacks`, `/stacks/:name/*` | List, start, stop, restart, pull stacks |
-| **Containers** | `/containers`, `/containers/:id/*` | List, inspect, start, stop, restart, logs |
-| **Templates** | `/templates`, `/templates/:name/deploy` | Browse, preview, deploy 28 service templates |
-| **Images** | `/images`, `/images/prune` | List images, prune unused |
-| **Networks** | `/networks`, `/networks/:id` | List, inspect, create, remove |
-| **Volumes** | `/volumes`, `/volumes/:name` | List, inspect, create, remove |
-| **Logs** | `/logs/services`, `/logs/api` | Service and API log viewing with filtering |
-| **Events** | `/events` | Real-time Docker event stream |
-| **Config** | `/config/env`, `/config/compose` | Read and edit `.env` and compose files |
-| **Maintenance** | `/maintenance/*` | Disk report, prune, orphan detection, log rotation |
-| **Backups** | `/backups/*` | Create, list, restore backups |
-| **Auth** | `/auth/*` | Setup, login, invite codes, token management |
-| **Setup** | `/setup/status`, `/setup/defaults`, `/setup/configure`, `/setup/complete` | First-run wizard endpoints |
-| **Terminal** | `/terminal/exec` | Authenticated remote command execution |
-| **Batch** | `/batch/start`, `/batch/stop` | Bulk stack operations |
+| **System** | `/status`, `/health`, `/version`, `/system` | Health, metrics, Docker info, disk usage |
+| **Stacks** | `/stacks`, `/stacks/:name/*` | List, start, stop, restart, update, rename, clone |
+| **Containers** | `/containers`, `/containers/:id/*` | Inspect, start, stop, restart, logs, exec, rename, file browser |
+| **Templates** | `/templates`, `/templates/:name/deploy` | Browse, preview, deploy, import from URL |
+| **Images** | `/images`, `/images/search`, `/images/check` | List, search Docker Hub, check for updates |
+| **Networks** | `/networks`, `/networks/:id/*` | List, create, remove, connect, disconnect |
+| **Volumes** | `/volumes`, `/volumes/:name` | List, inspect, remove |
+| **Logs** | `/logs`, `/logs/live`, `/logs/stats` | Service logs with filtering, live streaming, statistics |
+| **Events** | `/events`, `/stream` | Docker events, SSE real-time stream |
+| **Config** | `/config`, `/config/update` | Read and update `.env` configuration |
+| **Maintenance** | `/maintenance/*` | Disk analysis, prune, orphan detection, log rotation |
+| **Backups** | `/backups/*` | Create, list, restore, status polling |
+| **Snapshots** | `/snapshots/*` | Full system snapshots with metadata |
+| **Auth** | `/auth/*` | Setup, login, invite codes, token management, sessions |
+| **Terminal** | `/terminal/exec`, `/terminal/auth` | Authenticated Linux command execution |
+| **Batch** | `/batch/start`, `/batch/stop`, `/batch/update` | Bulk stack operations |
+| **Webhooks** | `/webhooks/*` | Create, test, fire on events |
+| **Automations** | `/automations/*` | Scheduled tasks with cron expressions |
+| **Plugins** | `/plugins/*` | Install, enable, scaffold custom plugins |
+| **Export** | `/export/*` | Export health, system, config data |
+| **Notifications** | `/notifications/*` | Rules, history, test |
+| **Updates** | `/system/update/*` | Check, apply, rollback DCS updates via git |
+| **OS Updates** | `/system/os-update/*` | Check and apply system package updates |
+| **DDNS** | `/ddns/status` | Dynamic DNS status and IP monitoring |
+| **Traefik** | `/traefik/status` | Traefik router and certificate status |
 
-### API Authentication
+### Authentication
 
-Token-based authentication with PBKDF2 password hashing, rate limiting, and invite-code registration:
+Token-based auth with PBKDF2-SHA256 password hashing (100k iterations), rate limiting, and invite-code registration:
 
 ```bash
-# Initial admin setup
-curl -X POST http://localhost:9876/auth/setup \
-  -d '{"username":"admin","password":"your-password"}'
+# Initial setup
+curl -X POST http://server:9876/auth/setup \
+  -d '{"username":"admin","password":"YourPassword1"}'
 
-# Login (returns auth token)
-curl -X POST http://localhost:9876/auth/login \
-  -d '{"username":"admin","password":"your-password"}'
+# Login
+curl -X POST http://server:9876/auth/login \
+  -d '{"username":"admin","password":"YourPassword1"}'
+# → {"success": true, "token": "abc123...", "role": "admin"}
 
-# Use token for authenticated endpoints
-curl -H "Authorization: Bearer <token>" http://localhost:9876/stacks
+# Authenticated request
+curl -H "Authorization: Bearer abc123..." http://server:9876/stacks
 ```
 
-### API Security
+### Security
 
-- Input validation with path traversal protection on all resource names
-- Request body size limits (configurable, default 1 MB)
-- CORS origin allowlisting (default: localhost only)
-- Security headers (X-Content-Type-Options, X-Frame-Options, CSP, etc.)
-- Rate limiting on authentication endpoints
-- Audit logging for all auth events
+The API server has been through **7 rounds of penetration testing** with 67+ security fixes:
+
+| Layer | Protection |
+|-------|-----------|
+| **Authentication** | PBKDF2-SHA256 (100k iterations), constant-time comparison, rate limiting (5 attempts → 15 min lockout) |
+| **Authorization** | Role-based access (admin/user), per-endpoint enforcement, invite-only registration |
+| **Input Validation** | 91 validation calls, path traversal protection, URL-encoded attack rejection |
+| **Compose Scanner** | Blocks privileged mode, dangerous capabilities (SYS_ADMIN, NET_ADMIN), host mounts, build directives, security profile disabling |
+| **Injection Prevention** | 287 JSON escape calls, sed/awk injection protection, shell metacharacter rejection |
+| **HTTP Security** | X-Content-Type-Options, X-Frame-Options, CSP, HSTS, Permissions-Policy, CORS allowlisting |
+| **SSRF Protection** | Private IP blocking, DNS rebinding prevention, URL re-validation at fire time |
+| **DoS Protection** | Body size limits (1MB), request timeouts (30s), global rate limiting |
+| **Session Security** | 24h token expiry, single-session enforcement, file-locked token storage |
+| **Audit Logging** | All POST/DELETE operations logged with IP, user, path, and timestamp |
+
+---
 
 ## Service Templates
 
-28 ready-to-deploy templates across 8 categories. Deploy via the API or the [DCS Manager UI](https://github.com/scotthowson/Docker-Compose-Skeleton-UI).
+100 ready-to-deploy templates across 10+ categories. Deploy via the API or [DCS Manager UI](https://github.com/scotthowson/Docker-Compose-Skeleton-UI).
 
-### Available Templates
+<details>
+<summary><strong>View all 100 templates</strong></summary>
 
-| Template | Category | Description |
-|----------|----------|-------------|
-| **Authelia** | Web | SSO and 2FA authentication server |
-| **Caddy** | Web | Automatic HTTPS web server |
-| **Docker Socket Proxy** | Web | Secure Docker API access proxy |
-| **Grafana** | Monitoring | Dashboards and data visualization |
-| **Homarr** | Web | Server dashboard and startpage |
-| **Home Assistant** | Automation | Smart home automation platform |
-| **Homepage** | Web | Application dashboard with widgets |
-| **Jellyfin** | Media | Open-source media server |
-| **MinIO** | Storage | S3-compatible object storage |
-| **MongoDB** | Databases | NoSQL document database |
-| **MySQL** | Databases | Relational SQL database |
-| **Nextcloud** | Storage | File sync and collaboration cloud |
-| **Nextcloud AIO** | Web | All-in-one Nextcloud with Collabora, Talk, backups |
-| **Nginx Proxy Manager** | Web | Reverse proxy with GUI (SQLite or MariaDB) |
-| **Pelican Panel** | Web | Game server management panel + Wings |
-| **phpMyAdmin** | Databases | MySQL/MariaDB web administration |
-| **Plex** | Media | Media server with transcoding |
-| **Portainer CE** | Monitoring | Docker management UI |
-| **PostgreSQL** | Databases | Advanced relational database |
-| **Prometheus** | Monitoring | Metrics collection and alerting |
-| **Redis** | Databases | In-memory key-value cache/store |
-| **RedisInsight** | Development | Redis GUI and monitoring tool |
-| **Sablier** | Utilities | On-demand container scaling |
-| **SpeedTest Tracker** | Monitoring | Network bandwidth monitoring |
-| **Traefik** | Web | Reverse proxy with auto-SSL, Cloudflare, file routing |
-| **Uptime Kuma** | Monitoring | Uptime monitoring and status pages |
-| **Watchtower** | Automation | Automatic Docker image updates |
+| Category | Templates |
+|----------|-----------|
+| **Reverse Proxies** | Traefik, Caddy, Nginx Proxy Manager, Cloudflared |
+| **Media** | Jellyfin, Plex, Sonarr, Radarr, Lidarr, Readarr, Prowlarr, Bazarr, Tautulli, Seerr, Jellyseerr, qBittorrent, Transmission, SABnzbd, FlareSolverr |
+| **Dashboards** | Homarr, Homepage, Dashy, Dashdot, Yacht |
+| **Monitoring** | Grafana, Prometheus, Uptime Kuma, Netdata, Loki, InfluxDB, SpeedTest Tracker, Dozzle |
+| **Storage** | Nextcloud, Nextcloud AIO, MinIO, Syncthing, Duplicati, FileBrowser |
+| **Databases** | PostgreSQL, MySQL, MariaDB, MongoDB, Redis, RedisInsight, Adminer, pgAdmin, phpMyAdmin |
+| **Productivity** | Memos, Trilium, BookStack, Mealie, Tandoor, Actual Budget, Firefly III, Vikunja, Planka, Reactive Resume, Karakeep, Linkwarden, Kavita, Calibre-Web, Audiobookshelf, Paperless-ngx |
+| **Development** | Gitea, Code Server, n8n, Semaphore |
+| **Security** | Authelia, Vaultwarden, CrowdSec, WireGuard (wg-easy), AdGuard Home, Pi-hole, Docker Socket Proxy |
+| **Communication** | PrivateBin, Ntfy, Gotify, FreshRSS, SearXNG, Wizarr |
+| **Gaming** | EmulatorJS, MonkeyType, Pelican Panel, RustDesk |
+| **Infrastructure** | Portainer, Watchtower, Diun, Sablier, Komodo, Home Assistant, Healthchecks |
+| **AI** | Ollama, Open WebUI |
+| **Web** | Nginx, Ghost, Excalidraw, Stirling PDF, IT-Tools, Immich |
+| **DNS** | Cloudflare DDNS |
 
-### Template Deployment
+</details>
 
-Templates deploy with full variable substitution, port conflict detection, compose file merging, and optional config file scaffolding:
+### Deployment
 
 ```bash
-# Preview a deployment (dry run with conflict detection)
-curl -X POST http://localhost:9876/templates/traefik/dry-run \
+# Preview (dry run with conflict detection)
+curl -X POST http://server:9876/templates/traefik/dry-run \
+  -H "Authorization: Bearer TOKEN" \
   -d '{"target_stack":"networking-security","variables":{"TRAEFIK_DOMAIN":"example.com"}}'
 
-# Deploy a template
-curl -X POST http://localhost:9876/templates/traefik/deploy \
-  -d '{"target_stack":"networking-security","auto_start":true,"variables":{"TRAEFIK_DOMAIN":"example.com","TRAEFIK_ACME_EMAIL":"admin@example.com"}}'
+# Deploy
+curl -X POST http://server:9876/templates/traefik/deploy \
+  -H "Authorization: Bearer TOKEN" \
+  -d '{"target_stack":"networking-security","auto_start":true,"variables":{"TRAEFIK_DOMAIN":"example.com"}}'
 ```
 
-**Deployment features:**
-- Section-aware compose merge (services, volumes, networks merged into correct sections)
-- Port conflict detection across all stacks and running containers
-- Automatic backup of existing compose files before merge
-- Rollback on validation failure (compose config check)
-- Non-destructive config file deployment (`cp -rn` — never overwrites existing files)
-- Variable substitution in config files (e.g., Traefik's `${TRAEFIK_DOMAIN}` replaced at deploy time)
-- DOCKER_STACKS-aware directory creation (custom routes match your stack categories)
+Every deployment includes: compose validation, security scanning, port conflict detection, automatic backup, variable substitution, config file scaffolding, volume permission fixing, and optional Cloudflare DNS record creation.
 
-### Traefik Template
-
-The Traefik template includes a complete file-based routing system:
-
-```
-App-Data/Traefik/                    # Deployed config structure
-├── acme.json                        # ACME cert storage (chmod 600)
-├── cache/                           # Plugin cache
-├── traefik.yml                      # Static config (entrypoints, providers, ACME)
-├── traefikRouters.yml               # Shared middlewares, TLS, security headers
-└── custom_routes/                   # Per-stack route directories
-    ├── core-infrastructure/         # Sample: traefik.yml (dashboard route)
-    ├── networking-security/
-    ├── monitoring-management/
-    ├── development-tools/
-    ├── media-services/
-    ├── web-applications/
-    ├── storage-backup/
-    ├── communication-collaboration/
-    ├── entertainment-personal/
-    └── miscellaneous-services/
-```
-
-Route directories mirror your `DOCKER_STACKS` configuration. Place one `.yml` file per service in the matching stack category — Traefik auto-discovers changes with no restart needed.
+---
 
 ## Commands
 
-### Core Operations
-
 | Command | Description |
 |---------|-------------|
-| `./setup.sh` | First-run setup — verifies Docker, creates directories, launches setup API for DCS Manager wizard |
-| `./start.sh` | Start all services in dependency order with updates and health checks |
-| `./stop.sh` | Stop all services in reverse dependency order |
-| `./restart.sh` | Stop then start all services |
-| `./status.sh` | Show container status across all stacks |
+| `./setup.sh` | First-run setup — dependencies, directories, Setup Wizard |
+| `./start.sh` | Start all services in dependency order |
+| `./stop.sh` | Graceful shutdown in reverse order |
+| `./restart.sh` | Stop then start |
+| `./status.sh` | Container status overview |
 
 ### Management Utilities
 
 | Script | Description |
 |--------|-------------|
-| `.scripts/stack-manager.sh` | CLI for managing individual stacks (start/stop/restart/status/logs/pull) |
-| `.scripts/health-check.sh` | Comprehensive container health monitoring with formatted tables |
-| `.scripts/config-validator.sh` | Validates all config files, directories, and system requirements |
-| `.scripts/maintenance.sh` | Docker cleanup, disk analysis, log rotation, orphan detection |
-| `.scripts/docker-network-info.sh` | Visualize Docker networks, connections, and port mappings |
-| `.scripts/image-tracker.sh` | Track image age and detect stale images across stacks |
+| `.scripts/stack-manager.sh` | CLI for individual stacks (start/stop/restart/status/logs/pull) |
+| `.scripts/health-check.sh` | Container health monitoring with formatted tables |
+| `.scripts/config-validator.sh` | Validates config, directories, compose syntax, ports |
+| `.scripts/maintenance.sh` | Docker cleanup, disk analysis, orphan detection, log rotation |
+| `.scripts/docker-network-info.sh` | Network visualization with tree-style connections |
+| `.scripts/image-tracker.sh` | Image age tracking and staleness detection |
 | `.scripts/system-info.sh` | System and Docker resource information |
-| `.scripts/logs-viewer.sh` | Interactive log viewer with filtering, search, and stats |
-| `.scripts/api-server.sh` | REST API server (auto-started by `start.sh`) |
+| `.scripts/logs-viewer.sh` | Interactive log viewer with filtering and search |
+| `.scripts/api-server.sh` | REST API server (60+ endpoints, 13,000+ lines) |
 
-### Flags
-
-| Flag | Available on | Description |
-|------|-------------|-------------|
-| `--help` | All scripts | Show usage information |
-| `--debug` | `start.sh`, `stop.sh` | Debug logging + bash trace |
-| `--force` | `stop.sh` | Force stop with 5s timeout |
-| `--fix` | `config-validator.sh` | Auto-fix common issues |
-| `--json` | Multiple utilities | JSON output |
-| `--quiet` | Multiple utilities | Minimal output |
-
-### Stack Manager Examples
-
-```bash
-# Manage individual stacks
-.scripts/stack-manager.sh list                          # List all stacks
-.scripts/stack-manager.sh start core-infrastructure     # Start one stack
-.scripts/stack-manager.sh status web-applications       # Detailed status
-.scripts/stack-manager.sh logs media-services --follow   # Live logs
-.scripts/stack-manager.sh pull monitoring-management    # Pull latest images
-.scripts/stack-manager.sh running                       # Show running stacks
-```
-
-### Maintenance Examples
-
-```bash
-# System maintenance
-.scripts/maintenance.sh                  # Full system report
-.scripts/maintenance.sh disk             # Disk usage breakdown
-.scripts/maintenance.sh prune            # Safe cleanup
-.scripts/maintenance.sh deep-prune       # Aggressive cleanup (interactive)
-.scripts/maintenance.sh orphans          # Find orphaned resources
-.scripts/maintenance.sh log-rotate       # Rotate log files
-
-# Validate your setup
-.scripts/config-validator.sh             # Check everything
-.scripts/config-validator.sh --fix       # Auto-fix issues
-
-# Network inspection
-.scripts/docker-network-info.sh          # Network overview
-.scripts/docker-network-info.sh --ports  # Include port mappings
-
-# Image tracking
-.scripts/image-tracker.sh               # Check all images
-.scripts/image-tracker.sh --quick       # Only show stale images
-```
+---
 
 ## Configuration
 
 ### Root `.env`
 
-The main configuration file. Copy from `.env.example` on first run (or let `setup.sh` handle it):
+Copy from `.env.example` on first run. Key settings:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `DOCKER_STACKS` | *(10 default categories)* | Space-separated stack directories — controls startup order |
-| `APP_DATA_DIR` | `./App-Data` | Persistent container data directory |
+| `DOCKER_STACKS` | *(10 categories)* | Space-separated stack directories — controls startup order |
+| `APP_DATA_DIR` | `./App-Data` | Persistent container data |
 | `PUID` / `PGID` | `1000` | User/Group IDs for file permissions |
-| `PROXY_DOMAIN` | `example.com` | Domain for reverse proxy routing |
 | `TZ` | `UTC` | Timezone for all containers |
-| `NTFY_URL` | *(empty)* | NTFY notification endpoint |
-| `SERVER_NAME` | `Docker Server` | Server name in notifications |
-| `PORTAINER_URL` | *(empty)* | Portainer dashboard URL |
-| `DOCKER_COMPOSE_VERSION` | `auto` | `auto`, `v1`, or `v2` |
-| `REMOVE_VOLUMES_ON_STOP` | `false` | Remove named volumes on stop |
-| `CONTINUE_ON_FAILURE` | `true` | Continue if a stack fails |
-| `SKIP_HEALTHCHECK_WAIT` | `false` | Skip `--wait` flag on startup |
+| `TRAEFIK_DOMAIN` | *(empty)* | Domain for reverse proxy routing |
+| `CF_DNS_API_TOKEN` | *(empty)* | Cloudflare API token for DNS + wildcard TLS |
+| `DDNS_ENABLED` | `false` | Auto-update Cloudflare A record on IP change |
 | `API_PORT` | `9876` | REST API server port |
-| `API_AUTH_ENABLED` | `true` | Require authentication for API endpoints |
+| `API_AUTH_ENABLED` | `false` | Authentication (auto-enabled on 0.0.0.0) |
+| `API_RATE_LIMIT` | `120` | Max requests per 60-second window |
+| `API_SINGLE_SESSION` | `true` | New login revokes previous tokens |
 
-### Stack Configuration
+See `.env.example` for all 72 documented settings.
 
-The `DOCKER_STACKS` variable controls which stacks exist and their startup order:
-
-```bash
-# Default: 10 category directories under Stacks/
-DOCKER_STACKS="core-infrastructure networking-security monitoring-management development-tools media-services web-applications storage-backup communication-collaboration entertainment-personal miscellaneous-services"
-```
-
-Add, remove, or reorder categories to fit your environment. `setup.sh` creates directories for any categories listed that don't yet exist. Shutdown order is automatically reversed.
-
-### Advanced Settings (`.config/settings.cfg`)
-
-| Category | Key Settings |
-|----------|-------------|
-| **Startup Behavior** | `SHOW_STARTUP_BANNER`, `SHOW_SYSTEM_INFO`, `SERVICE_START_DELAY`, `STACK_START_TIMEOUT` |
-| **Health Checks** | `ENABLE_POST_STARTUP_HEALTH_CHECK`, `HEALTH_CHECK_DELAY`, `INCLUDE_RESOURCE_METRICS` |
-| **Logging** | `LOG_LEVEL`, `LOG_DATE_FORMAT`, `LOG_MAX_SIZE`, `LOG_BACKUP_COUNT`, `LOG_RETENTION_DAYS` |
-| **Colors** | `COLOR_MODE` (auto/always/never), `COLOR_THEME` (dark/light/high-contrast) |
-| **Docker** | `DOCKER_TIMEOUT`, `SERVICE_START_DELAY`, `SERVICE_STOP_DELAY`, `MAX_PARALLEL_OPERATIONS` |
-| **Notifications** | `ENABLE_NOTIFICATIONS`, `NOTIFICATION_LEVELS`, `WEBHOOK_URL`, `EMAIL_ALERTS` |
-
-### Per-Stack `.env`
-
-Each stack in `Stacks/` has its own `.env` for stack-specific overrides. By default they inherit from the root `.env`.
-
-### Environment Overrides
-
-Set `ENVIRONMENT` to change behavior profiles:
-
-| Environment | Effect |
-|------------|--------|
-| `production` | Default. INFO logging, notifications on. |
-| `development` | DEBUG logging, verbose mode, function tracing |
-| `testing` | DEBUG logging, mocked external calls |
-| `staging` | INFO logging, notifications + metrics on |
-
-Runtime override: `LOG_LEVEL=DEBUG ./start.sh`
-
-## Architecture
-
-### Directory Structure
+### Startup Order
 
 ```
-Docker-Compose-Skeleton/
-├── start.sh                    # Main entry point (startup sequence)
-├── stop.sh                     # Graceful shutdown
-├── restart.sh                  # Stop + Start wrapper
-├── status.sh                   # Container status viewer
-├── setup.sh                    # First-run setup
-├── .env.example                # Configuration template
-├── .env                        # Your configuration (gitignored)
-├── .config/
-│   ├── settings.cfg            # Application settings & defaults
-│   └── palette.sh              # Terminal color palette system
-├── .lib/
-│   ├── logger.sh               # Enhanced logging system (v3.0)
-│   ├── banner.sh               # ASCII art banner library
-│   ├── docker-utils.sh         # Docker Compose detection
-│   ├── helpers.sh              # Utility functions
-│   ├── environment.sh          # Environment verification
-│   ├── error_handling.sh       # Graceful error handling
-│   └── debugger.sh             # Debug mode support
-├── .scripts/
-│   ├── api-server.sh           # REST API server (60+ endpoints)
-│   ├── run.sh                  # Service startup library (v3.0)
-│   ├── stop.sh                 # Service shutdown library (v3.0)
-│   ├── health-check.sh         # Container health monitoring
-│   ├── stack-manager.sh        # Individual stack management CLI
-│   ├── config-validator.sh     # Configuration validator
-│   ├── maintenance.sh          # Docker maintenance & cleanup
-│   ├── docker-network-info.sh  # Network visualization
-│   ├── image-tracker.sh        # Image update tracker
-│   ├── system-info.sh          # System information reporter
-│   ├── logs-viewer.sh          # Interactive log viewer
-│   ├── update.sh               # Docker Compose updater
-│   ├── update_all_stacks.sh    # Intelligent stack updater
-│   ├── clean-up.sh             # Unused volume cleanup
-│   ├── backup-server.sh        # Backup system
-│   ├── ntfy-status.sh          # Start status notifications
-│   ├── ntfy-status-stop.sh     # Stop status notifications
-│   ├── ntfy-status-restart.sh  # Restart status notifications
-│   └── wait-for-it.sh          # TCP port availability checker
-├── .templates/                 # 28 deployable service templates
-│   ├── traefik/                # Includes full config/ scaffolding
-│   ├── authelia/
-│   ├── nginx-proxy-manager/
-│   └── ...                     # See template list above
-├── .api-auth/                  # API authentication data (gitignored)
-├── Stacks/
-│   ├── core-infrastructure/    # Redis (placeholder)
-│   ├── networking-security/    # Whoami (placeholder)
-│   ├── monitoring-management/  # Alpine heartbeat
-│   ├── development-tools/      # Alpine uptime counter
-│   ├── media-services/         # Nginx static page (:8081)
-│   ├── web-applications/       # Nginx static page (:8082)
-│   ├── storage-backup/         # Alpine file writer
-│   ├── communication-collaboration/  # Alpine heartbeat
-│   ├── entertainment-personal/ # Alpine heartbeat
-│   └── miscellaneous-services/ # Alpine healthcheck demo
-├── App-Data/                   # Container volumes (gitignored)
-└── logs/                       # Log files (gitignored)
+1. core-infrastructure     →  6. web-applications
+2. networking-security     →  7. storage-backup
+3. monitoring-management   →  8. communication-collaboration
+4. development-tools       →  9. entertainment-personal
+5. media-services          → 10. miscellaneous-services
 ```
 
-### Startup Order (Dependency Chain)
+Shutdown runs in exact reverse.
 
-```
-1. core-infrastructure          6. web-applications
-2. networking-security          7. storage-backup
-3. monitoring-management        8. communication-collaboration
-4. development-tools            9. entertainment-personal
-5. media-services              10. miscellaneous-services
-```
-
-Shutdown runs in exact reverse order.
-
-### Startup Sequence
-
-When you run `./start.sh`, this happens:
-
-1. **Environment verification** — checks Docker, Compose, directories
-2. **Docker Compose update** — auto-updates the binary (v1 only; v2 is package-managed)
-3. **Volume cleanup** — removes unreferenced resources
-4. **Service startup** — starts all stacks in dependency order with progress bars and per-stack timing
-5. **Image updates** — pulls latest images, detects changes via SHA256, rolling restart
-6. **Health monitoring** — comprehensive container health check with color-coded status table
-7. **API server** — starts the REST API on port 9876
-
-### Logger System
-
-The Enhanced Logger (v3.0, 1200+ lines) provides 50+ log functions with colored console output and plain-text file logging:
-
-- **20+ log levels**: `log_info`, `log_success`, `log_warning`, `log_error`, `log_debug`, `log_critical`, plus extended variants
-- **Bold/no-date/combined variants**: `log_bold_success`, `log_nodate_info`, `log_bold_nodate_warning`
-- **Progress bars**: `log_progress "Starting stacks" 3 10` with Unicode block characters
-- **Step tracking**: `log_step 1 6 "Verifying environment"`
-- **Named timers**: `log_timer_start "pull"` / `log_timer_stop "pull"` with human-readable durations
-- **Table formatting**: `log_table "Stack|Status|Duration" "core|OK|12s"` with box-drawing characters
-- **Session summaries**: Duration, error/warning counts, entry totals in a formatted box
-
-### Notifications
-
-Push notifications via [NTFY](https://ntfy.sh). Set `NTFY_URL` in `.env` to enable. Notifications fire for:
-- Service start (critical stacks)
-- Service failure (with Portainer action button)
-- Shutdown completion
-- Container health issues
-
-Leave `NTFY_URL` empty to disable all notifications.
+---
 
 ## DCS Manager UI
 
-A companion desktop application for managing Docker Compose Skeleton servers with a dark glassmorphism UI. See [Docker-Compose-Skeleton-UI](https://github.com/scotthowson/Docker-Compose-Skeleton-UI).
+A companion Electron desktop app with glassmorphism dark theme UI. See [Docker-Compose-Skeleton-UI](https://github.com/scotthowson/Docker-Compose-Skeleton-UI).
 
 **Stack:** Electron + React + Vite + Tailwind CSS + Zustand + TypeScript
 
-**Features:**
-- **Setup Wizard** — 5-step guided first-run configuration (connect, admin account, server config, stacks, review)
-- Live dashboard with system metrics, memory, disk, and container status
-- Stack management — start, stop, restart, pull with real-time status
-- Template browser — deploy any of the 28 templates with a form-based UI
-- Container control — inspect, logs, start, stop individual containers
-- Compose editor — edit docker-compose.yml and .env files in-browser
-- Network and volume management
-- Notification center with alerts
-- Command palette with keyboard shortcuts
+**37 pages** including: Dashboard, Containers, Stacks, Templates, Health Monitor, Uptime, Trends, Networks, Volumes, Images, Logs, Terminal, Export, Settings, Users, Plugins, and more.
 
-## Customizing Stacks
-
-Each stack ships with a minimal placeholder container. To add your real services:
-
-1. Edit `Stacks/<category>/docker-compose.yml` with your services
-2. Add stack-specific variables to `Stacks/<category>/.env`
-3. Run `./start.sh` to deploy
-
-Or use the template system to deploy pre-configured services into any stack.
-
-The placeholder containers use `skeleton-*` naming, so they won't conflict with your real services.
+---
 
 ## Requirements
 
-- **Bash 4+** (uses associative arrays, `declare -g`)
-- **Docker** with either:
-  - Docker Compose plugin v2 (`docker compose`) — preferred
-  - Legacy docker-compose binary v1
-- **jq** for API server JSON processing
-- **python3** for PBKDF2 password hashing (API auth)
-- **curl** for NTFY notifications (optional)
-- **tput** for color support (standard on most systems)
-- **bc** for size calculations in maintenance tools (optional)
+| Dependency | Required | Purpose |
+|------------|----------|---------|
+| **Bash 4+** | Yes | Associative arrays, `declare -g`, `${var,,}` |
+| **Docker** | Yes | Container runtime |
+| **Docker Compose v2** | Yes | Stack orchestration (`docker compose` plugin) |
+| **jq** | Yes | JSON processing for the API server |
+| **python3** | Yes | PBKDF2 password hashing, privilege escalation |
+| **curl** | Yes | Health checks, notifications, updates |
+| **git** | Yes | DCS updates, plugin installation |
+| **openssl** | Yes | Token generation, TLS support |
+| **socat** or **ncat** | Yes | API server TCP listener |
+| rsync | Recommended | Backups and snapshots |
+| tar | Recommended | Backup/restore archives |
+| xxd | Recommended | Hex encoding for tokens |
+| perl | Recommended | ANSI code stripping in log output |
+
+`./setup.sh` detects your distro and offers to install all dependencies automatically.
+
+**Supported distros:** Ubuntu, Debian, Fedora, RHEL, CentOS, Arch, Manjaro, openSUSE, Alpine, Void Linux, NixOS
+
+---
 
 ## License
 
