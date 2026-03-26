@@ -8,6 +8,7 @@ services:
     ports:
       - "8084:80"
 
+
   docker-socket-proxy:
     container_name: Docker-Socket
     image: tecnativa/docker-socket-proxy:latest
@@ -49,7 +50,7 @@ services:
     environment:
       - TZ=UTC
       - DOCKER_HOST=tcp://Docker-Socket:2375
-      - CF_DNS_API_TOKEN=REDACTED_CF_TOKEN
+      - CF_DNS_API_TOKEN=${CF_DNS_API_TOKEN}
     networks:
       - default
       - proxy
@@ -65,6 +66,46 @@ services:
       retries: 3
       start_period: 20s
 
+  authelia:
+    container_name: Authelia
+    image: authelia/authelia:latest
+    restart: unless-stopped
+    environment:
+      - TZ=UTC
+    volumes:
+      - ./App-Data/Authelia/config:/config
+    ports:
+      - "9091:9091"
+    expose:
+      - 9091
+    networks:
+      - default
+      - proxy
+    depends_on:
+      authelia-redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:9091/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  authelia-redis:
+    container_name: Authelia-Redis
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: redis-server --save 60 1 --loglevel warning
+    volumes:
+      - ./App-Data/Authelia/redis:/data
+    expose:
+      - 6379
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
 networks:
   proxy:
     name: proxy

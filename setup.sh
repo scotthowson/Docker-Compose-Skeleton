@@ -150,6 +150,20 @@ _info "App-Data target : $APP_DATA_DIR"
 _info "Running as user : ${CURRENT_USER}:${CURRENT_GROUP}"
 
 # =============================================================================
+# PRE-CHECK: Docker must be installed before proceeding
+# =============================================================================
+
+if ! command -v docker >/dev/null 2>&1; then
+    echo ""
+    _warn "Docker is NOT installed on this system."
+    _info "DCS requires Docker Engine to manage containers."
+    _info "Install Docker first: https://docs.docker.com/engine/install/"
+    echo ""
+    _fail "Cannot continue without Docker. Install it and run ./setup.sh again."
+    exit 1
+fi
+
+# =============================================================================
 # STEP 1: Environment File
 # =============================================================================
 
@@ -763,7 +777,21 @@ if [[ -f "$SETUP_COMPLETE_MARKER" ]]; then
             sleep 1
             if kill -0 "$(cat "$API_PID_FILE")" 2>/dev/null; then
                 _ok "API server started (PID $(cat "$API_PID_FILE"))"
-                _info "Listening on http://${HOST_IP}:${API_PORT}"
+                # Verify the port is actually responding (not just process alive)
+                local _api_ready=false
+                for _i in $(seq 1 10); do
+                    if curl -s -o /dev/null --max-time 2 "http://127.0.0.1:${API_PORT}/" 2>/dev/null; then
+                        _api_ready=true
+                        break
+                    fi
+                    sleep 1
+                done
+                if [[ "$_api_ready" == "true" ]]; then
+                    _ok "API responding on http://${HOST_IP}:${API_PORT}"
+                else
+                    _warn "API process running but port ${API_PORT} not responding yet"
+                    _info "It may still be initializing — check logs/api-server.log"
+                fi
                 _info "Logs: $BASE_DIR/logs/api-server.log"
             else
                 _fail "API server failed to start — check logs/api-server.log"

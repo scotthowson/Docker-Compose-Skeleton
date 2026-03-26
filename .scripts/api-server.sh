@@ -654,24 +654,28 @@ _api_generate_salt() {
     echo "$salt"
 }
 
-# Read a JSON auth file (returns contents)
+# Read a JSON auth file (returns contents, with shared flock)
 _api_read_auth_file() {
     local file="$API_AUTH_DIR/$1"
-    if [[ -f "$file" ]]; then
-        cat "$file" 2>/dev/null
+    [[ -f "$file" ]] || { echo '[]'; return; }
+    if command -v flock >/dev/null 2>&1; then
+        (flock -s -w 2 200; cat "$file" 2>/dev/null) 200>"$file.lock"
     else
-        echo '[]'
+        cat "$file" 2>/dev/null
     fi
 }
 
-# Write a JSON auth file (restricted permissions)
+# Write a JSON auth file (exclusive flock + restricted permissions)
 _api_write_auth_file() {
     local file="$API_AUTH_DIR/$1"
     local content="$2"
-    # Ensure dir exists, then write atomically
     [[ -d "$API_AUTH_DIR" ]] || mkdir -p "$API_AUTH_DIR" 2>/dev/null
-    printf '%s' "$content" > "$file" 2>/dev/null
-    chmod 600 "$file" 2>/dev/null
+    if command -v flock >/dev/null 2>&1; then
+        (flock -w 2 200; printf '%s' "$content" > "$file" 2>/dev/null; chmod 600 "$file" 2>/dev/null) 200>"$file.lock"
+    else
+        printf '%s' "$content" > "$file" 2>/dev/null
+        chmod 600 "$file" 2>/dev/null
+    fi
     return 0
 }
 
@@ -1757,6 +1761,19 @@ handle_status() {
     _api_success "{\"timestamp\": \"$(date -u '+%Y-%m-%dT%H:%M:%SZ')\", \"hostname\": \"$(_api_json_escape "$(hostname)")\", \"uptime_seconds\": $uptime_seconds, \"docker\": {\"containers\": {\"total\": $total_containers, \"running\": $running_containers, \"stopped\": $stopped_containers}, \"images\": $total_images, \"volumes\": $total_volumes, \"networks\": $total_networks}, \"stacks\": {\"total\": ${#stacks[@]}, \"running\": $running_stacks}, \"system\": {\"load_average\": $load_avg, \"memory_mb\": {\"total\": $mem_total, \"available\": $mem_available}, \"disk\": $disk_usage, \"cpu_count\": $cpu_count}}"
 }
 
+# Internal variant — returns JSON to stdout (used by export handler)
+handle_system_info_internal() {
+    local load_avg mem_total mem_available uptime_seconds cpu_count disk_usage
+    load_avg=$(awk '{printf "[%s, %s, %s]", $1, $2, $3}' /proc/loadavg 2>/dev/null || echo "[0,0,0]")
+    mem_total=$(awk '/MemTotal/ {printf "%d", $2/1024}' /proc/meminfo 2>/dev/null || echo 0)
+    mem_available=$(awk '/MemAvailable/ {printf "%d", $2/1024}' /proc/meminfo 2>/dev/null || echo 0)
+    uptime_seconds=$(awk '{printf "%d", $1}' /proc/uptime 2>/dev/null || echo 0)
+    cpu_count=$(nproc 2>/dev/null || echo 0)
+    disk_usage=$(df -h / 2>/dev/null | tail -1 | awk '{printf "{\"total\":\"%s\",\"used\":\"%s\",\"available\":\"%s\",\"percent\":\"%s\"}", $2, $3, $4, $5}')
+    printf '{"hostname":"%s","uptime_seconds":%d,"system":{"load_average":%s,"memory_mb":{"total":%d,"available":%d},"disk":%s,"cpu_count":%d}}' \
+        "$(_api_json_escape "$(hostname)")" "$uptime_seconds" "$load_avg" "$mem_total" "$mem_available" "${disk_usage:-{}}" "$cpu_count"
+}
+
 handle_health() {
     local -a results=()
     local total=0 healthy=0 unhealthy=0 stopped=0
@@ -1819,6 +1836,31 @@ handle_health() {
     fi
 
     _api_success "{\"status\": \"$overall\", \"summary\": {\"total\": $total, \"healthy\": $healthy, \"unhealthy\": $unhealthy, \"stopped\": $stopped}, \"containers\": $containers_json, \"api\": {\"uptime_seconds\": $api_uptime, \"requests_total\": ${api_requests:-0}, \"errors_total\": ${api_errors:-0}, \"memory_kb\": ${api_mem_kb:-0}, \"pid\": ${api_pid_val:-0}}}"
+}
+
+# Internal variant — returns JSON to stdout (used by export handler)
+handle_health_internal() {
+    local -a results=()
+    local total=0 healthy=0 unhealthy=0 stopped=0
+    local inspect_data="" all_cids
+    all_cids=$(timeout 5 docker ps -a -q 2>/dev/null | tr '\n' ' ')
+    if [[ -n "$all_cids" ]] && command -v jq >/dev/null 2>&1; then
+        inspect_data=$(timeout 10 docker inspect $all_cids 2>/dev/null | jq -r '.[] | "\(.Name | ltrimstr("/"))\t\(.State.Status)\t\(if .State.Health then .State.Health.Status else "none" end)"' 2>/dev/null) || inspect_data=""
+    fi
+    while IFS=$'\t' read -r name state health; do
+        [[ -z "$name" ]] && continue
+        name="${name#/}"; total=$(( total + 1 ))
+        if [[ "$state" != "running" ]]; then stopped=$(( stopped + 1 ))
+        elif [[ "$health" == "unhealthy" ]]; then unhealthy=$(( unhealthy + 1 ))
+        else healthy=$(( healthy + 1 )); fi
+        results+=("{\"name\":\"$(_api_json_escape "$name")\",\"state\":\"$state\",\"health\":\"$health\"}")
+    done <<< "$inspect_data"
+    local overall="healthy"
+    (( unhealthy >= 3 )) && overall="critical"
+    (( unhealthy > 0 && unhealthy < 3 )) && overall="degraded"
+    local cj; cj=$(printf '%s,' "${results[@]}"); cj="[${cj%,}]"
+    printf '{"status":"%s","summary":{"total":%d,"healthy":%d,"unhealthy":%d,"stopped":%d},"containers":%s}' \
+        "$overall" "$total" "$healthy" "$unhealthy" "$stopped" "$cj"
 }
 
 handle_stacks() {
@@ -3852,11 +3894,17 @@ handle_auth_factory_reset() {
             disown
         fi
 
-        # Remove App-Data directories in background (can be slow for root-owned files)
+        # Remove App-Data directories in background (handles root-owned files via docker alpine)
         (
             if [[ -d "$stacks_dir" ]]; then
                 for d in "$stacks_dir"/*/; do
-                    [[ -d "$d" && -d "$d/App-Data" ]] && rm -rf "$d/App-Data" 2>/dev/null
+                    [[ -d "$d" && -d "$d/App-Data" ]] || continue
+                    # Try normal rm first, then use docker for root-owned files
+                    rm -rf "$d/App-Data" 2>/dev/null
+                    if [[ -d "$d/App-Data" ]]; then
+                        docker run --rm -v "$d/App-Data:/cleanup" alpine rm -rf /cleanup 2>/dev/null || true
+                        rm -rf "$d/App-Data" 2>/dev/null || true
+                    fi
                 done
             fi
         ) &
@@ -6877,9 +6925,10 @@ _ddns_update_loop() {
             last_ip="$current_ip"
         fi
 
-        # Also scan custom_routes for subdomains that need DNS records
-        # Creates CNAME records for any route files that don't have DNS entries yet
-        if [[ -n "$current_ip" ]]; then
+        # On IP change, also scan custom_routes for subdomains that need DNS records.
+        # Only runs when IP changes (not every cycle) to avoid hitting CF rate limits.
+        if [[ -n "$current_ip" && "$current_ip" != "${_last_route_sync_ip:-}" ]]; then
+            _last_route_sync_ip="$current_ip"
             local routes_dir=""
             local _sd
             for _sd in "$COMPOSE_DIR"/*/App-Data/Traefik/custom_routes; do
@@ -6908,6 +6957,7 @@ _ddns_update_loop() {
                             "$cf_api/zones/$zone_id/dns_records" >/dev/null 2>&1
                         printf '[%s] DDNS sync: created CNAME %s → %s\n' "$(date -Iseconds)" "$route_fqdn" "$domain" >> "$log_file"
                     fi
+                    sleep 2  # Pace CF API calls to avoid rate limits
                 done < <(find "$routes_dir" -name '*.yml' -not -name '.reload' 2>/dev/null)
             fi
         fi
@@ -7854,15 +7904,17 @@ handle_traefik_status() {
     local traefik_domain=""
     local traefik_routes_dir=""
 
-    # Find the Traefik custom_routes directory across all stacks
+    # Find the Traefik custom_routes directory — only in the stack that runs Traefik
     local _check_stack
     for _check_stack in $(_api_get_stacks); do
         local _check_appdata="${APP_DATA_DIR:-$COMPOSE_DIR/$_check_stack/App-Data}"
         [[ "$_check_appdata" == ./* ]] && _check_appdata="$COMPOSE_DIR/$_check_stack/${_check_appdata#./}"
         if [[ -d "$_check_appdata/Traefik/custom_routes" ]]; then
-            traefik_active="true"
-            traefik_routes_dir="$_check_appdata/Traefik/custom_routes"
-            break
+            if grep -q 'container_name: Traefik\|image: traefik' "$COMPOSE_DIR/$_check_stack/docker-compose.yml" 2>/dev/null; then
+                traefik_active="true"
+                traefik_routes_dir="$_check_appdata/Traefik/custom_routes"
+                break
+            fi
         fi
     done
 
@@ -7956,6 +8008,26 @@ handle_template_deploy() {
 
     local vars
     vars=$(printf '%s' "$body" | jq -r '.variables // {} | to_entries[] | "\(.key)=\(.value)"' 2>/dev/null)
+
+    # Auto-generate empty secret/key variables (e.g., SECRET_ENCRYPTION_KEY, JWT_SECRET)
+    if [[ -f "$tdir/template.json" ]] && command -v jq >/dev/null 2>&1; then
+        local _gen_vars
+        _gen_vars=$(jq -r '.variables[]? | select(.generate != null or (.name | test("SECRET|_KEY$|ENCRYPTION"))) | .name' "$tdir/template.json" 2>/dev/null)
+        for _gv in $_gen_vars; do
+            local _gv_val
+            _gv_val=$(printf '%s' "$body" | jq -r --arg k "$_gv" '.variables[$k] // empty' 2>/dev/null)
+            if [[ -z "$_gv_val" ]]; then
+                _gv_val=$(openssl rand -hex 32 2>/dev/null || head -c 32 /dev/urandom | xxd -p -c 64 2>/dev/null)
+                # Replace the empty entry in vars (not append — first match wins in substitution)
+                if echo "$vars" | grep -q "^${_gv}="; then
+                    vars=$(echo "$vars" | sed "s|^${_gv}=.*|${_gv}=${_gv_val}|")
+                else
+                    vars+=$'\n'"${_gv}=${_gv_val}"
+                fi
+            fi
+        done
+    fi
+
     while IFS='=' read -r key val; do
         [[ -z "$key" ]] && continue
         # B1: Validate key is a legal env var name
@@ -8338,6 +8410,41 @@ handle_template_deploy() {
     done <<< "$template_services"
     services_json+="]"
 
+    # -----------------------------------------------------------------------
+    # Detect Traefik — needed by config generation (Authelia routes) and auto-routing.
+    # Checks both existing App-Data AND the deploy request variables.
+    # -----------------------------------------------------------------------
+    local traefik_routes_dir="" traefik_domain=""
+    for _check_stack in $(_api_get_stacks); do
+        local _check_appdata="${APP_DATA_DIR:-$COMPOSE_DIR/$_check_stack/App-Data}"
+        [[ "$_check_appdata" == ./* ]] && _check_appdata="$COMPOSE_DIR/$_check_stack/${_check_appdata#./}"
+        if [[ -d "$_check_appdata/Traefik/custom_routes" ]]; then
+            # Verify this stack actually runs Traefik (not a stale artifact)
+            if grep -q 'container_name: Traefik\|image: traefik' "$COMPOSE_DIR/$_check_stack/docker-compose.yml" 2>/dev/null; then
+                traefik_routes_dir="$_check_appdata/Traefik/custom_routes"
+                break
+            fi
+        fi
+    done
+    # Domain: check .env files, then request variables, then root .env PROXY_DOMAIN
+    for _env_file in "$COMPOSE_DIR"/*/".env" "$BASE_DIR/.env"; do
+        [[ -f "$_env_file" ]] || continue
+        local _d
+        _d=$(grep -m1 '^TRAEFIK_DOMAIN=' "$_env_file" 2>/dev/null | cut -d'=' -f2- | tr -d '"' | tr -d "'")
+        if [[ -n "$_d" ]]; then traefik_domain="$_d"; break; fi
+    done
+    # Fallback: request variables (critical for first-time Traefik deploy)
+    [[ -z "$traefik_domain" ]] && traefik_domain=$(printf '%s' "$body" | jq -r '.variables.TRAEFIK_DOMAIN // empty' 2>/dev/null)
+    # Fallback: PROXY_DOMAIN from .env
+    if [[ -z "$traefik_domain" ]]; then
+        for _env_file in "$COMPOSE_DIR"/*/".env" "$BASE_DIR/.env"; do
+            [[ -f "$_env_file" ]] || continue
+            local _pd
+            _pd=$(grep -m1 '^PROXY_DOMAIN=' "$_env_file" 2>/dev/null | cut -d'=' -f2- | tr -d '"' | tr -d "'")
+            if [[ -n "$_pd" ]]; then traefik_domain="$_pd"; break; fi
+        done
+    fi
+
     # Deploy config files BEFORE auto-start so they exist when containers mount volumes
     if [[ -d "$tdir/config" ]]; then
         local config_target_name
@@ -8350,12 +8457,32 @@ handle_template_deploy() {
                 app_data="$target_dir/${app_data#./}"
             fi
             local config_target="$app_data/$config_target_name"
-            mkdir -p "$config_target"
-            # rsync is more reliable for recursive copies; fall back to cp -a
-            if command -v rsync >/dev/null 2>&1; then
-                rsync -a --ignore-existing "$tdir/config/" "$config_target/" 2>/dev/null || true
+            mkdir -p "$config_target" 2>/dev/null || docker run --rm -v "$app_data:/d" alpine mkdir -p "/d/$config_target_name" 2>/dev/null || true
+
+            # CRITICAL: Docker creates DIRECTORIES for missing bind-mount targets.
+            # If a previous failed deploy left traefik.yml or acme.json as directories,
+            # rsync --ignore-existing will skip them. Remove any directory-as-file artifacts
+            # BEFORE copying so the real files can be placed.
+            while IFS= read -r _src_file; do
+                [[ -z "$_src_file" ]] && continue
+                local _rel="${_src_file#$tdir/config/}"
+                local _dst="$config_target/$_rel"
+                if [[ -d "$_dst" && -f "$_src_file" ]]; then
+                    rm -rf "$_dst"
+                fi
+            done < <(find "$tdir/config" -type f 2>/dev/null)
+
+            # Copy config files — use docker if target is root-owned
+            if [[ -w "$config_target" ]]; then
+                if command -v rsync >/dev/null 2>&1; then
+                    rsync -a --ignore-existing "$tdir/config/" "$config_target/" 2>/dev/null || true
+                else
+                    cp -an "$tdir/config/"* "$config_target/" 2>/dev/null || cp -a "$tdir/config/"* "$config_target/" 2>/dev/null || true
+                fi
             else
-                cp -a "$tdir/config/"* "$config_target/" 2>/dev/null || true
+                # Target is root-owned — use docker alpine to copy
+                docker run --rm -v "$tdir/config:/src:ro" -v "$config_target:/dst" alpine sh -c \
+                    'cp -rn /src/* /dst/ 2>/dev/null; cp -r /src/* /dst/ 2>/dev/null' || true
             fi
 
             # Create custom_routes subdirectories for ALL existing stacks
@@ -8413,9 +8540,279 @@ handle_template_deploy() {
                 done < <(find "$config_target" -type f \( -name '*.yml' -o -name '*.yaml' \) 2>/dev/null)
             fi
 
+            # Ensure traefik.yml and acme.json are FILES not directories.
+            # Docker creates directories for missing bind mount sources — if the config
+            # copy didn't run yet or was skipped, these may be directories which breaks Traefik.
+            for _critical_file in "traefik.yml" "acme.json"; do
+                local _cf_path="$config_target/$_critical_file"
+                if [[ -d "$_cf_path" ]]; then
+                    # Docker created a directory — remove it and copy the real file
+                    rm -rf "$_cf_path"
+                fi
+                if [[ ! -f "$_cf_path" ]]; then
+                    if [[ -f "$tdir/config/$_critical_file" ]]; then
+                        cp -a "$tdir/config/$_critical_file" "$_cf_path"
+                    else
+                        touch "$_cf_path"
+                    fi
+                fi
+            done
             # Ensure acme.json has secure permissions (required by Traefik)
-            if [[ -f "$config_target/acme.json" ]]; then
-                chmod 600 "$config_target/acme.json"
+            chmod 600 "$config_target/acme.json" 2>/dev/null
+        fi
+    fi
+
+    # Re-detect Traefik AFTER config copy — when deploying the Traefik template itself,
+    # the config copy above creates the custom_routes directory. The early detection at
+    # the top of the handler found nothing because the directory didn't exist yet.
+    if [[ -z "$traefik_routes_dir" ]]; then
+        for _check_stack in $(_api_get_stacks); do
+            local _check_appdata="${APP_DATA_DIR:-$COMPOSE_DIR/$_check_stack/App-Data}"
+            [[ "$_check_appdata" == ./* ]] && _check_appdata="$COMPOSE_DIR/$_check_stack/${_check_appdata#./}"
+            if [[ -d "$_check_appdata/Traefik/custom_routes" ]]; then
+                if grep -q 'container_name: Traefik\|image: traefik' "$COMPOSE_DIR/$_check_stack/docker-compose.yml" 2>/dev/null; then
+                    traefik_routes_dir="$_check_appdata/Traefik/custom_routes"
+                    break
+                fi
+            fi
+        done
+    fi
+
+    # -----------------------------------------------------------------------
+    # Authelia config generation — creates configuration.yml and users_database.yml
+    # when deploying the authelia template. Secrets are auto-generated.
+    # -----------------------------------------------------------------------
+    if [[ "$name" == "authelia" ]]; then
+        local _auth_base="${APP_DATA_DIR:-$target_dir/App-Data}"
+        [[ "$_auth_base" == ./* ]] && _auth_base="$target_dir/${_auth_base#./}"
+        local _auth_dir="$_auth_base/Authelia/config"
+        # Write to a temp dir first, then copy with docker (handles root-owned target dirs)
+        local _auth_tmp="/tmp/dcs-authelia-$$"
+        mkdir -p "$_auth_tmp"
+        # Also ensure target dirs exist
+        mkdir -p "$_auth_dir" 2>/dev/null || docker run --rm -v "$_auth_base:/d" alpine mkdir -p /d/Authelia/config 2>/dev/null || true
+
+        local _domain="${TRAEFIK_DOMAIN:-example.com}"
+        local _admin_user _admin_display _admin_email _admin_pass
+        _admin_user=$(printf '%s' "$body" | jq -r '.variables.AUTHELIA_ADMIN_USER // "admin"' 2>/dev/null)
+        _admin_display=$(printf '%s' "$body" | jq -r '.variables.AUTHELIA_ADMIN_DISPLAY // ""' 2>/dev/null)
+        [[ -z "$_admin_display" ]] && _admin_display="$_admin_user"
+        _admin_email=$(printf '%s' "$body" | jq -r '.variables.AUTHELIA_ADMIN_EMAIL // "admin@'$_domain'"' 2>/dev/null)
+        _admin_pass=$(printf '%s' "$body" | jq -r '.variables.AUTHELIA_ADMIN_PASSWORD // "changeme"' 2>/dev/null)
+
+        # Generate random secrets
+        local _jwt_secret _session_secret _storage_key
+        _jwt_secret=$(openssl rand -hex 32 2>/dev/null || head -c 64 /dev/urandom | xxd -p -c 64)
+        _session_secret=$(openssl rand -hex 32 2>/dev/null || head -c 64 /dev/urandom | xxd -p -c 64)
+        _storage_key=$(openssl rand -base64 32 2>/dev/null || head -c 32 /dev/urandom | base64)
+
+        # Hash the admin password with Argon2id (via docker if argon2 not installed)
+        local _hashed_pass=""
+        if command -v authelia >/dev/null 2>&1; then
+            _hashed_pass=$(authelia crypto hash generate argon2 --password "$_admin_pass" 2>/dev/null | grep 'Digest:' | sed 's/Digest: //')
+        fi
+        if [[ -z "$_hashed_pass" ]]; then
+            _hashed_pass=$(docker run --rm authelia/authelia:latest authelia crypto hash generate argon2 --password "$_admin_pass" 2>/dev/null | grep 'Digest:' | sed 's/Digest: //')
+        fi
+        if [[ -z "$_hashed_pass" ]]; then
+            # Fallback: use python3 argon2 if available
+            _hashed_pass=$(python3 -c "
+import hashlib, os, base64
+salt = os.urandom(16)
+h = hashlib.scrypt(b'$_admin_pass', salt=salt, n=65536, r=8, p=1, dklen=32)
+s64 = base64.b64encode(salt).decode().rstrip('=')
+h64 = base64.b64encode(h).decode().rstrip('=')
+print(f'\$argon2id\$v=19\$m=65536,t=3,p=4\${s64}\${h64}')
+" 2>/dev/null) || _hashed_pass='$argon2id$v=19$m=65536,t=3,p=4$CHANGE_ME_HASH'
+        fi
+
+        # Write configuration.yml (only if it doesn't exist — don't overwrite user edits)
+        # Always write config on deploy (overwrites container defaults and stale configs)
+        if true; then
+            cat > "$_auth_tmp/configuration.yml" << AUTHELIA_CONFIG_EOF
+---
+# =============================================================================
+# Authelia Configuration — Auto-generated by DCS
+# =============================================================================
+# Documentation: https://www.authelia.com/configuration/
+# =============================================================================
+
+server:
+  address: 'tcp://0.0.0.0:9091/'
+
+log:
+  level: info
+
+theme: dark
+
+identity_validation:
+  reset_password:
+    jwt_secret: '${_jwt_secret}'
+
+totp:
+  issuer: ${_domain}
+
+webauthn:
+  disable: false
+  display_name: Authelia
+  attestation_conveyance_preference: indirect
+  user_verification: preferred
+  timeout: 60s
+
+password_policy:
+  standard:
+    enabled: true
+    min_length: 8
+    max_length: 128
+    require_uppercase: true
+    require_lowercase: true
+    require_number: true
+    require_special: true
+
+authentication_backend:
+  file:
+    path: /config/users_database.yml
+    password:
+      algorithm: argon2id
+      iterations: 3
+      salt_length: 16
+      parallelism: 4
+      memory: 65536
+
+access_control:
+  default_policy: deny
+  rules:
+    - domain:
+        - "auth.${_domain}"
+      policy: bypass
+    - domain:
+        - "*.${_domain}"
+      subject:
+        - "group:admins"
+      policy: one_factor
+
+session:
+  name: authelia_session
+  secret: '${_session_secret}'
+  expiration: 1h
+  inactivity: 5m
+  cookies:
+    - domain: ${_domain}
+      authelia_url: 'https://auth.${_domain}'
+      default_redirection_url: 'https://dash.${_domain}'
+
+  redis:
+    host: Authelia-Redis
+    port: 6379
+
+regulation:
+  max_retries: 3
+  find_time: 2m
+  ban_time: 5m
+
+storage:
+  encryption_key: '${_storage_key}'
+  local:
+    path: /config/db.sqlite3
+
+notifier:
+  filesystem:
+    filename: /config/notifications.txt
+AUTHELIA_CONFIG_EOF
+        fi
+
+        # Write users_database.yml (only if it doesn't exist)
+        if true; then
+            cat > "$_auth_tmp/users_database.yml" << AUTHELIA_USERS_EOF
+---
+# =============================================================================
+# Authelia Users Database — Auto-generated by DCS
+# =============================================================================
+# Add users here. Passwords must be hashed with Argon2id.
+# Generate hashes:
+#   docker run --rm authelia/authelia:latest authelia crypto hash generate argon2 --password 'YOUR_PASSWORD'
+# =============================================================================
+
+users:
+  ${_admin_user}:
+    disabled: false
+    displayname: "${_admin_display}"
+    password: "${_hashed_pass}"
+    email: ${_admin_email}
+    groups:
+      - admins
+AUTHELIA_USERS_EOF
+        fi
+
+        # Copy generated configs from temp into target (handles root-owned dirs via docker)
+        if [[ -s "$_auth_tmp/configuration.yml" ]]; then
+            # Copy to target dir
+            cp -f "$_auth_tmp/configuration.yml" "$_auth_dir/" 2>/dev/null && \
+            cp -f "$_auth_tmp/users_database.yml" "$_auth_dir/" 2>/dev/null && \
+            chmod 600 "$_auth_dir/configuration.yml" "$_auth_dir/users_database.yml" 2>/dev/null || \
+            docker run --rm -v "$_auth_dir:/dst" -v "$_auth_tmp:/src" alpine sh -c \
+                "cp -f /src/configuration.yml /src/users_database.yml /dst/; chmod 600 /dst/configuration.yml /dst/users_database.yml" 2>/dev/null
+            # Cache for post-start re-apply (outside root-owned config dir)
+            local _cache_dir="$_auth_base/Authelia/.dcs-cache"
+            mkdir -p "$_cache_dir" 2>/dev/null || docker run --rm -v "$_auth_base/Authelia:/d" alpine mkdir -p /d/.dcs-cache 2>/dev/null
+            cp -f "$_auth_tmp/configuration.yml" "$_cache_dir/" 2>/dev/null && \
+            cp -f "$_auth_tmp/users_database.yml" "$_cache_dir/" 2>/dev/null || \
+            docker run --rm -v "$_cache_dir:/dst" -v "$_auth_tmp:/src" alpine sh -c \
+                "cp -f /src/configuration.yml /src/users_database.yml /dst/" 2>/dev/null
+        fi
+        rm -rf "$_auth_tmp"
+
+        # Create Traefik route file for auth.domain → Authelia:9091
+        if [[ -n "${traefik_routes_dir:-}" && -n "${traefik_domain:-}" ]]; then
+            mkdir -p "$traefik_routes_dir/$target_stack"
+            # Always write — overrides the auto-generated route to use auth. subdomain
+            if true; then
+                cat > "$traefik_routes_dir/$target_stack/authelia.yml" << AUTH_ROUTE_EOF
+# Auto-generated Traefik route for Authelia SSO portal
+http:
+  routers:
+    authelia-router:
+      entryPoints:
+        - "websecure"
+      rule: "Host(\`auth.${traefik_domain}\`)"
+      service: "authelia"
+      middlewares:
+        - "authelia-headers"
+        - "compress-gzip"
+      tls: {}
+
+  services:
+    authelia:
+      loadBalancer:
+        servers:
+          - url: "http://Authelia:9091"
+
+  middlewares:
+    authelia-headers:
+      headers:
+        browserXssFilter: true
+        customFrameOptionsValue: "SAMEORIGIN"
+        customResponseHeaders:
+          Cache-Control: "no-store"
+          Pragma: "no-cache"
+        sslProxyHeaders:
+          X-Forwarded-Proto: "https"
+        referrerPolicy: "same-origin"
+        forceSTSHeader: true
+        stsPreload: true
+        stsIncludeSubdomains: true
+        stsSeconds: 315360000
+
+    authelia-forwardauth:
+      forwardAuth:
+        address: "http://Authelia:9091/api/authz/forward-auth"
+        trustForwardHeader: true
+        authResponseHeaders:
+          - "Remote-User"
+          - "Remote-Groups"
+          - "Remote-Name"
+          - "Remote-Email"
+AUTH_ROUTE_EOF
             fi
         fi
     fi
@@ -8429,6 +8826,10 @@ handle_template_deploy() {
     # -----------------------------------------------------------------------
     _cloudflare_add_dns() {
         local subdomain="$1" domain="$2" cf_token="$3"
+        # Debug trace
+        printf '[%s] _cloudflare_add_dns called: sub=%s domain=%s token=%s\n' \
+            "$(date -Iseconds)" "$subdomain" "$domain" "${cf_token:0:8}..." \
+            >> "$BASE_DIR/.api-auth/cf-debug.log" 2>/dev/null
         [[ -z "$cf_token" || -z "$domain" || -z "$subdomain" ]] && return 0
         command -v curl >/dev/null 2>&1 || return 0
         command -v jq >/dev/null 2>&1 || return 0
@@ -8472,17 +8873,9 @@ handle_template_deploy() {
             printf '%s\n%s\n' "$domain" "$zone_id" > "$zone_cache" 2>/dev/null
         fi
 
-        # ── Check if any record already exists (A, AAAA, or CNAME) ──
-        local existing
-        existing=$(curl -s --max-time 10 "${cf_auth[@]}" \
-            "$cf_api/zones/$zone_id/dns_records?name=$fqdn" 2>/dev/null)
-        local existing_count
-        existing_count=$(printf '%s' "$existing" | jq -r '.result | length' 2>/dev/null || echo 0)
-        if [[ "$existing_count" -gt 0 ]]; then
-            return 0  # Record exists (any type) — skip
-        fi
-
         # ── Create CNAME: subdomain.domain.com → domain.com (proxied) ──
+        # Single attempt — no duplicate check (saves an API call, avoids rate limits).
+        # If the record already exists, CF returns an error which we silently ignore.
         local create_resp
         create_resp=$(curl -s --max-time 15 -X POST \
             "${cf_auth[@]}" \
@@ -8493,10 +8886,12 @@ handle_template_deploy() {
         local success
         success=$(printf '%s' "$create_resp" | jq -r '.success // false' 2>/dev/null)
 
-        # ── Audit log ──
+        # Debug: log result regardless of success
+        printf '[%s] CF create %s: success=%s resp=%s\n' \
+            "$(date -Iseconds)" "$fqdn" "$success" "$(printf '%s' "$create_resp" | head -c 200)" \
+            >> "$BASE_DIR/.api-auth/cf-debug.log" 2>/dev/null
         if [[ "$success" == "true" ]]; then
-            local _log="$BASE_DIR/.api-auth/cf-dns-audit.log"
-            printf '[%s] CREATED %s → %s (CNAME, proxied)\n' "$(date -Iseconds)" "$fqdn" "$domain" >> "$_log" 2>/dev/null
+            printf '[%s] CREATED %s → %s (CNAME, proxied)\n' "$(date -Iseconds)" "$fqdn" "$domain" >> "$BASE_DIR/.api-auth/cf-dns-audit.log" 2>/dev/null
         fi
 
         return 0
@@ -8510,46 +8905,12 @@ handle_template_deploy() {
     # which auto-discovers new .yml files (no restart needed).
     # Skip for the traefik template itself (it ships its own routes).
     # -----------------------------------------------------------------------
+    printf '[%s] AUTO-ROUTE CHECK: name=%s routes_dir=[%s] domain=[%s]\n' \
+        "$(date -Iseconds)" "$name" "$traefik_routes_dir" "$traefik_domain" \
+        >> "$BASE_DIR/.api-auth/cf-debug.log" 2>/dev/null
     if [[ "$name" != "traefik" ]]; then
-        # Find the Traefik custom_routes directory
-        local traefik_routes_dir=""
-        local _check_stack
-        for _check_stack in $(_api_get_stacks); do
-            local _check_appdata="${APP_DATA_DIR:-$COMPOSE_DIR/$_check_stack/App-Data}"
-            [[ "$_check_appdata" == ./* ]] && _check_appdata="$COMPOSE_DIR/$_check_stack/${_check_appdata#./}"
-            if [[ -d "$_check_appdata/Traefik/custom_routes" ]]; then
-                traefik_routes_dir="$_check_appdata/Traefik/custom_routes"
-                break
-            fi
-        done
-
-        if [[ -n "$traefik_routes_dir" ]]; then
-            # Read TRAEFIK_DOMAIN from .env files (stack envs first, then root)
-            local traefik_domain=""
-            local _env_file
-            for _env_file in "$COMPOSE_DIR"/*/".env" "$BASE_DIR/.env"; do
-                [[ -f "$_env_file" ]] || continue
-                local _domain
-                _domain=$(grep -m1 '^TRAEFIK_DOMAIN=' "$_env_file" 2>/dev/null | cut -d'=' -f2- | tr -d '"' | tr -d "'")
-                if [[ -n "$_domain" ]]; then
-                    traefik_domain="$_domain"
-                    break
-                fi
-            done
-            # Fallback to PROXY_DOMAIN if TRAEFIK_DOMAIN not found
-            if [[ -z "$traefik_domain" ]]; then
-                for _env_file in "$COMPOSE_DIR"/*/".env" "$BASE_DIR/.env"; do
-                    [[ -f "$_env_file" ]] || continue
-                    local _pdomain
-                    _pdomain=$(grep -m1 '^PROXY_DOMAIN=' "$_env_file" 2>/dev/null | cut -d'=' -f2- | tr -d '"' | tr -d "'")
-                    if [[ -n "$_pdomain" ]]; then
-                        traefik_domain="$_pdomain"
-                        break
-                    fi
-                done
-            fi
-
-            if [[ -n "$traefik_domain" && "$traefik_domain" != "example.com" ]]; then
+        # traefik_routes_dir and traefik_domain already computed above
+        if [[ -n "$traefik_routes_dir" && -n "$traefik_domain" && "$traefik_domain" != "example.com" ]]; then
                 mkdir -p "$traefik_routes_dir/$target_stack"
 
                 # Read CF_DNS_API_TOKEN for auto DNS record creation
@@ -8594,10 +8955,8 @@ handle_template_deploy() {
                 while IFS= read -r _svc_name; do
                     [[ -z "$_svc_name" ]] && continue
 
-                    # Skip if route file already exists for this service
-                    if [[ -f "$traefik_routes_dir/$target_stack/${_svc_name}.yml" ]]; then
-                        continue
-                    fi
+                    local _route_exists=false
+                    [[ -f "$traefik_routes_dir/$target_stack/${_svc_name}.yml" ]] && _route_exists=true
 
                     # Extract container_name for this service
                     local _container_name=""
@@ -8641,10 +9000,11 @@ handle_template_deploy() {
                         _protocol="https"
                     fi
 
-                    # Generate the route file
+                    # Generate the route file (skip if already exists — preserves user edits)
                     local _route_id
                     _route_id=$(printf '%s' "$_svc_name" | tr '[:upper:]' '[:lower:]' | tr -c '[:alnum:]-' '-')
 
+                    if [[ "$_route_exists" != "true" ]]; then
                     cat > "$traefik_routes_dir/$target_stack/${_svc_name}.yml" << ROUTE_EOF
 # =============================================================================
 # Auto-generated Traefik route for: $_svc_name
@@ -8664,8 +9024,7 @@ http:
       middlewares:
         - "traefik-chain"
         - "compress-gzip"
-      tls:
-        certResolver: "letsencrypt"
+      tls: {}
 
   services:
     ${_route_id}:
@@ -8673,9 +9032,20 @@ http:
         servers:
           - url: "${_protocol}://${_container_name}:${_container_port}"
 ROUTE_EOF
-                    # Auto-create Cloudflare DNS record (non-fatal, background)
+                    fi
+                    # Auto-create Cloudflare DNS record using the actual subdomain from the route file
+                    # (respects user-edited subdomains, not just the service name)
                     if [[ -n "$_cf_token" ]]; then
-                        _cloudflare_add_dns "$_svc_name" "$traefik_domain" "$_cf_token" &
+                        local _dns_sub="$_svc_name"
+                        # Extract subdomain from the route file's Host() rule if it exists
+                        local _route_file="$traefik_routes_dir/$target_stack/${_svc_name}.yml"
+                        if [[ -f "$_route_file" ]]; then
+                            local _host_sub
+                            _host_sub=$(grep -oP 'Host\(`\K[^.]+' "$_route_file" 2>/dev/null | head -1)
+                            [[ -n "$_host_sub" ]] && _dns_sub="$_host_sub"
+                        fi
+                        _cloudflare_add_dns "$_dns_sub" "$traefik_domain" "$_cf_token"
+                        sleep 1
                     fi
 
                     # Add proxy network to this service in the target compose file
@@ -8755,14 +9125,35 @@ print('\n'.join(result))
                     fi
                     printf '%s\n' "$_final_compose" > "$target_dir/docker-compose.yml"
                 fi
-            fi
+        fi
+    fi
+
+    # -----------------------------------------------------------------------
+    # Infrastructure DNS — create subdomains for core services (traefik, auth)
+    # These aren't port-scanned; they need explicit DNS entries.
+    # -----------------------------------------------------------------------
+    if [[ -n "${traefik_domain:-}" ]]; then
+        local _infra_cf_token="${CF_DNS_API_TOKEN:-}"
+        [[ -z "$_infra_cf_token" ]] && _infra_cf_token=$(printf '%s' "$body" | jq -r '.variables.CF_DNS_API_TOKEN // empty' 2>/dev/null)
+        [[ -z "$_infra_cf_token" ]] && _infra_cf_token=$(grep -m1 '^CF_DNS_API_TOKEN=' "$COMPOSE_DIR"/*/".env" "$BASE_DIR/.env" 2>/dev/null | head -1 | cut -d'=' -f2- | tr -d '"' | tr -d "'")
+
+        if [[ -n "$_infra_cf_token" ]]; then
+            case "$name" in
+                traefik)
+                    _cloudflare_add_dns "traefik" "$traefik_domain" "$_infra_cf_token"
+                    ;;
+                authelia)
+                    _cloudflare_add_dns "auth" "$traefik_domain" "$_infra_cf_token"
+                    ;;
+            esac
         fi
     fi
 
     # Auto-start if requested — run in background so API responds immediately.
     # After compose up, fix App-Data ownership for non-root images.
-    local auto_start
+    local auto_start connect_proxy
     auto_start=$(printf '%s' "$body" | jq -r '.auto_start // false' 2>/dev/null)
+    connect_proxy=$(printf '%s' "$body" | jq -r '.connect_proxy // false' 2>/dev/null)
     local started=false
     if [[ "$auto_start" == "true" ]]; then
         local env_up=()
@@ -8772,8 +9163,43 @@ print('\n'.join(result))
         local _ad="${APP_DATA_DIR:-$target_dir/App-Data}"
         [[ "$_ad" == ./* ]] && _ad="$target_dir/${_ad#./}"
         (
+            # Safety: ensure Traefik directories and files exist before compose up
+            mkdir -p "$_ad/Traefik/custom_routes" "$_ad/Traefik/cache" 2>/dev/null
+            # Ensure bind-mount targets are files, not directories (Docker creates dirs for missing targets)
+            for _bm in traefik.yml acme.json; do
+                local _bm_path="$_ad/Traefik/$_bm"
+                if [[ -d "$_bm_path" ]]; then
+                    rm -rf "$_bm_path"
+                    touch "$_bm_path"
+                    [[ "$_bm" == "acme.json" ]] && chmod 600 "$_bm_path"
+                fi
+            done
+
             # Start containers
             $DOCKER_COMPOSE_CMD -f "$target_dir/docker-compose.yml" "${env_up[@]}" up -d --force-recreate --remove-orphans >/dev/null 2>&1
+
+            # Connect routed containers to the 'proxy' network so Traefik can reach them.
+            # Controlled by the connect_proxy flag from the deploy request.
+            if [[ "$connect_proxy" == "true" ]] && docker network inspect proxy >/dev/null 2>&1; then
+                for _rf in "$traefik_routes_dir/$target_stack"/*.yml; do
+                    [[ -f "$_rf" ]] || continue
+                    local _cname
+                    _cname=$(grep -oP '(?<=url: "https?://)[^:]+' "$_rf" 2>/dev/null | head -1)
+                    [[ -n "$_cname" ]] && docker network connect proxy "$_cname" 2>/dev/null || true
+                done
+            fi
+
+            # Re-apply Authelia config AFTER compose up — the container's entrypoint
+            # overwrites our generated config with its default template on first start.
+            if [[ "$name" == "authelia" && -d "$_ad/Authelia/.dcs-cache" ]]; then
+                sleep 3
+                # Restore our generated config — container may have overwritten it with defaults
+                docker run --rm -v "$_ad/Authelia/.dcs-cache:/src" -v "$_ad/Authelia/config:/dst" alpine sh -c \
+                    "cp -f /src/configuration.yml /src/users_database.yml /dst/ 2>/dev/null; chmod 600 /dst/configuration.yml /dst/users_database.yml" 2>/dev/null
+                # Restart Authelia to pick up the correct config
+                $DOCKER_COMPOSE_CMD -f "$target_dir/docker-compose.yml" "${env_up[@]}" restart authelia >/dev/null 2>&1 || true
+            fi
+
             # Fix volume ownership — Docker creates bind-mount dirs as root
             # This runs AFTER compose creates the directories but containers may need a restart
             sleep 2
@@ -9283,20 +9709,64 @@ handle_template_undeploy() {
     local data_removed="false"
     local images_removed="false"
     local routes_removed="false"
-    if [[ "$remove_data" == "true" ]]; then
-        # Fast: Remove Traefik route files (instant, triggers reload)
-        local _routes_dir=""
-        for _sd in "$COMPOSE_DIR"/*/App-Data/Traefik/custom_routes; do
-            [[ -d "$_sd" ]] && _routes_dir="$_sd" && break
-        done
-        if [[ -n "$_routes_dir" ]]; then
-            for svc in "${services_to_remove[@]}"; do
-                [[ -f "$_routes_dir/$target_stack/${svc}.yml" ]] && rm -f "$_routes_dir/$target_stack/${svc}.yml" && routes_removed="true"
-            done
-            [[ "$routes_removed" == "true" ]] && touch "$_routes_dir/.reload" 2>/dev/null
-        fi
 
-        # Heavy cleanup in background — app-data, images, DNS (prevents HTTP timeout)
+    # ALWAYS remove Traefik route files and CF DNS on undeploy (these are infrastructure, not user data)
+    local _routes_dir=""
+    local _sd_stack
+    for _sd_stack in $(_api_get_stacks); do
+        local _sd_appdata="${APP_DATA_DIR:-$COMPOSE_DIR/$_sd_stack/App-Data}"
+        [[ "$_sd_appdata" == ./* ]] && _sd_appdata="$COMPOSE_DIR/$_sd_stack/${_sd_appdata#./}"
+        if [[ -d "$_sd_appdata/Traefik/custom_routes" ]] && \
+           grep -q 'container_name: Traefik\|image: traefik' "$COMPOSE_DIR/$_sd_stack/docker-compose.yml" 2>/dev/null; then
+            _routes_dir="$_sd_appdata/Traefik/custom_routes"
+            break
+        fi
+    done
+    # Collect actual subdomains from route files BEFORE deleting them
+    local -a _dns_subs_to_remove=()
+    if [[ -n "$_routes_dir" ]]; then
+        for svc in "${services_to_remove[@]}"; do
+            local _rf="$_routes_dir/$target_stack/${svc}.yml"
+            local _sub="$svc"
+            if [[ -f "$_rf" ]]; then
+                local _hsub
+                _hsub=$(grep -oP 'Host\(`\K[^.]+' "$_rf" 2>/dev/null | head -1)
+                [[ -n "$_hsub" ]] && _sub="$_hsub"
+                rm -f "$_rf" && routes_removed="true"
+            fi
+            _dns_subs_to_remove+=("$_sub")
+        done
+        [[ "$routes_removed" == "true" ]] && touch "$_routes_dir/.reload" 2>/dev/null
+    fi
+
+    # Remove CF DNS records in background (always, not gated on remove_data)
+    local _dns_list="${_dns_subs_to_remove[*]}"
+    (
+        local _cf_token="${CF_DNS_API_TOKEN:-}"
+        local _cf_domain="${TRAEFIK_DOMAIN:-}"
+        [[ -z "$_cf_token" ]] && _cf_token=$(grep -m1 '^CF_DNS_API_TOKEN=' "$COMPOSE_DIR"/*/".env" "$BASE_DIR/.env" 2>/dev/null | head -1 | cut -d'=' -f2- | tr -d '"' | tr -d "'")
+        [[ -z "$_cf_domain" ]] && _cf_domain=$(grep -m1 '^TRAEFIK_DOMAIN=' "$COMPOSE_DIR"/*/".env" "$BASE_DIR/.env" 2>/dev/null | head -1 | cut -d'=' -f2- | tr -d '"' | tr -d "'")
+        if [[ -n "$_cf_token" && -n "$_cf_domain" ]] && command -v curl >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
+            local cf_api="https://api.cloudflare.com/client/v4"
+            local zone_id=""
+            [[ -f "$BASE_DIR/.api-auth/.cf-zone-cache" ]] && zone_id=$(sed -n '2p' "$BASE_DIR/.api-auth/.cf-zone-cache" 2>/dev/null)
+            [[ -z "$zone_id" ]] && zone_id=$(curl -s --max-time 10 -H "Authorization: Bearer $_cf_token" "$cf_api/zones?name=$_cf_domain&status=active" 2>/dev/null | jq -r '.result[0].id // empty')
+            if [[ -n "$zone_id" ]]; then
+                for _dns_sub in $_dns_list; do
+                    local fqdn="${_dns_sub}.${_cf_domain}"
+                    local rec_id
+                    rec_id=$(curl -s --max-time 10 -H "Authorization: Bearer $_cf_token" "$cf_api/zones/$zone_id/dns_records?name=$fqdn" 2>/dev/null | jq -r '.result[0].id // empty')
+                    [[ -n "$rec_id" ]] && curl -s --max-time 10 -X DELETE -H "Authorization: Bearer $_cf_token" "$cf_api/zones/$zone_id/dns_records/$rec_id" >/dev/null 2>&1
+                    printf '[%s] DELETED %s (undeploy)\n' "$(date -Iseconds)" "$fqdn" >> "$BASE_DIR/.api-auth/cf-dns-audit.log" 2>/dev/null
+                    sleep 1
+                done
+            fi
+        fi
+    ) &
+    disown
+
+    if [[ "$remove_data" == "true" ]]; then
+        # Heavy cleanup in background — app-data, images (prevents HTTP timeout)
         local _app_data="${APP_DATA_DIR:-$target_dir/App-Data}"
         [[ "$_app_data" == ./* ]] && _app_data="$target_dir/${_app_data#./}"
         local _config_path
@@ -9317,26 +9787,6 @@ handle_template_undeploy() {
                 img=$(awk -v s="  ${svc}:" 'BEGIN{f=0} $0==s||index($0,s)==1{f=1;next} f&&/image:/{gsub(/.*image:[[:space:]]*/,"");gsub(/[[:space:]]*$/,"");print;exit} f&&/^  [a-zA-Z]/{exit}' "$_backup_file" 2>/dev/null)
                 [[ -n "$img" ]] && docker rmi "$img" 2>/dev/null || true
             done
-            # 4. Remove Cloudflare DNS records
-            local _cf_token="${CF_DNS_API_TOKEN:-}"
-            local _cf_domain="${TRAEFIK_DOMAIN:-}"
-            [[ -z "$_cf_token" ]] && _cf_token=$(grep -m1 '^CF_DNS_API_TOKEN=' "$COMPOSE_DIR"/*/".env" "$BASE_DIR/.env" 2>/dev/null | head -1 | cut -d'=' -f2- | tr -d '"' | tr -d "'")
-            [[ -z "$_cf_domain" ]] && _cf_domain=$(grep -m1 '^TRAEFIK_DOMAIN=' "$COMPOSE_DIR"/*/".env" "$BASE_DIR/.env" 2>/dev/null | head -1 | cut -d'=' -f2- | tr -d '"' | tr -d "'")
-            if [[ -n "$_cf_token" && -n "$_cf_domain" ]] && command -v curl >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
-                local cf_api="https://api.cloudflare.com/client/v4"
-                local zone_id=""
-                [[ -f "$BASE_DIR/.api-auth/.cf-zone-cache" ]] && zone_id=$(sed -n '2p' "$BASE_DIR/.api-auth/.cf-zone-cache" 2>/dev/null)
-                [[ -z "$zone_id" ]] && zone_id=$(curl -s --max-time 10 -H "Authorization: Bearer $_cf_token" "$cf_api/zones?name=$_cf_domain&status=active" 2>/dev/null | jq -r '.result[0].id // empty')
-                if [[ -n "$zone_id" ]]; then
-                    for svc in "${services_to_remove[@]}"; do
-                        local fqdn="${svc}.${_cf_domain}"
-                        local rec_id
-                        rec_id=$(curl -s --max-time 10 -H "Authorization: Bearer $_cf_token" "$cf_api/zones/$zone_id/dns_records?name=$fqdn" 2>/dev/null | jq -r '.result[0].id // empty')
-                        [[ -n "$rec_id" ]] && curl -s --max-time 10 -X DELETE -H "Authorization: Bearer $_cf_token" "$cf_api/zones/$zone_id/dns_records/$rec_id" >/dev/null 2>&1
-                        printf '[%s] DELETED %s (undeploy)\n' "$(date -Iseconds)" "$fqdn" >> "$BASE_DIR/.api-auth/cf-dns-audit.log" 2>/dev/null
-                    done
-                fi
-            fi
         ) &
         disown
         data_removed="true"
@@ -10515,6 +10965,12 @@ handle_setup_configure() {
         # SECURITY: Validate key is a legal env var name (prevent injection)
         if [[ ! "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then continue; fi
         val=$(echo "$env_vars" | jq -r --arg k "$key" '.[$k] // empty' 2>/dev/null)
+        # Sanitize CF_DNS_API_TOKEN — extract token if user pasted a curl command
+        if [[ "$key" == "CF_DNS_API_TOKEN" && "$val" == *"curl "* ]]; then
+            val=$(printf '%s' "$val" | grep -oP 'Bearer \K[A-Za-z0-9_-]+' | head -1)
+        fi
+        # Strip any value containing shell-dangerous characters (newlines, backticks, $())
+        val=$(printf '%s' "$val" | tr -d '\n\r' | sed 's/`//g')
         # SECURITY: Escape sed delimiter and special chars in value
         local safe_val="${val//\\/\\\\}"
         safe_val="${safe_val//|/\\|}"
@@ -11952,6 +12408,26 @@ handle_plugin_scaffold() {
 MANIFEST_EOF
     fi
 
+    # Write card definitions (dashboard widget cards)
+    if command -v jq >/dev/null 2>&1; then
+        local card_keys
+        card_keys=$(echo "$body" | jq -r '.cards // {} | keys[]' 2>/dev/null)
+        for card_name in $card_keys; do
+            if [[ ! "$card_name" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+                continue
+            fi
+            mkdir -p "$target_dir/cards/$card_name"
+            # Write card.json metadata
+            local card_meta
+            card_meta=$(echo "$body" | jq -c ".cards[\"$card_name\"].meta // {}" 2>/dev/null)
+            [[ -n "$card_meta" && "$card_meta" != "{}" ]] && printf '%s' "$card_meta" > "$target_dir/cards/$card_name/card.json"
+            # Write index.html content
+            local card_html
+            card_html=$(echo "$body" | jq -r ".cards[\"$card_name\"].html // empty" 2>/dev/null)
+            [[ -n "$card_html" ]] && printf '%s' "$card_html" > "$target_dir/cards/$card_name/index.html"
+        done
+    fi
+
     # Read back manifest
     local final_manifest="{}"
     if [[ -f "$target_dir/plugin.json" ]]; then
@@ -12342,8 +12818,11 @@ handle_plugin_cards_list() {
             [[ -f "$card_json" ]] || continue
 
             if command -v jq >/dev/null 2>&1; then
+                local _card_dirname
+                _card_dirname=$(basename "$card_dir")
                 local card_meta
-                card_meta=$(jq -c --arg plugin "$plugin_name" '. + {plugin: $plugin}' "$card_json" 2>/dev/null)
+                card_meta=$(jq -c --arg plugin "$plugin_name" --arg cid "plugin:${plugin_name}:${_card_dirname}" \
+                    '. + {plugin: $plugin, id: $cid}' "$card_json" 2>/dev/null)
                 [[ -n "$card_meta" ]] && entries+=("$card_meta")
             fi
         done
@@ -12437,12 +12916,11 @@ handle_sse_stream() {
     # Start docker events listener in background
     local events_pid=""
     docker events --format '{{json .}}' 2>/dev/null | while IFS= read -r event_line; do
-        local escaped
-        escaped=$(_api_json_escape "$event_line")
         printf "event: docker-event\ndata: %s\n\n" "$event_line" 2>/dev/null || break
     done &
     events_pid=$!
 
+    # Ensure docker events process is killed when this function exits
     # Periodic metrics loop (every 5 seconds)
     local iteration=0
     while true; do

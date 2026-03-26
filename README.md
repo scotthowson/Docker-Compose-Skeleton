@@ -1,29 +1,70 @@
+<p align="center">
+  <img src="https://img.shields.io/badge/bash-4.0+-4EAA25?style=flat-square&logo=gnubash&logoColor=white" />
+  <img src="https://img.shields.io/badge/docker-compose-2496ED?style=flat-square&logo=docker&logoColor=white" />
+  <img src="https://img.shields.io/badge/templates-100+-34d399?style=flat-square" />
+  <img src="https://img.shields.io/badge/API_endpoints-76+-06b6d4?style=flat-square" />
+  <img src="https://img.shields.io/badge/security-67%2B_fixes-a78bfa?style=flat-square" />
+  <img src="https://img.shields.io/badge/license-MIT-f472b6?style=flat-square" />
+</p>
+
 # Docker Compose Skeleton
 
-A portable, modular Docker service orchestration framework with a hardened REST API, 100 deployable service templates, dependency-ordered startup/shutdown, enhanced logging, push notifications, intelligent image updates, and a comprehensive management UI.
+**Your entire homelab, orchestrated from one framework.**
 
-Clone it. Configure it. Run it — from any directory, by any user, on any Linux distro.
+Deploy 100+ services with one click. Automatic HTTPS routing. Cloudflare DNS. Authelia SSO. Wildcard TLS. Security-hardened API. Customizable dashboard. Setup wizard. All from a single git clone.
+
+```bash
+git clone https://github.com/scotthowson/Docker-Compose-Skeleton.git
+cd Docker-Compose-Skeleton && ./setup.sh
+```
+
+That's it. The setup wizard handles the rest.
+
+---
+
+## Why DCS?
+
+Most homelab setups are a mess of scattered compose files, manual DNS entries, and no central management. DCS gives you:
+
+- **One framework** that manages every service on your server
+- **Deploy anything** from 100 templates — Traefik, Plex, Nextcloud, Authelia, Grafana, and more
+- **Automatic HTTPS** with wildcard TLS via Cloudflare DNS challenge (one cert, unlimited subdomains)
+- **Auto DNS** — deploy a service, get `service.yourdomain.com` in Cloudflare instantly
+- **Undeploy cleanup** — removes routes, DNS records, containers, images, and app data
+- **Security-first** — 7 rounds of penetration testing, 67+ fixes, compose security scanner
+- **37-page management UI** with glassmorphism design, real-time metrics, and drag-and-drop dashboard
 
 ---
 
 ## Features
 
-- **100 Service Templates** — Deploy Traefik, Portainer, Jellyfin, Nextcloud, Grafana, and 95 more with one command
-- **REST API** — 76+ endpoints for full remote management (stacks, containers, templates, networks, volumes, backups, terminal)
-- **Two-Factor Authentication** — TOTP 2FA with authenticator app support, auto-lock after inactivity
-- **Setup Wizard** — 5-step guided first-run configuration via the companion UI
+### Infrastructure
+- **100 Service Templates** — Traefik, Portainer, Jellyfin, Nextcloud, Grafana, Authelia, and 94 more
+- **Traefik Auto-Routing** — deploy a template, get automatic HTTPS route + Cloudflare DNS CNAME
+- **Wildcard TLS** — single `*.yourdomain.com` certificate covers all subdomains forever
+- **Authelia SSO** — single sign-on with 2FA, WebAuthn, and access control — deployed from Setup Wizard
+- **Dynamic DNS** — auto-update Cloudflare A record when your public IP changes
 - **Dependency-Ordered Startup** — 10 stack categories start in order, shutdown in reverse
-- **Intelligent Updates** — SHA256-based image change detection with rolling restarts
-- **Compose Security Scanner** — Blocks privileged containers, dangerous mounts, capability escalation, and container escape vectors (7 rounds of penetration testing, 67+ security fixes)
-- **Traefik Integration** — Auto-generated route files, Cloudflare DNS records, wildcard TLS certificates, Dynamic DNS
-- **Plugin System** — Extensible with custom dashboard cards, hooks, and templates
+
+### Security
+- **Two-Factor Authentication** — TOTP 2FA with authenticator app support
+- **Auto-Lock** — screen locks after inactivity, preserves app state, password to unlock
+- **Compose Security Scanner** — blocks privileged containers, dangerous mounts, capability escalation
+- **PBKDF2-SHA256 Auth** — 100k iterations, rate limiting, invite-only registration
+- **7 Rounds of Penetration Testing** — 67+ security fixes applied
+
+### Management
+- **76+ API Endpoints** — full remote management of stacks, containers, templates, networks, volumes
+- **Auto-Generate Secrets** — encryption keys and JWT secrets created automatically on deploy
+- **Plugin System** — custom dashboard cards, lifecycle hooks, and template extensions
+- **Encrypted Secrets** — AES-256-CBC key-value store for API keys, passwords, and tokens
+- **System Updates** — git-based with backup tags, one-click rollback, factory reset
+
+### Monitoring
+- **Health Scoring** — container health monitoring with uptime tracking
+- **Resource Trends** — historical CPU, memory, disk usage with charts
 - **Push Notifications** — NTFY integration for start, stop, failure, and health events
-- **Health Monitoring** — Container health scoring, uptime tracking, resource trending
-- **Backup & Restore** — Full system snapshots with path traversal protection
-- **Encrypted Secrets** — AES-256-CBC encrypted key-value store for API keys, passwords, and tokens
-- **Terminal Access** — Authenticated remote command execution with audit logging
-- **System Updates** — Git-based framework updates with backup tags and one-click rollback
-- **Cross-Distro** — Works on Ubuntu, Fedora, Arch, Alpine, openSUSE, Debian, and more
+- **Backup & Restore** — full system snapshots with path traversal protection
 
 ---
 
@@ -34,106 +75,62 @@ Clone it. Configure it. Run it — from any directory, by any user, on any Linux
 git clone https://github.com/scotthowson/Docker-Compose-Skeleton.git
 cd Docker-Compose-Skeleton
 
-# 2. Run setup (installs dependencies, creates directories, launches setup API)
+# 2. Run setup (installs dependencies, creates directories, starts API)
 ./setup.sh
 
-# 3. Open DCS Manager, connect to your server IP, complete the Setup Wizard
+# 3. Open DCS Manager → connect to your server → complete the 5-step Setup Wizard
+#    (creates admin account, configures domain, deploys Traefik + Authelia)
 
 # 4. Start all services
 ./start.sh
 ```
 
-### What `./setup.sh` Does
+### What the Setup Wizard Does
 
-| Step | Action |
-|------|--------|
-| 1 | Copies `.env.example` to `.env` |
-| 2 | Creates `logs/` and archive directories |
-| 3 | Creates stack directories from `DOCKER_STACKS` |
-| 4 | Sets executable permissions on all scripts |
-| 5 | Sets ownership to the current user |
-| 6 | Installs required + optional system dependencies |
-| 7 | Verifies Docker and Docker Compose |
-| 8 | Launches the API server for Setup Wizard |
-
-After setup, open [DCS Manager](https://github.com/scotthowson/Docker-Compose-Skeleton-UI) and the 5-step wizard walks you through admin account creation, server config, Traefik domain setup, DDNS, and stack selection.
+1. **Connect** — enter your server IP, the wizard finds the API
+2. **Account** — create your admin account (PBKDF2-hashed, rate-limited)
+3. **Configure** — domain, timezone, PUID/PGID, notifications, Traefik, DDNS
+4. **Authelia** — optional SSO with auto-generated config, Redis sessions, Argon2id passwords
+5. **Complete** — deploys Traefik + Authelia, creates DNS records, starts containers
 
 ---
 
-## REST API
+## The Deploy Flow
 
-A 13,000+ line hardened bash API server with 60+ endpoints. Starts automatically with `./start.sh` on port `9876`.
+When you deploy a template, DCS handles everything:
 
-### Endpoints
-
-| Group | Endpoints | Description |
-|-------|-----------|-------------|
-| **System** | `/status`, `/health`, `/version`, `/system` | Health, metrics, Docker info, disk usage |
-| **Stacks** | `/stacks`, `/stacks/:name/*` | List, start, stop, restart, update, rename, clone |
-| **Containers** | `/containers`, `/containers/:id/*` | Inspect, start, stop, restart, logs, exec, rename, file browser |
-| **Templates** | `/templates`, `/templates/:name/deploy` | Browse, preview, deploy, import from URL |
-| **Images** | `/images`, `/images/search`, `/images/check` | List, search Docker Hub, check for updates |
-| **Networks** | `/networks`, `/networks/:id/*` | List, create, remove, connect, disconnect |
-| **Volumes** | `/volumes`, `/volumes/:name` | List, inspect, remove |
-| **Logs** | `/logs`, `/logs/live`, `/logs/stats` | Service logs with filtering, live streaming, statistics |
-| **Events** | `/events`, `/stream` | Docker events, SSE real-time stream |
-| **Config** | `/config`, `/config/update` | Read and update `.env` configuration |
-| **Maintenance** | `/maintenance/*` | Disk analysis, prune, orphan detection, log rotation |
-| **Backups** | `/backups/*` | Create, list, restore, status polling |
-| **Snapshots** | `/snapshots/*` | Full system snapshots with metadata |
-| **Auth** | `/auth/*` | Setup, login, invite codes, token management, sessions |
-| **Terminal** | `/terminal/exec`, `/terminal/auth` | Authenticated Linux command execution |
-| **Batch** | `/batch/start`, `/batch/stop`, `/batch/update` | Bulk stack operations |
-| **Webhooks** | `/webhooks/*` | Create, test, fire on events |
-| **Automations** | `/automations/*` | Scheduled tasks with cron expressions |
-| **Plugins** | `/plugins/*` | Install, enable, scaffold custom plugins |
-| **Export** | `/export/*` | Export health, system, config data |
-| **Notifications** | `/notifications/*` | Rules, history, test |
-| **Updates** | `/system/update/*` | Check, apply, rollback DCS updates via git |
-| **OS Updates** | `/system/os-update/*` | Check and apply system package updates |
-| **DDNS** | `/ddns/status` | Dynamic DNS status and IP monitoring |
-| **Traefik** | `/traefik/status` | Traefik router and certificate status |
-
-### Authentication
-
-Token-based auth with PBKDF2-SHA256 password hashing (100k iterations), rate limiting, and invite-code registration:
-
-```bash
-# Initial setup
-curl -X POST http://server:9876/auth/setup \
-  -d '{"username":"admin","password":"YourPassword1"}'
-
-# Login
-curl -X POST http://server:9876/auth/login \
-  -d '{"username":"admin","password":"YourPassword1"}'
-# → {"success": true, "token": "abc123...", "role": "admin"}
-
-# Authenticated request
-curl -H "Authorization: Bearer abc123..." http://server:9876/stacks
+```
+Template Deploy
+  ├─ Security scan (blocks privileged, dangerous mounts, capabilities)
+  ├─ Port conflict detection across all stacks
+  ├─ Compose merge (services added to target stack)
+  ├─ Variable substitution + secret auto-generation
+  ├─ Config file scaffolding (Traefik, Authelia, etc.)
+  ├─ Traefik route file creation (custom subdomain support)
+  ├─ Cloudflare CNAME auto-creation
+  ├─ Proxy network connection
+  ├─ Container startup with volume permission fixing
+  └─ Deploy event audit logging
 ```
 
-### Security
+On undeploy, the reverse:
 
-The API server has been through **7 rounds of penetration testing** with 67+ security fixes:
-
-| Layer | Protection |
-|-------|-----------|
-| **Authentication** | PBKDF2-SHA256 (100k iterations), constant-time comparison, rate limiting (5 attempts → 15 min lockout) |
-| **Authorization** | Role-based access (admin/user), per-endpoint enforcement, invite-only registration |
-| **Input Validation** | 91 validation calls, path traversal protection, URL-encoded attack rejection |
-| **Compose Scanner** | Blocks privileged mode, dangerous capabilities (SYS_ADMIN, NET_ADMIN), host mounts, build directives, security profile disabling |
-| **Injection Prevention** | 287 JSON escape calls, sed/awk injection protection, shell metacharacter rejection |
-| **HTTP Security** | X-Content-Type-Options, X-Frame-Options, CSP, HSTS, Permissions-Policy, CORS allowlisting |
-| **SSRF Protection** | Private IP blocking, DNS rebinding prevention, URL re-validation at fire time |
-| **DoS Protection** | Body size limits (1MB), request timeouts (30s), global rate limiting |
-| **Session Security** | 24h token expiry, single-session enforcement, file-locked token storage |
-| **Audit Logging** | All POST/DELETE operations logged with IP, user, path, and timestamp |
+```
+Template Undeploy
+  ├─ Container stop + removal
+  ├─ Service removed from compose file
+  ├─ Traefik route file deleted
+  ├─ Cloudflare DNS record deleted
+  ├─ App-Data cleanup (optional)
+  ├─ Docker image removal (optional)
+  └─ Undeploy event audit logging
+```
 
 ---
 
 ## Service Templates
 
-100 ready-to-deploy templates across 10+ categories. Deploy via the API or [DCS Manager UI](https://github.com/scotthowson/Docker-Compose-Skeleton-UI).
+100 ready-to-deploy templates. Deploy via the UI or API.
 
 <details>
 <summary><strong>View all 100 templates</strong></summary>
@@ -148,7 +145,7 @@ The API server has been through **7 rounds of penetration testing** with 67+ sec
 | **Databases** | PostgreSQL, MySQL, MariaDB, MongoDB, Redis, RedisInsight, Adminer, pgAdmin, phpMyAdmin |
 | **Productivity** | Memos, Trilium, BookStack, Mealie, Tandoor, Actual Budget, Firefly III, Vikunja, Planka, Reactive Resume, Karakeep, Linkwarden, Kavita, Calibre-Web, Audiobookshelf, Paperless-ngx |
 | **Development** | Gitea, Code Server, n8n, Semaphore |
-| **Security** | Authelia, Vaultwarden, CrowdSec, WireGuard (wg-easy), AdGuard Home, Pi-hole, Docker Socket Proxy |
+| **Security** | Authelia, Vaultwarden, CrowdSec, WireGuard, AdGuard Home, Pi-hole, Docker Socket Proxy |
 | **Communication** | PrivateBin, Ntfy, Gotify, FreshRSS, SearXNG, Wizarr |
 | **Gaming** | EmulatorJS, MonkeyType, Pelican Panel, RustDesk |
 | **Infrastructure** | Portainer, Watchtower, Diun, Sablier, Komodo, Home Assistant, Healthchecks |
@@ -158,21 +155,32 @@ The API server has been through **7 rounds of penetration testing** with 67+ sec
 
 </details>
 
-### Deployment
+---
 
-```bash
-# Preview (dry run with conflict detection)
-curl -X POST http://server:9876/templates/traefik/dry-run \
-  -H "Authorization: Bearer TOKEN" \
-  -d '{"target_stack":"networking-security","variables":{"TRAEFIK_DOMAIN":"example.com"}}'
+## REST API
 
-# Deploy
-curl -X POST http://server:9876/templates/traefik/deploy \
-  -H "Authorization: Bearer TOKEN" \
-  -d '{"target_stack":"networking-security","auto_start":true,"variables":{"TRAEFIK_DOMAIN":"example.com"}}'
-```
+13,700+ line hardened bash API server. 76+ endpoints. Starts on port `9876`.
 
-Every deployment includes: compose validation, security scanning, port conflict detection, automatic backup, variable substitution, config file scaffolding, volume permission fixing, and optional Cloudflare DNS record creation.
+<details>
+<summary><strong>View all endpoint groups</strong></summary>
+
+| Group | Endpoints | Description |
+|-------|-----------|-------------|
+| **System** | `/status`, `/health`, `/version`, `/system` | Health, metrics, Docker info |
+| **Stacks** | `/stacks`, `/stacks/:name/*` | Start, stop, restart, update, rename, clone |
+| **Containers** | `/containers`, `/containers/:id/*` | Inspect, logs, exec, file browser, stats |
+| **Templates** | `/templates`, `/templates/:name/deploy` | Browse, deploy, import, undeploy |
+| **Auth** | `/auth/*` | Login, TOTP 2FA, invite codes, sessions |
+| **Networks** | `/networks/*` | Create, remove, connect, disconnect |
+| **Volumes** | `/volumes/*` | List, inspect, remove |
+| **Logs** | `/logs/*` | Filtering, live streaming, statistics |
+| **Backups** | `/backups/*` | Create, restore, status |
+| **Plugins** | `/plugins/*` | Install, scaffold, enable, cards |
+| **Updates** | `/system/update/*` | Check, apply, rollback |
+| **Webhooks** | `/webhooks/*` | Create, test, fire |
+| **Automations** | `/automations/*` | Cron-based scheduled tasks |
+
+</details>
 
 ---
 
@@ -180,95 +188,51 @@ Every deployment includes: compose validation, security scanning, port conflict 
 
 | Command | Description |
 |---------|-------------|
-| `./setup.sh` | First-run setup — dependencies, directories, Setup Wizard |
+| `./setup.sh` | First-run setup with dependency installer |
 | `./start.sh` | Start all services in dependency order |
 | `./stop.sh` | Graceful shutdown in reverse order |
 | `./restart.sh` | Stop then start |
 | `./status.sh` | Container status overview |
 
-### Management Utilities
+<details>
+<summary><strong>Management utilities</strong></summary>
 
 | Script | Description |
 |--------|-------------|
-| `.scripts/stack-manager.sh` | CLI for individual stacks (start/stop/restart/status/logs/pull) |
-| `.scripts/health-check.sh` | Container health monitoring with formatted tables |
-| `.scripts/config-validator.sh` | Validates config, directories, compose syntax, ports |
-| `.scripts/maintenance.sh` | Docker cleanup, disk analysis, orphan detection, log rotation |
-| `.scripts/docker-network-info.sh` | Network visualization with tree-style connections |
-| `.scripts/image-tracker.sh` | Image age tracking and staleness detection |
-| `.scripts/system-info.sh` | System and Docker resource information |
-| `.scripts/logs-viewer.sh` | Interactive log viewer with filtering and search |
-| `.scripts/api-server.sh` | REST API server (60+ endpoints, 13,000+ lines) |
+| `.scripts/api-server.sh --bind 0.0.0.0` | Start API server (external access) |
+| `.scripts/stack-manager.sh list` | CLI for individual stacks |
+| `.scripts/health-check.sh` | Container health monitoring |
+| `.scripts/config-validator.sh --fix` | Validate and fix configuration |
+| `.scripts/maintenance.sh` | Docker cleanup and disk analysis |
+| `.scripts/docker-network-info.sh` | Network visualization |
+| `.scripts/image-tracker.sh` | Image freshness tracking |
 
----
-
-## Configuration
-
-### Root `.env`
-
-Copy from `.env.example` on first run. Key settings:
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `DOCKER_STACKS` | *(10 categories)* | Space-separated stack directories — controls startup order |
-| `APP_DATA_DIR` | `./App-Data` | Persistent container data |
-| `PUID` / `PGID` | `1000` | User/Group IDs for file permissions |
-| `TZ` | `UTC` | Timezone for all containers |
-| `TRAEFIK_DOMAIN` | *(empty)* | Domain for reverse proxy routing |
-| `CF_DNS_API_TOKEN` | *(empty)* | Cloudflare API token for DNS + wildcard TLS |
-| `DDNS_ENABLED` | `false` | Auto-update Cloudflare A record on IP change |
-| `API_PORT` | `9876` | REST API server port |
-| `API_AUTH_ENABLED` | `false` | Authentication (auto-enabled on 0.0.0.0) |
-| `API_RATE_LIMIT` | `120` | Max requests per 60-second window |
-| `API_SINGLE_SESSION` | `true` | New login revokes previous tokens |
-
-See `.env.example` for all 72 documented settings.
-
-### Startup Order
-
-```
-1. core-infrastructure     →  6. web-applications
-2. networking-security     →  7. storage-backup
-3. monitoring-management   →  8. communication-collaboration
-4. development-tools       →  9. entertainment-personal
-5. media-services          → 10. miscellaneous-services
-```
-
-Shutdown runs in exact reverse.
+</details>
 
 ---
 
 ## DCS Manager UI
 
-A companion Electron desktop app with glassmorphism dark theme UI. See [Docker-Compose-Skeleton-UI](https://github.com/scotthowson/Docker-Compose-Skeleton-UI).
+A companion 37-page Electron + web app with glassmorphism dark theme.
 
-**Stack:** Electron + React + Vite + Tailwind CSS + Zustand + TypeScript
+See [Docker-Compose-Skeleton-UI](https://github.com/scotthowson/Docker-Compose-Skeleton-UI).
 
-**37 pages** including: Dashboard, Containers, Stacks, Templates, Health Monitor, Uptime, Trends, Networks, Volumes, Images, Logs, Terminal, Export, Settings, Users, Plugins, and more.
+**Pages:** Dashboard, Containers, Stacks, Templates, Health, Uptime, Trends, Networks, Volumes, Images, Logs, Terminal, Export, Settings, Users, Plugins, Notifications, Automations, Schedules, Secrets, Snapshots, Backup, File Browser, Environment, Config, Diagnostics, Disk Analysis, Topology, Event Feed, Bookmarks, Activity, Updates, System, Login, Setup Wizard
 
 ---
 
 ## Requirements
 
-| Dependency | Required | Purpose |
-|------------|----------|---------|
-| **Bash 4+** | Yes | Associative arrays, `declare -g`, `${var,,}` |
-| **Docker** | Yes | Container runtime |
-| **Docker Compose v2** | Yes | Stack orchestration (`docker compose` plugin) |
-| **jq** | Yes | JSON processing for the API server |
-| **python3** | Yes | PBKDF2 password hashing, privilege escalation |
-| **curl** | Yes | Health checks, notifications, updates |
-| **git** | Yes | DCS updates, plugin installation |
-| **openssl** | Yes | Token generation, TLS support |
-| **socat** or **ncat** | Yes | API server TCP listener |
-| rsync | Recommended | Backups and snapshots |
-| tar | Recommended | Backup/restore archives |
-| xxd | Recommended | Hex encoding for tokens |
-| perl | Recommended | ANSI code stripping in log output |
+| Dependency | Purpose |
+|------------|---------|
+| **Docker + Compose v2** | Container runtime |
+| **Bash 4+** | Framework scripts |
+| **jq** | JSON processing |
+| **python3** | Password hashing |
+| **curl, git, openssl** | Health checks, updates, tokens |
+| **socat** or **ncat** | API server listener |
 
-`./setup.sh` detects your distro and offers to install all dependencies automatically.
-
-**Supported distros:** Ubuntu, Debian, Fedora, RHEL, CentOS, Arch, Manjaro, openSUSE, Alpine, Void Linux, NixOS
+`./setup.sh` auto-installs everything. Supports Ubuntu, Debian, Fedora, RHEL, Arch, Alpine, openSUSE, Void, NixOS.
 
 ---
 

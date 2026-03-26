@@ -15,3 +15,27 @@ services:
       interval: 30s
       timeout: 5s
       retries: 3
+
+  dashdot:
+    container_name: Dashdot
+    image: mauricenino/dashdot:latest
+    restart: unless-stopped
+    environment:
+      - TZ=UTC
+      - DASHDOT_WIDGET_LIST=os,cpu,storage,ram,network
+    volumes:
+      - /proc:/mnt/host/proc:ro
+      - /sys:/mnt/host/sys:ro
+      - /etc/os-release:/mnt/host/etc/os-release:ro
+    ports:
+      - "3002:3001"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3001/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+networks:
+  proxy:
+    name: proxy
+    external: true
