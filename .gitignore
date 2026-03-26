@@ -4,8 +4,9 @@
 # Keep the example template
 !.env.example
 
-# Keep per-stack .env files (they are templates, not secrets)
-!Stacks/*/.env
+# Stack .env files contain deployed secrets (CF tokens, passwords) — do NOT track
+# They are auto-generated during template deployment
+Stacks/*/.env
 
 # API auth data (tokens, sessions, deploy history)
 .api-auth/
