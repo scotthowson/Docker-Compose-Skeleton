@@ -90,7 +90,7 @@ verify_environment() {
     fi
 
     # Verify optional but recommended tools
-    local -a optional_tools=("rsync" "tar" "xxd" "perl" "awk" "nproc")
+    local -a optional_tools=("rsync" "tar" "xxd" "perl" "awk" "nproc" "sqlite3")
     for tool in "${optional_tools[@]}"; do
         if ! command -v "$tool" &>/dev/null; then
             log_warning "Optional tool '$tool' not found — some features may be limited"
