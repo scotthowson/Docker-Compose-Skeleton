@@ -6598,30 +6598,67 @@ handle_stack_services() {
     local -a compose_args=(-f "$compose_file")
     [[ -f "$env_file" ]] && compose_args+=(--env-file "$env_file")
 
+    # Get all service names from compose config
+    local -a svc_list=()
+    while IFS= read -r svc; do
+        [[ -n "$svc" ]] && svc_list+=("$svc")
+    done < <($DOCKER_COMPOSE_CMD "${compose_args[@]}" config --services 2>/dev/null)
+
+    # Map service names to container names (single compose ps call)
+    local -A svc_to_container=()
+    local -a container_names=()
+    while IFS=$'\t' read -r _svc_name _ctr_name; do
+        [[ -n "$_svc_name" && -n "$_ctr_name" ]] && {
+            svc_to_container["$_svc_name"]="$_ctr_name"
+            container_names+=("$_ctr_name")
+        }
+    done < <($DOCKER_COMPOSE_CMD "${compose_args[@]}" ps --format '{{.Service}}\t{{.Name}}' 2>/dev/null)
+
+    # Batch inspect all containers at once (1 call instead of 3N)
+    local _inspect_index="{}"
+    if [[ ${#container_names[@]} -gt 0 ]]; then
+        local _batch_inspect
+        _batch_inspect=$(timeout 5 docker inspect "${container_names[@]}" 2>/dev/null)
+        if [[ -n "$_batch_inspect" ]]; then
+            _inspect_index=$(printf '%s' "$_batch_inspect" | jq -c '
+                [.[] | {
+                    key: (.Name | ltrimstr("/")),
+                    value: {
+                        state: .State.Status,
+                        health: (if .State.Health then .State.Health.Status else "none" end),
+                        image: .Config.Image
+                    }
+                }] | from_entries' 2>/dev/null) || _inspect_index="{}"
+        fi
+    fi
+
+    # Build response from indexed data
     local services_json="["
     local first=true
 
-    while IFS= read -r svc; do
-        [[ -z "$svc" ]] && continue
+    for svc in "${svc_list[@]}"; do
         $first || services_json+=","
         first=false
 
-        local container_name state health image
-        container_name=$($DOCKER_COMPOSE_CMD "${compose_args[@]}" ps --format '{{.Name}}' "$svc" 2>/dev/null | head -1)
+        local container_name="${svc_to_container[$svc]:-}"
+        local state health image
 
         if [[ -n "$container_name" ]]; then
-            state=$(docker inspect --format='{{.State.Status}}' "$container_name" 2>/dev/null || echo "unknown")
-            health=$(docker inspect --format='{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$container_name" 2>/dev/null || echo "none")
-            image=$(docker inspect --format='{{.Config.Image}}' "$container_name" 2>/dev/null || echo "unknown")
+            local _svc_data
+            _svc_data=$(printf '%s' "$_inspect_index" | jq -r --arg cn "$container_name" '.[$cn] // empty' 2>/dev/null)
+            if [[ -n "$_svc_data" ]]; then
+                state=$(printf '%s' "$_svc_data" | jq -r '.state // "unknown"' 2>/dev/null)
+                health=$(printf '%s' "$_svc_data" | jq -r '.health // "none"' 2>/dev/null)
+                image=$(printf '%s' "$_svc_data" | jq -r '.image // "unknown"' 2>/dev/null)
+            else
+                state="unknown"; health="none"; image="unknown"
+            fi
         else
-            state="not_created"
-            health="none"
-            image=""
-            container_name=""
+            state="not_created"; health="none"; image=""; container_name=""
         fi
 
         services_json+="{\"name\": \"$(_api_json_escape "$svc")\", \"state\": \"$state\", \"health\": \"$health\", \"image\": \"$(_api_json_escape "$image")\", \"container\": \"$(_api_json_escape "$container_name")\"}"
-    done < <($DOCKER_COMPOSE_CMD "${compose_args[@]}" config --services 2>/dev/null)
+    done
 
     services_json+="]"
 
