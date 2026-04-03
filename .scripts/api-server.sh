@@ -9073,7 +9073,7 @@ handle_template_deploy() {
     if [[ "$is_singleton" == "true" ]]; then
         local target_compose="$target_dir/docker-compose.yml"
         local template_services
-        template_services=$(awk '/^services:/{found=1; next} found && /^[a-zA-Z]/{exit} found && /^  [a-zA-Z]/{gsub(/[: ].*/, ""); gsub(/^ +/, ""); print}' "$tdir/docker-compose.yml" 2>/dev/null)
+        template_services=$(awk '/^services:/{found=1; next} found && /^[a-zA-Z]/{exit} found && /^  [a-zA-Z]/{gsub(/^ +/, ""); gsub(/:.*/, ""); print}' "$tdir/docker-compose.yml" 2>/dev/null)
         local replace_flag
         replace_flag=$(printf '%s' "$body" | jq -r '.replace_services // false' 2>/dev/null)
         if [[ "$replace_flag" != "true" ]]; then
