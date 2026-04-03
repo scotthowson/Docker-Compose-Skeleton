@@ -88,7 +88,7 @@ API_VERSION="1.2.2"
 # Plugin system
 PLUGINS_DIR="${BASE_DIR}/.plugins"
 PLUGINS_HOOKS_ENABLED="${PLUGINS_HOOKS_ENABLED:-true}"
-API_PID_FILE="/tmp/dcs-api-server.pid"
+API_PID_FILE="${BASE_DIR}/.data/api-server.pid"
 API_LOG_FILE="${BASE_DIR}/logs/api-server.log"
 
 # Authentication configuration
@@ -2502,34 +2502,43 @@ handle_container_detail() {
         return
     fi
 
-    local cid
-    cid=$(docker inspect --format='{{.Id}}' "$name" 2>/dev/null)
+    # Single inspect call — extract all fields via jq
+    local _full_inspect
+    _full_inspect=$(timeout 5 docker inspect "$name" 2>/dev/null) || {
+        _api_error 500 "Failed to inspect container: $name"
+        return
+    }
+
+    local now_epoch
+    now_epoch=$(date +%s)
 
     local full_json
-    full_json=$(_api_container_json "$cid")
+    full_json=$(printf '%s' "$_full_inspect" | jq -c --argjson now "$now_epoch" '
+        .[0] | {
+            name: (.Name | ltrimstr("/")),
+            state: .State.Status,
+            health: (if .State.Health then .State.Health.Status else "none" end),
+            image: .Config.Image,
+            image_id: (.Image | split(":") | .[1][:12] // ""),
+            created: .Created,
+            uptime_seconds: (if .State.Status == "running" and .State.StartedAt != "0001-01-01T00:00:00Z" then
+                ($now - (.State.StartedAt | split(".")[0] + "Z" | fromdateiso8601)) else 0 end),
+            ports: ([.NetworkSettings.Ports | to_entries[] |
+                select(.value != null) | .value[] |
+                (if .HostIp == "" or .HostIp == "0.0.0.0" then "0.0.0.0" else .HostIp end) +
+                ":" + .HostPort + "->" + (.key // "")] | join(", ")),
+            restart_count: (.RestartCount // 0),
+            environment: ([.Config.Env // [] | .[] | .] | join("\n")),
+            mounts: ([.Mounts // [] | .[] | .Source + ":" + .Destination + (if .Mode != "" then ":" + .Mode else "" end)] | join("\n")),
+            networks: ([.NetworkSettings.Networks // {} | keys[] | .] | join("\n")),
+            ip_addresses: ([.NetworkSettings.Networks // {} | to_entries[] | .key + "=" + .value.IPAddress] | join("\n")),
+            platform: (.Platform // "linux"),
+            hostname: .Config.Hostname,
+            working_dir: .Config.WorkingDir,
+            restart_policy: .HostConfig.RestartPolicy.Name
+        }' 2>/dev/null)
 
-    # Add extra detail: environment, mounts, networks, IP addresses
-    local env_json mounts_json networks_json ip_json
-    env_json=$(_api_json_escape "$(docker inspect --format='{{range .Config.Env}}{{.}}
-{{end}}' "$name" 2>/dev/null)")
-    mounts_json=$(_api_json_escape "$(docker inspect --format='{{range .Mounts}}{{.Source}}:{{.Destination}}{{if .Mode}}:{{.Mode}}{{end}}
-{{end}}' "$name" 2>/dev/null)")
-    networks_json=$(_api_json_escape "$(docker inspect --format='{{range $k, $v := .NetworkSettings.Networks}}{{$k}}
-{{end}}' "$name" 2>/dev/null)")
-    ip_json=$(_api_json_escape "$(docker inspect --format='{{range $k, $v := .NetworkSettings.Networks}}{{$k}}={{$v.IPAddress}}
-{{end}}' "$name" 2>/dev/null)")
-
-    # Platform, restart policy, hostname, working dir
-    local platform hostname workdir restart_policy
-    platform=$(docker inspect --format='{{.Platform}}' "$name" 2>/dev/null)
-    hostname=$(docker inspect --format='{{.Config.Hostname}}' "$name" 2>/dev/null)
-    workdir=$(docker inspect --format='{{.Config.WorkingDir}}' "$name" 2>/dev/null)
-    restart_policy=$(docker inspect --format='{{.HostConfig.RestartPolicy.Name}}' "$name" 2>/dev/null)
-
-    # Reconstruct with extra fields
-    # Remove closing brace and append
-    full_json="${full_json%\}}"
-    full_json+=", \"environment\": \"$env_json\", \"mounts\": \"$mounts_json\", \"networks\": \"$networks_json\", \"ip_addresses\": \"$(_api_json_escape "$ip_json")\", \"platform\": \"$(_api_json_escape "${platform:-linux}")\", \"hostname\": \"$(_api_json_escape "$hostname")\", \"working_dir\": \"$(_api_json_escape "$workdir")\", \"restart_policy\": \"$(_api_json_escape "$restart_policy")\"}"
+    [[ -z "$full_json" ]] && { _api_error 500 "Failed to parse container data"; return; }
 
     _api_success "$full_json"
 }
@@ -4248,7 +4257,7 @@ handle_auth_factory_reset() {
         rm -f "$auth_dir/.cf-zone-cache" "$auth_dir/cf-dns-audit.log" "$auth_dir/ddns.log" "$auth_dir/os-update-status.json" 2>/dev/null || true
 
         # Stop scheduler and metrics daemons if running
-        for pidfile in /tmp/dcs-metrics-collector.pid /tmp/dcs-scheduler.pid; do
+        for pidfile in "${BASE_DIR}/.data/metrics-collector.pid" "${BASE_DIR}/.data/scheduler.pid"; do
             if [[ -f "$pidfile" ]]; then
                 local daemon_pid
                 daemon_pid=$(cat "$pidfile" 2>/dev/null)
@@ -7291,7 +7300,7 @@ handle_os_update_status() {
 
 DDNS_ENABLED="${DDNS_ENABLED:-false}"
 DDNS_INTERVAL="${DDNS_INTERVAL:-300}"
-DDNS_PID_FILE="/tmp/dcs-ddns.pid"
+DDNS_PID_FILE="${BASE_DIR}/.data/ddns.pid"
 
 _ddns_get_public_ip() {
     # Try multiple providers — use plain IPv4 services to avoid Cloudflare proxy IPs
@@ -11436,7 +11445,7 @@ handle_template_fetch_url() {
 
     # Fetch the compose content
     local compose_content
-    compose_content=$(curl -fsSL --max-time 30 "$url" 2>/dev/null)
+    compose_content=$(curl -fsSL --max-time 30 --max-filesize 10485760 "$url" 2>/dev/null)
     if [[ -z "$compose_content" ]]; then
         _api_error 400 "Failed to fetch content from URL"
         return
@@ -11486,7 +11495,7 @@ handle_template_import_url() {
 
     # Fetch the compose content
     local compose_content
-    compose_content=$(curl -fsSL --max-time 30 "$url" 2>/dev/null)
+    compose_content=$(curl -fsSL --max-time 30 --max-filesize 10485760 "$url" 2>/dev/null)
     if [[ -z "$compose_content" ]]; then
         _api_error 400 "Failed to fetch content from URL"
         return
