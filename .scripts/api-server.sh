@@ -1158,10 +1158,10 @@ _api_scan_compose_security() {
     # Mount /etc directly (system config) — but allow specific subdirs like /etc/localtime
     # Block: "- /etc:/something" or bare "- /etc"
     # Allow: "- /etc/localtime:/etc/localtime:ro" or "- /etc/timezone:/etc/timezone:ro"
-    if printf '%s' "$lower_content" | grep -qE '^\s+-\s*["'"'"']?/etc["'"'"']?[:\s]'; then
+    if printf '%s' "$lower_content" | grep -qE '^\s+-\s*["'"'"']?/etc["'"'"']?(:|[[:space:]]|$)'; then
         # Only flag if mounting /etc root, not a subdirectory like /etc/localtime
         local etc_lines
-        etc_lines=$(printf '%s' "$lower_content" | grep -E '^\s+-\s*["'"'"']?/etc["'"'"']?[:\s]')
+        etc_lines=$(printf '%s' "$lower_content" | grep -E '^\s+-\s*["'"'"']?/etc["'"'"']?(:|[[:space:]]|$)')
         if echo "$etc_lines" | grep -qvE '/etc/'; then
             violations+=("mounting /etc is not allowed (contains system configuration)")
         fi
@@ -1599,7 +1599,7 @@ _api_container_json() {
 
     # Fallback without jq — single inspect call
     local _info name state health image
-    _info=$(timeout 3 docker inspect --format='{{.Name}}|{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}|{{.Config.Image}}' "$container_id" 2>/dev/null) || continue
+    _info=$(timeout 3 docker inspect --format='{{.Name}}|{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}|{{.Config.Image}}' "$container_id" 2>/dev/null) || _info="/$container_id|unknown|none|unknown"
     _info="${_info#/}"
     IFS='|' read -r name state health image <<< "$_info"
 
