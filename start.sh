@@ -175,11 +175,12 @@ _verify_environment() {
         return 1
     fi
 
-    # Ensure App-Data exists
+    # Ensure App-Data and runtime data directories exist
     if [[ ! -d "$APP_DATA_DIR" ]]; then
         mkdir -p "$APP_DATA_DIR"
         log_info "Created App-Data directory: $APP_DATA_DIR"
     fi
+    mkdir -p "$BASE_DIR/.data" 2>/dev/null
 
     log_keyvalue "Docker" "$(docker --version 2>/dev/null | sed 's/Docker version /v/' | cut -d, -f1)"
     log_keyvalue "Compose" "$(_docker_compose_version_string)"
