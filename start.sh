@@ -23,6 +23,9 @@ if [[ -f "$BASE_DIR/.env" ]]; then
     set -a
     source "$BASE_DIR/.env"
     set +a
+else
+    echo "  ⚠ No .env file found — using defaults from .config/settings.cfg"
+    echo "    To customize, run: cp .env.example .env"
 fi
 
 COMPOSE_DIR="$BASE_DIR/Stacks"
