@@ -15806,7 +15806,7 @@ start_server() {
     if [[ "$DDNS_ENABLED" == "true" && -n "${CF_DNS_API_TOKEN:-}" && -n "${TRAEFIK_DOMAIN:-}" ]]; then
         _ddns_update_loop &
         local _ddns_pid=$!
-        echo "$_ddns_pid" > "${DDNS_PID_FILE:-/tmp/dcs-ddns.pid}" 2>/dev/null
+        echo "$_ddns_pid" > "$DDNS_PID_FILE" 2>/dev/null
     fi
 
     # Start metrics collector background loop (same pattern as DDNS loop above)

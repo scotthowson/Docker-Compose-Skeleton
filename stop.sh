@@ -213,32 +213,32 @@ main() {
 
     # ── Stop v2.0 background daemons ────────────────────────────────
     # Metrics collector
-    if [[ -f "/tmp/dcs-metrics-collector.pid" ]]; then
+    if [[ -f "$BASE_DIR/.data/metrics-collector.pid" ]]; then
         local metrics_pid
-        metrics_pid=$(cat /tmp/dcs-metrics-collector.pid 2>/dev/null)
+        metrics_pid=$(cat "$BASE_DIR/.data/metrics-collector.pid" 2>/dev/null)
         if [[ -n "$metrics_pid" ]] && kill -0 "$metrics_pid" 2>/dev/null; then
             kill "$metrics_pid" 2>/dev/null
             log_success "Metrics collector stopped (PID: $metrics_pid)"
         fi
-        rm -f /tmp/dcs-metrics-collector.pid
+        rm -f "$BASE_DIR/.data/metrics-collector.pid"
     fi
 
     # Scheduler daemon
-    if [[ -f "/tmp/dcs-scheduler.pid" ]]; then
+    if [[ -f "$BASE_DIR/.data/scheduler.pid" ]]; then
         local sched_pid
-        sched_pid=$(cat /tmp/dcs-scheduler.pid 2>/dev/null)
+        sched_pid=$(cat "$BASE_DIR/.data/scheduler.pid" 2>/dev/null)
         if [[ -n "$sched_pid" ]] && kill -0 "$sched_pid" 2>/dev/null; then
             kill "$sched_pid" 2>/dev/null
             log_success "Scheduler daemon stopped (PID: $sched_pid)"
         fi
-        rm -f /tmp/dcs-scheduler.pid
+        rm -f "$BASE_DIR/.data/scheduler.pid"
     fi
 
     # ── Stop REST API server if running ──────────────────────────────
     # Stop if: PID file exists OR API_ENABLED=true (covers orphaned processes)
     local api_script="$BASE_DIR/.scripts/api-server.sh"
     if [[ -x "$api_script" ]]; then
-        if [[ -f "/tmp/dcs-api-server.pid" ]] || [[ "${API_ENABLED:-false}" == "true" ]]; then
+        if [[ -f "$BASE_DIR/.data/api-server.pid" ]] || [[ "${API_ENABLED:-false}" == "true" ]]; then
             log_info "Stopping REST API server..."
             "$api_script" --stop 2>/dev/null && log_success "REST API server stopped" || log_debug "REST API server was not running"
         fi
